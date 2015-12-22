@@ -1,0 +1,98 @@
+{% themeextends "admin/base_admin.html" %}
+{% load i18n %}
+{% block title %} TapelessIngest {% endblock %}
+{% block heading %} TapelessIngest Settings {% endblock heading %}
+
+{% block content %}
+<style>
+    .file_valid {
+        color: green;
+    }
+
+    .file_error {
+        color: red;
+    }
+</style>
+
+<div class="itemcontent">
+
+    <form action="{% url tapelessingest:settings %}" method="POST" class="formmain">
+        {% csrf_token %}
+        <fieldset>
+
+            <h3><strong>Global settings</strong></h3>
+            <ul>
+                <li>
+                    <label for="storage">Target storage</label>
+                    {{ settings_form.storage_id }} {% if storage_root_path %}{{ storage_root_path }}{% endif %}
+                </li>
+
+                <li>
+                    <label for="storage">Temporary storage</label>
+                    {{ settings_form.tmp_storage }}
+                </li>
+
+                <li>
+                    <label for="storage">Base folder</label>
+                    {{ settings_form.base_folder }}
+                </li>
+
+                <li>
+                    <label for="storage">BMXTransWrap library</label>
+                    {{ settings_form.bmxtranswrap }}
+                </li>
+
+                <li>
+                    <label for="storage">MXF2Raw library</label>
+                    {{ settings_form.mxf2raw }}
+                </li>
+            </ul>
+            <h3><strong>Metadatas mappings</strong></h3>
+            <table class="generictbl dataTable" id="videotagtable" aria-describedby="videotagtable_info">
+              {% if forloop.first %}
+              <thead>
+                <tr>
+                  {% for field in metadatas_form.visible_fields %}
+                  <th>{{ field.label|capfirst }}</th>
+                  {% endfor %}
+                </tr>
+              </thead>
+              {% endif %}
+              <tbody>
+                {% for metadata in metadatas %}
+                <tr class="{% cycle row1,row2 %}">
+                    <td>{{metadata.metadata_provider}}</td>
+                    <td>{{metadata.metadata_portal}} <a href="{% url tapelessingest:metadata_remove metadata_id=metadata.pk %}">Remove</a></td>
+                </tr>
+                {% endfor %}
+                <tr>
+                {% for field in metadatas_form.visible_fields %}
+                  <td>
+                  {# Include the hidden fields in the form #}
+                  {% if forloop.first %}
+                    {% for hidden in metadatas_form.hidden_fields %}
+                    {{ hidden }}
+                    {% endfor %}
+                  {% endif %}
+                    {{ field.errors.as_ul }}
+                    {{ field }}
+                  </td>
+                {% endfor %}
+                </tr>
+              </tbody>
+            </table>
+
+            <ul>
+                <li class="mono">
+                    <input type="Submit"/>
+                </li>
+            </ul>
+        </fieldset>
+
+    </form>
+</div><!-- /itemcontent-->
+
+<script>
+
+</script>
+{% endblock content %}

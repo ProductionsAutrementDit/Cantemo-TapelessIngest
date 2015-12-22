@@ -1,0 +1,27 @@
+{% themeextends "base.html" %}
+{% load i18n compress %}
+{% load staticfiles %}
+{% block extra_script %}
+  <style type="text/css">
+  {% themeinclude "TapelessIngest/tapelessingest.css"  %}
+  </style>
+{% endblock extra_script %}
+{% block body %}
+{% block heading %}
+{% endblock heading %}
+
+<div id="content" class="content searchcontent">
+  <div class="fullwidthcontent">
+    {% block content %}
+    {% endblock content %}
+  </div>
+</div>
+{% endblock body %}
+{% block inlinejs %}
+{% endblock inlinejs %}
+{% docstring %}
+base.html is a container for Tapeless Ingest pages. The results pages have another template.
+
+Context:
+ * theme - Current theme for the user. Can be overridden to have "ajax.html".
+{% enddocstring %}

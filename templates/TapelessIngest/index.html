@@ -1,0 +1,145 @@
+{% themeextends "TapelessIngest/base.html" %}
+{% load i18n compress %}
+
+{% block content %}
+
+{% block extra_script %}
+<link type="text/css" href="{{ STATIC_URL }}TapelessIngest/tapelessingest.css" rel="stylesheet">
+<script type="text/javascript" src="{{ STATIC_URL }}js/app/collection/utilities.js"></script>
+<script type="text/javascript" src="{{ STATIC_URL }}js/app/media/mediabox.js"></script>
+<script type="text/javascript" src="{{ STATIC_URL }}js/libs/select2/select2.js"></script>
+{% endblock %}
+
+{% load tapelessingest_extras %}
+
+<div class="itemcontent">
+  <form action="{% url tapelessingest:index %}" method="post" id="tapelessingestpathform" class="" autocomplete="false">{% csrf_token %}
+    <div id="sidebar-left">
+      <div id="FolderView" class="tapelessingest-panels">
+        <h2>Folders:</h2>
+        <fieldset>
+          <button type="button" class="button button-navigator" id="cntmo_prtl_folder_browse_lnk">Browse</button>
+        </fieldset>
+        <table class="generictbl" id="FolderTable">
+          <tbody>
+          </tbody>
+        </table>
+      </div>
+      <div id="MetadatasView" class="tapelessingest-panels">
+        {% themeinclude "media/metadata_render.html" %}
+      </div>
+    </div>
+    <div id="main-content">
+      <div id="MainView" class="tapelessingest-panels">
+        <h2>Clips:</h2>
+        <fieldset>
+            <button type="button" class="button button-ingest" id="cntmo_prtl_ClipTable_selectall_lnk">Select all clips</button>
+            <button type="button" class="button button-ingest" id="cntmo_prtl_ClipTable_unselectall_lnk">Unselect all clips</button>
+            <button type="button" class="button button-ingest" id="cntmo_prtl_cliptable_addtocollection">Update target collection(s)</button>
+            <button type="button" class="button button-ingest" id="cntmo_prtl_ClipTable_ing_lnk">Ingest selected clips</button>
+            <button type="button" class="button button-ingest" id="cntmo_prtl_ClipTable_act_lnk">Actualize selected clips</button>
+        </fieldset>
+        <table class="generictbl" id="ClipTable">
+          <thead>
+              <tr role="row">
+                <th class=""></th>
+                <th class=""><a href="#" id="cntmo_prtl_ClipTable_srt" data-sort="metadatas.clipname">Name</a></th>
+                <th class=""><a href="#" id="cntmo_prtl_ClipTable_srt" data-sort="provider_name">Provider</a></th>
+                <th class=""><a href="#" id="cntmo_prtl_ClipTable_srt" data-sort="timecode">TC in</a></th>
+                <th class=""><a href="#" id="cntmo_prtl_ClipTable_srt" data-sort="metadatas.duration">Duration</a></th>
+                <th class=""><a href="#" id="cntmo_prtl_ClipTable_srt" data-sort="metadatas.shootingdate">Shooted on</a></th>
+                <th class="">Man.</th>
+                <th class="">Model</th>
+                <th class="">Serial</th>
+                <th class="">Spanned</th>
+                <th class=""><a href="#" id="cntmo_prtl_ClipTable_srt" data-sort="folder_path">Path</a></th>
+                <th class=""><a href="#" id="cntmo_prtl_ClipTable_srt" data-sort="status">Status</a></th>
+                <th class=""><a href="#" id="cntmo_prtl_ClipTable_srt" data-sort="user">User</a></th>
+                <th class=""><a href="#" id="cntmo_prtl_ClipTable_srt" data-sort="item_id">Item</a></th>
+                <th class=""><a href="#" id="cntmo_prtl_ClipTable_srt" data-sort="file_id">File</a></th>
+                <th class=""><a href="#" id="cntmo_prtl_ClipTable_srt" data-sort="collection_id">Target</a></th>
+              </tr>
+          </thead>
+              
+          <tbody role="alert" aria-live="polite" aria-relevant="all">
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </form>
+</div><!--.box -->
+{% endblock content %}
+
+{% block inlinejs %}
+
+<script type="text/template" id="tapelessingest_folder_format_tmpl">
+
+    <td class="tdItem"><span class="ui-icon ui-icon-folder-open"></span> <%= basename %></td><td><a href="#" class="cntmo_prtl_FolderTable-pod-rmv">Remove</a></td>
+
+</script>
+
+<script type="text/template" id="tapelessingest_clip_format_tmpl">
+
+    <td><a href="#" class="preview"><img src="<%= thumbnail_url %>"></a></td>
+    <td class="tdItem"><%= metadatas.clipname %></td>
+    <td class="tdItem"><%= provider_name %></td>
+    <td class="tdItem"><%= metadatas.timecode %></td>
+    <td class="tdItem"><%= duration_readable %></td>
+    <td class="tdItem"><%= metadatas.shooting_date %></td>
+    <td class="tdItem"><%= metadatas.device_manufacturer %></td>
+    <td class="tdItem"><%= metadatas.device_model %></td>
+    <td class="tdItem"><%= metadatas.device_serial %></td>
+    <td class="tdItem"><%= count_spanned %></td>
+    <td class="tdItem"><%= folder_path %></td>
+    <td class="tdItem state status-<%=  state  %>"><div><p><%=  state  %> <%=  progress  %></p></div><div class="fld_help_txt"><%=  error  %></div></td>
+    <td class="tdItem"><%= user %></td>
+    <td class="tdItem"><a href="/vs/item/<%= item_id %>/"><%= item_id %></a></td>
+    <td class="tdItem"><%= file_id %></td>
+    <td class="tdItem"><a href="/vs/collections/<%= collection_id %>/"><%= collection_id %></a></td>
+
+</script>
+<script type="text/javascript" charset="utf-8">
+$(document).ready(function() {
+    if (gblPrtlIsAuthenticated) {
+          
+
+          void 0 !== window.$LAB && $LAB.script(gblStaticURL + "TapelessIngest/folders_model.js").wait().script(gblStaticURL + "TapelessIngest/folders_collection.js").wait().script(gblStaticURL + "TapelessIngest/folders_views.js").wait(function() {
+              cntmo.app.page.FolderItems = new cntmo.prtl.FolderTable.FolderCollection,
+              window.FolderItems = cntmo.app.page.FolderItems,
+              !cntmo.app.page.FolderTable & $("#tapelessingest_folder_format_tmpl").length > 0  && (cntmo.app.page.FolderTable = new cntmo.prtl.FolderTable.FolderTableView({
+                  collection: cntmo.app.page.FolderItems,
+              }), cntmo.prtl.FolderTableApp = cntmo.app.page.FolderTable)
+          });
+          
+          void 0 !== window.$LAB && $LAB.script(gblStaticURL + "TapelessIngest/clips_model.js").wait().script(gblStaticURL + "TapelessIngest/clips_collection.js").wait().script(gblStaticURL + "TapelessIngest/clips_views.js").wait(function() {
+              cntmo.app.page.ClipItems = new cntmo.prtl.ClipTable.ClipCollection,
+              window.ClipItems = cntmo.app.page.ClipItems,
+              !cntmo.app.page.ClipTable & $("#tapelessingest_clip_format_tmpl").length > 0  && (cntmo.app.page.ClipTable = new cntmo.prtl.ClipTable.MainView({
+                  collection: cntmo.app.page.ClipItems,
+              }), cntmo.prtl.ClipTableApp = cntmo.app.page.ClipTable)
+          });
+      
+          var helppointer = '<div class="fld_help_txt_arrow">';
+          
+          $("#MainView", "#main")
+                .delegate("td.state", "mouseenter mouseleave", function (e) {
+                    var $elHelp = $(this)
+                        .find("div.fld_help_txt");
+                    "mouseenter" == e.type ? $($elHelp)
+                        .siblings(".error")
+                        .length < 2 && ($elHelp.append(helppointer), $elHelp.delay(250)
+                            .addClass("fld_help_txt_show")
+                            .animate({
+                                opacity: 1
+                            }, 250)) : $elHelp.css("opacity", "0")
+                        .removeClass("fld_help_txt_show")
+                        .find(".fld_help_txt_arrow")
+                        .remove()
+          });
+
+    }
+
+});
+</script>
+
+{% endblock inlinejs %}

@@ -1,0 +1,39 @@
+{% load i18n %}
+<style type="text/css" media="all">
+    #collection_add_form label {
+        width: 10em;
+    }
+</style>
+<form action="{% url tapelessingest:addTargetCollection %}" method="post" accept-charset="utf-8" id="collection_add_target_form" >{% csrf_token %}
+<ul>
+    <li id="collectionselectrow">
+        <label for="collection" style="width:10em;">{{ strcollectionname|capfirst }}</label>
+        <input type="hidden" id="collectionselect" name="collection" multiple="multiple" rel="{% url search_collections %}" />
+    </li>
+    <li>
+        {% themeinclude "includes/collectionprofilechooser.html" %}
+    </li>
+</ul>
+{% pluginblock "vs_collection_add_form_form" core %}
+</form>
+
+{% docstring %}
+This page is now called from a JQuery UI dialog and is intended to be brought in via an Ajax call to then parse the HTML and to have addToCollection enhance with a select box.
+
+Context
+-------
+
+items
+    selected_objects in getstring which have been passed through when calling the view.
+
+collection
+    VidiRest Collection object if we are sent the collection when getting, or an error has occured.
+
+Plugins
+-------
+
+pluginblock
+    vs_collection_add_form_form core
+
+{% enddocstring %}
+

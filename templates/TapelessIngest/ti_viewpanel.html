@@ -1,0 +1,68 @@
+{% if clip %}
+<div id="panel_ingestinfos" class="panel" style="display:none;">
+    <h2>Ingest informations</h2>
+    <table class="generictbl">
+      <tbody>
+      <tr class="even">
+        <td>UMID</td>
+        <td>{{ clip.pk }}</td>
+      </tr>
+      <tr class="odd">
+        <td>Created on</td>
+        <td>{{ clip.created_on }}</td>
+      </tr>
+      <tr class="even">
+        <td>Imported on</td>
+        <td>{{ clip.imported_on }}</td>
+      </tr>
+      <tr class="odd">
+        <td>Folder path</td>
+        <td>{{ clip.folder_path }}</td>
+      </tr>
+      <tr class="even">
+        <td>Outputed file</td>
+        <td>{{ clip.output_file }}</td>
+      </tr>
+      <tr class="odd">
+        <td>Status</td>
+        <td>{{ clip.status }}</td>
+      </tr>
+      <tr class="even">
+        <td>Is spanned</td>
+        <td>{{ clip.spanned }}</td>
+      </tr>
+      <tr class="odd">
+        <td>Provider</td>
+        <td>{{ clip.provider_name }}</td>
+      </tr>
+      <tr class="even">
+        <td>Collection Id</td>
+        <td>{{ clip.collection_id }}</td>
+      </tr>
+      <tr class="odd">
+        <td colspan="2"><h3>Provider metadatas:</h3> <a href="{% url tapelessingest:metadatas_update_item clip.umid %}">Update item metadatas</a></td>
+      </tr>
+      {% for metadata in clip.metadatas.all %}
+      <tr class={% cycle 'even' 'odd' %}>
+        <td>{{ metadata.name }}</td>
+        <td>{{ metadata.value }}</td>
+      </tr>
+      {% endfor %}
+      <tr class="even">
+        <td>Clip XML</td>
+        <td>{{ clip.clip_xml }}</td>
+      </tr>
+      <tr class="even">
+        <td>Media XML</td>
+        <td>{{ clip.media_xml }}</td>
+      </tr>
+      </tbody>
+    </table>
+
+</div>
+
+<script>
+
+</script>
+
+{% endif %}

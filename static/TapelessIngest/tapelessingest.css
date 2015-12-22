@@ -1,0 +1,115 @@
+td.LOADING p {
+    background-image: url('/sitemedia/img/icon-button-loader-transparent.gif?7d9e1ad8d7e4') !important; 
+    background-size: 16px 16px !important;
+    background-position: 4px !important;
+    background-repeat: no-repeat !important;
+    background-color: #1982de !important
+}
+
+.fullwidthcontent {
+  box-sizing: border-box;
+}
+
+#cntmo_prtl_folder_browse_lnk,
+#cntmo_prtl_ClipTable_selectall_lnk,
+#cntmo_prtl_ClipTable_unselectall_lnk,
+#cntmo_prtl_cliptable_addtocollection {
+  background-color: #4a65ac;
+}
+#cntmo_prtl_folder_browse_lnk {
+  padding-left: 3em;
+  background-image: url('/sitemedia/img/icon-view.svg?7d9e1ad8d7e4');
+  background-size: 16px 16px;
+  background-position: 4px;
+  background-repeat: no-repeat;
+}
+
+#main-content .clipitem img {
+  max-width: 150px;
+}
+
+
+.folderitem .ui-icon {
+    background-image: url(/sitemedia/img/core/ui-icons_888888_256x240.png);
+    display: inline-block;
+}
+
+td.status-NOTIMPORTED p {
+  background:#df6819 url('/sitemedia/img/mini-icon-cross.png?7d9e1ad8d7e4') no-repeat 4px center
+}
+
+td.status-PROCESSING p {
+  background:#4a65ac url('/sitemedia/img/icon-button-loader-transparent.gif?7d9e1ad8d7e4') no-repeat 4px center
+}
+
+td.status-FAILED p {
+  background:#7d4141 url('/sitemedia/img/mini-icon-cross.png?7d9e1ad8d7e4') no-repeat 4px center
+}
+
+td.status-IMPORTED p {
+  background:#417c49 url('/sitemedia/img/mini-icon-checked.png?7d9e1ad8d7e4') no-repeat 4px center
+}
+
+
+.tapelessingest-panels#MainView {
+  overflow: auto;
+}
+.tapelessingest-panels {
+  margin-bottom: 1em;
+}
+.tapelessingest-panels h2 {
+  float: left;
+}
+
+.tapelessingest-panels fieldset {
+  float: right;
+}
+
+.tapelessingest-panels tbody tr:nth-child(even):hover {
+  background-color: rgba(0, 0, 0, 0.30);
+}
+
+.tapelessingest-panels tbody tr:nth-child(even) {
+  background-color: rgba(0, 0, 0, 0.05);
+}
+
+.tapelessingest-panels tbody tr:nth-child(odd):hover {
+  background-color: rgba(0, 0, 0, 0.30);
+}
+
+.tapelessingest-panels tbody tr:nth-child(odd) {
+  background-color: rgba(0, 0, 0, 0.10);
+}
+
+.tapelessingest-panels tbody tr.clipitem-selected {
+  background:rgba(122, 171, 108, 0.80);
+}
+.tapelessingest-panels tbody tr.clipitem-selected:hover {
+  background:rgba(122, 171, 108, 1);
+}
+
+#sidebar-left {
+  float: left;
+  width: 20%;
+}
+
+#main-content {
+  margin-left: 21%;
+  margin-right: 1em;
+  float: none;
+}
+
+#FolderView label,
+#MetadataView label {
+  display: block;
+}
+
+#FolderView input,
+#MetadataView input {
+  max-width: 100%;
+}
+
+.tapelessingest-panels {
+  background-color: rgba(0, 0, 0, 0);
+  padding: 1em;
+}

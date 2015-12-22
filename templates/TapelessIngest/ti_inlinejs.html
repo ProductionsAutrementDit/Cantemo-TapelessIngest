@@ -1,0 +1,12 @@
+<script type="text/javascript" charset="utf-8">
+    $(document).ready(function () {
+        var ir_timer;
+
+        // Extend the namespace with a new viewclass.
+        (function (app, $, undefined) {
+            app.IngestInfosPanel = cntmo.prtl.ViewClass.extend();
+        }(cntmo.app = cntmo.app || {}, jQuery));
+        // Create a new instance of the viewclass that can be switched to.
+        cntmo.prtl.panelviews['IngestInfosPanel'] = new cntmo.app.IngestInfosPanel({el:$('#panel_ingestinfos')});
+    });
+</script>

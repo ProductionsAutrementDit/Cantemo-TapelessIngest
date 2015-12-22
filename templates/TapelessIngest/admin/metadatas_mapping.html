@@ -1,0 +1,53 @@
+{% themeextends "admin/base_admin.html" %}
+{% load i18n datetimeformatting compress %}
+{% block title %}{% trans 'Tapeless Ingest Metadata Mapping For' %} {{current_provider.name}}{% endblock %}
+{% block heading %}{% trans 'Tapeless Ingest Metadata Mapping For' %} {{current_provider.name}}{% endblock heading %}
+
+{% block content %}
+
+<h4>{{debug}}</h4>
+<ul>
+    {% for machine_name, provider in providers.items %}
+    <li><a href="{% url tapelessingest:admin_metadatamapping_form provider=machine_name %}" class="current">{{provider.name}}</a></li>
+    {% endfor %}
+</ul>
+<div class="panes">
+<form action="{% url tapelessingest:admin_metadatamapping_form provider=current_provider.machine_name %}" method="post">{% csrf_token %}
+<table class="generictbl dataTable" id="videotagtable" aria-describedby="videotagtable_info">
+    {% if forloop.first %}
+    <thead>
+    <tr>
+      {% for field in form.visible_fields %}
+      <th>{{ field.label|capfirst }}</th>
+      {% endfor %}
+    </tr>
+    </thead>
+    {% endif %}
+    {% for metadata in metadatas %}
+    <tr class="{% cycle row1,row2 %}">
+        <td>{{metadata.metadata_provider}}</td>
+        <td>{{metadata.metadata_portal}} <a href="{% url tapelessingest:metadata_remove provider=current_provider.machine_name metadata_id=metadata.pk %}">Remove</a></td>
+    </tr>
+    {% endfor %}
+    <tr>
+    {% for field in form.visible_fields %}
+      <td>
+      {# Include the hidden fields in the form #}
+      {% if forloop.first %}
+        {% for hidden in form.hidden_fields %}
+        {{ hidden }}
+        {% endfor %}
+      {% endif %}
+        {{ field.errors.as_ul }}
+        {{ field }}
+      </td>
+    {% endfor %}
+    </tr>
+</table>
+<input type="submit"/>
+</form>
+<div> 
+</div>
+
+</div>
+{% endblock content %}

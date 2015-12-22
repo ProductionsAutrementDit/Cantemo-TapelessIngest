@@ -1,0 +1,13 @@
+{% load i18n %}
+
+<style>
+
+</style>
+
+
+<div>
+    <video width="540" height="300" controls autoplay>
+      <source src="{% url tapelessingest:clip_proxy clip_id=clip.umid %}" type="{{ mimetype }}" >
+    </video>
+</div>
+
