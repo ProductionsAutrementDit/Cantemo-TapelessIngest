@@ -7,7 +7,9 @@
 <link type="text/css" href="{{ STATIC_URL }}TapelessIngest/tapelessingest.css" rel="stylesheet">
 <script type="text/javascript" src="{{ STATIC_URL }}js/app/collection/utilities.js"></script>
 <script type="text/javascript" src="{{ STATIC_URL }}js/app/media/mediabox.js"></script>
+<script type="text/javascript" src="{{ STATIC_URL }}js/app/metadata/metadataform.js"></script>
 <script type="text/javascript" src="{{ STATIC_URL }}js/libs/select2/select2.js"></script>
+<script type="text/javascript" src="{{ STATIC_URL }}js/app/metadata/metadataform.js"></script>
 {% endblock %}
 
 {% load tapelessingest_extras %}
@@ -95,7 +97,7 @@
     <td class="tdItem"><%= user %></td>
     <td class="tdItem"><a href="/vs/item/<%= item_id %>/"><%= item_id %></a></td>
     <td class="tdItem"><%= file_id %></td>
-    <td class="tdItem"><a href="/vs/collections/<%= collection_id %>/"><%= collection_id %></a></td>
+    <td class="tdItem"><a href="/collections/#/collection/<%= collection_id %>/"><%= collection_id %></a></td>
 
 </script>
 <script type="text/javascript" charset="utf-8">
@@ -111,7 +113,7 @@ $(document).ready(function() {
               }), cntmo.prtl.FolderTableApp = cntmo.app.page.FolderTable)
           });
           
-          void 0 !== window.$LAB && $LAB.script(gblStaticURL + "TapelessIngest/clips_model.js").wait().script(gblStaticURL + "TapelessIngest/clips_collection.js").wait().script(gblStaticURL + "TapelessIngest/clips_views.js").wait(function() {
+          void 0 !== window.$LAB && $LAB.script(gblStaticURL + "TapelessIngest/utilities.js").wait().script(gblStaticURL + "TapelessIngest/clips_model.js").wait().script(gblStaticURL + "TapelessIngest/clips_collection.js").wait().script(gblStaticURL + "TapelessIngest/clips_views.js").wait(function() {
               cntmo.app.page.ClipItems = new cntmo.prtl.ClipTable.ClipCollection,
               window.ClipItems = cntmo.app.page.ClipItems,
               !cntmo.app.page.ClipTable & $("#tapelessingest_clip_format_tmpl").length > 0  && (cntmo.app.page.ClipTable = new cntmo.prtl.ClipTable.MainView({

@@ -14,46 +14,33 @@ from django.core.exceptions import ObjectDoesNotExist
 from portal.plugins.TapelessIngest.metadatas import XMLParser
 from portal.plugins.TapelessIngest.models import Clip, ClipFile, ClipMetadata, Reel, Settings
 
-from portal.plugins.TapelessIngest.providers.providers import Provider as BaseProvider
+from portal.plugins.TapelessIngest.providers.video_file import Provider as VideoFileProvider
 from portal.plugins.TapelessIngest.providers.xdcam import Provider as XDCAMProvider
 
 log = logging.getLogger(__name__)
 
 # Classe ProviderP2: Récupère les clips à partir des fichiers XML du dossier CLIP
-class Provider(BaseProvider):
+class Provider(VideoFileProvider):
 
     def __init__(self):
-        BaseProvider.__init__(self)
-        self.name = "FILE"
-        self.machine_name = "video_file"
-        self.base_path = ""
-        self.clips_path = ""
-        self.index_xml = None
-        self.card_xml_file = None
-        self.file_extensions = ('.mov', '.avi', '.mp4', '.mts', '.m2t', '.mxf', '.mpg', '.wav', '.aiff', '.mp3', '.jpg')
-
-    def checkPath(self, path):
-        files = [ f for f in os.listdir(path) if f.lower().endswith(self.file_extensions) ]
-        if len(files) > 0:
-            return True
-        else:
-            return False
+        VideoFileProvider.__init__(self)
+        self.name = "IMAGE"
+        self.machine_name = "image_file"
+        self.file_extensions = ('.png', '.bmp', '.tiff', '.jpg')
 
     def getAllClips(self, folder):
         clips = []
 
         infos, reel = self.getFilesInfos(folder)
         for material in infos.findall('Contents/Material'):
-            if material.get('has_sidecar'):
                 Clip = self.createClipFromFileWithSidecar(folder, material, reel)
             else:
                 Clip = self.createClipFromFile(folder, material, reel)
             if Clip is not False:
                 clips.append(Clip)
-            else:
-                log.error("Unable to parse %s" % material)
 
         return clips
+
 
     def getClipFilePaths(self, clipname, folder_path):
         return [os.path.join(folder_path, clipname)]
@@ -111,10 +98,10 @@ class Provider(BaseProvider):
 
                     clip = etree.fromstring(stdout)
                     format = clip.find('format')
+                    format.set('filename', file)
 
                     if format is None:
                         continue
-                    format.set('filename', file)
                     clip.set('umid',str(umid))
 
                     clip.tag = "Material"
@@ -133,10 +120,9 @@ class Provider(BaseProvider):
 
         umid = material.get('umid')
         material_file = os.path.join(folder.path, material.get('filename'))
-        filename, file_extension = os.path.splitext(material_file)
         metadatas_file = os.path.join(folder.path, material.get('sidecar_file'))
         xdcamprovider = XDCAMProvider()
-        clip = xdcamprovider.createClipFromFile(folder, umid, metadatas_file, material_file, extra_infos = {'extension': file_extension})
+        clip = xdcamprovider.createClipFromFile(folder, umid, metadatas_file, material_file, extra_infos = [])
         clip.provider = self
 
         return clip

@@ -1,12 +1,13 @@
 ! function(ClipTable, $, undefined) {
 
-    ClipTable.addTargetCollection = cntmo.prtl.Collection.addToCollection.extend({
+    ClipTable.addTargetCollection = cntmo.prtl.Collection.TapelessIngestaddToCollection.extend({
         add: function() {
             var self = this,
             form = this.$el.find("form#collection_add_target_form");
             self.smartSelectBox ? (formdata = {
                 selected_objects: self.selected_objects,
                 collection: self.smartSelectBox.val(),
+                tags: form.find("#tagselect").val(),
                 collectionprofilegroup: form.find("#collectionprofilechooser").val()
             },
             $.ajax({

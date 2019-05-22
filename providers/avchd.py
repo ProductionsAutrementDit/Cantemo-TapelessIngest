@@ -5,6 +5,8 @@ import logging
 import subprocess as sp
 
 import os.path
+import uuid
+
 from portal.plugins.TapelessIngest.metadatas import XMLParser
 from portal.plugins.TapelessIngest.models import Clip, ClipFile, ClipMetadata, Settings
 
@@ -17,67 +19,107 @@ class Provider(BaseProvider):
 
     def __init__(self):
         BaseProvider.__init__(self)
-        self.name = "JVC PRO HD"
-        self.machine_name = "jvcprohd"
+        self.name = "AVCHD"
+        self.machine_name = "avchd"
         self.base_path = ""
         self.clips_path = ""
         self.index_xml = None
         self.card_xml_file = None
+        self.file_extensions = ('.mts', '.m2ts', '.m2t')
 
     def checkPath(self, path):
         if os.path.isdir(path + '/PRIVATE'):
             self.base_path = '/PRIVATE'
         paths = [
-          "/JVC/CQAV/",
+          "/AVCHD/",
         ]
         for possible_path in paths:
-            if os.path.isfile(path + self.base_path + possible_path + 'MEDIAINF.XML'):
-                self.clips_path = path + self.base_path + possible_path
-                self.card_xml_file = self.clips_path + "MEDIAINF.XML"
-                return True
+            if os.path.isdir(path + self.base_path + possible_path + 'BDMV/STREAM'):
+                files = [ f for f in os.listdir(path) if f.lower().endswith(self.file_extensions) ]
+                if len(files) > 0:
+                    self.clips_path = path + self.base_path + possible_path
+                    return True
         return False
+
+
 
     def getClipFilePaths(self, clipname, folder_path):
         possible_paths = []
         folders = [
-            "JVC/CQAV",
-            "PRIVATE/JVC/CQAV",
+            "AVCHD",
+            "PRIVATE/AVCHD",
         ]
         for folder in folders:
-            possible_paths.append(os.path.join(folder_path, folder, 'CLIP', clipname))
+            possible_paths.append(os.path.join(folder_path, folder, 'BDMV/STREAM', clipname))
         return possible_paths
 
+
     def getAllClips(self, folder):
-        # get all clip from MEDIAPRO.XML file
         clips = []
-        path = folder.path
-        self.clips_xml = XMLParser(self.card_xml_file)
-        if self.clips_xml.root is not None:
-            for material in self.clips_xml.getValueFromPath('Contents/ClipInfo/Individual'):
 
-                metadatas_file = os.path.join(self.clips_path, self.clips_xml.getValueFromPath("@info", root=material))
-                material_file = os.path.join(self.clips_path, self.clips_xml.getValueFromPath("@name", root=material))
+        infos, reel = self.getFilesInfos(folder)
+        for material in infos.findall('Contents/Material'):
+            Clip = self.createClipFromFile(folder, material, reel)
+            if Clip is not False:
+                clips.append(Clip)
+            else:
+                log.error("Unable to parse %s" % clip_file)
 
-
-                umid = self.clips_xml.getValueFromPath("@umid", root=material)
-                extra_infos = {}
-
-                extra_infos['wrapping'] = self.clips_xml.getValueFromPath("@wrapping", root=material)
-                extra_infos['shooting_date'] = self.clips_xml.getValueFromPath("@creationDate", root=material)
-                extra_infos['timecode'] = self.clips_xml.getValueFromPath("@startTc", root=material)
-                extra_infos['duration'] = self.clips_xml.getValueFromPath("@duration", root=material)
-                extra_infos['video_codec'] = self.clips_xml.getValueFromPath("@videoCodec", root=material)
-                extra_infos['spanning_status'] = self.clips_xml.getValueFromPath("@spanningStatus", root=material)
-
-                if os.path.isfile(material_file) and os.path.isfile(metadatas_file):
-                    Clip = self.createClipFromFile(folder, umid, metadatas_file, material_file, extra_infos)
-                    if Clip is not False:
-                        clips.append(Clip)
-                    else:
-                        log.error("Unable to parse %s" % metadatas_file)
-                else:
-                    log.error("Listed clip %s has no video (%s, %s)" % (umid, material_file, metadatas_file))
         return clips
+
+    def getFilesInfos(self, folder):
+
+        path = folder.path
+
+        self.card_xml_file = os.path.join(path, "cantemo_ingest_log.xml")
+
+        # Check if there already is a reel entry for the given path
+        try:
+            reel = Reel.objects.filter(folder_path=path)[0]
+        except IndexError:
+            reel_umid = uuid.uuid4()
+            reel = Reel(pk=reel_umid)
+            reel.folder_path = path
+            reel.save()
+
+        if os.path.isfile(self.card_xml_file):
+            root = etree.parse(self.card_xml_file)
+
+        else:
+            # Get all files in folder
+            root = etree.Element("CantemoIngestLog")
+
+            videos = etree.SubElement(root, "Contents")
+
+            files = [ f for f in os.listdir(path) if f.lower().endswith(self.file_extensions) ]
+
+            for file in files:
+
+                file_path = os.path.join(path, file)
+
+                umid = uuid.uuid4()
+
+                process = sp.Popen(['/usr/bin/ffprobe', '-v', 'quiet', '-print_format', 'xml', '-show_format', '-show_streams', file_path], stdout=sp.PIPE, stderr=sp.STDOUT)
+                stdout, stderr = process.communicate()
+
+                clip = etree.fromstring(stdout)
+                format = clip.find('format')
+
+                if format is not None:
+
+                    clip.tag = "Material"
+                    clip.set('umid',str(umid))
+
+                    format.set('filename', file)
+
+                    videos.append(clip)
+
+            xml_output = etree.ElementTree(root)
+            xml_output.write(self.card_xml_file, xml_declaration=True, encoding='utf-16')
+
+        reel.media_xml = etree.tostring(root)
+        reel.save()
+        return root, reel
 
 
     def createClipFromFile(self, folder, umid, metadatas_file, material_file, extra_infos):
@@ -91,6 +133,9 @@ class Provider(BaseProvider):
               'provider': self,
               'folder_path': path
             })
+            if clip.reel_id is None:
+                clip.reel = reel
+                clip.save()
 
             log.debug("Create metadatas for %s" % umid)
 

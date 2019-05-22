@@ -1,7 +1,8 @@
 ! function(FolderTable) {
-    
+
     FolderTable.Folder = Backbone.Model.extend({
         defaults: {
+          storage: "",
           basename: "",
           path: ""
         },

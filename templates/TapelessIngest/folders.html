@@ -7,7 +7,7 @@
   }
 </style>
 
-<small>{{ path }}</small>
+<small>{{ current_path }}</small>
 <div class="folder-table-container">
   <table class="generictbl" id="pathtable">
     <thead>
@@ -23,13 +23,12 @@
           <td></td>
         </tr>
       {% endif %}
-      {% for name, path in folders %}
+      {% for name, folder in folders %}
         <tr class="{% cycle 'odd' 'even' %}">
-          <td class="folderitem"><span class="ui-icon ui-icon-folder-open"></span> <a href="#" data-path="{{ path }}" class="folder-link">{{name}}</a></td>
-          <td class=""><a href="#" data-path="{{ path }}" class="folder-add-link">Add</a></td>
+          <td class="folderitem"><span class="ui-icon ui-icon-folder-open"></span> <a href="#" data-path="{{ folder.path }}" class="folder-link">{{name}}</a></td>
+          <td class=""><a href="#" data-path="{{ folder.path }}" class="folder-add-link">Add</a></td>
         </tr>
       {% endfor %}
     </tbody>
   </table>
 </div>
-

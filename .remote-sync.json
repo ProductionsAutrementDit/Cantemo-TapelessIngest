@@ -1,0 +1,19 @@
+{
+  "logger": {
+    "title": "Remote Sync"
+  },
+  "uploadOnSave": false,
+  "useAtomicWrites": false,
+  "deleteLocal": false,
+  "hostname": "192.168.0.90",
+  "port": "22",
+  "target": "/opt/cantemo/portal/portal/plugins/TapelessIngest",
+  "ignore": [
+    ".remote-sync.json",
+    ".git/**"
+  ],
+  "username": "root",
+  "password": "scx#iXbk#/kbG{[9v5y",
+  "watch": [],
+  "transport": "scp"
+}

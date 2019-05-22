@@ -1,8 +1,8 @@
 """
 This is your new plugin handler code.
 
-Put your plugin handling code in here. remember to update the __init__.py file with 
-you app version number. We have automatically generated a GUID for you, namespace, and a url 
+Put your plugin handling code in here. remember to update the __init__.py file with
+you app version number. We have automatically generated a GUID for you, namespace, and a url
 that serves up index.html file
 """
 import logging
@@ -46,7 +46,7 @@ class TapelessingestAdminNavigationPlugin(Plugin):
 navbaradminplug = TapelessingestAdminNavigationPlugin()
 
 class TapelessingestAdminMenuPlugin(Plugin):
-    u""" adds a menu item to the admin screen
+    """ adds a menu item to the admin screen
     """
     implements(IPluginBlock)
 
@@ -156,5 +156,3 @@ class TapelessingestRegister(Plugin):
         return _app_dict
 
 tapelessingestplugin = TapelessingestRegister()
-
-

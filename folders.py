@@ -1,5 +1,5 @@
 """ Helper class for folders """
-    
+
 from django.core.cache import cache
 from os.path import isdir, basename
 from portal.plugins.TapelessIngest.models import Clip
@@ -8,10 +8,10 @@ FOLDER_LIST = cache.get('tapeless_paths', {})
 
 def addFolder(path):
     import portal.plugins.TapelessIngest.providers.providers as Providers
-    
+
     messages = []
     error = False
-    
+
     # remove trailing slashe if needed
     if path.endswith('/'):
         path = path[:-1]
@@ -34,7 +34,7 @@ def addFolder(path):
 
     # store the paths to cache
     cache.set('tapeless_paths', FOLDER_LIST)
-    
+
     return (error, messages)
 
 def removeFolder(path):
@@ -54,4 +54,3 @@ def searchForSpannedClips():
     for folder_path, listed_folder in FOLDER_LIST.items():
         for clip in listed_folder.clips.items():
             test = True
-    

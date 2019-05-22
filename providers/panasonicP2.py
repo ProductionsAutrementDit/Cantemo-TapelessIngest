@@ -27,7 +27,7 @@ class Provider(BaseProvider):
         self.machine_name = "panasonicP2"
         self.clips_path = "/CONTENTS/CLIP/"
         self.clips_file_extension = ".XML"
-        self.video_path = "/CONTENTS/VIDEO/"
+        self.video_path = "CONTENTS/VIDEO/"
         self.video_file_extension = ".MXF"
         self.audio_path = "/CONTENTS/AUDIO/"
 
@@ -36,24 +36,28 @@ class Provider(BaseProvider):
             return True
         else:
             return False
-    
+
+
+    def getClipFilePaths(self, clipname, folder_path):
+        return [os.path.join(folder_path, self.video_path, clipname + self.video_file_extension)]
+
     def createClipFromFile(self, folder, clip_file):
-      
+
         path = folder.path
 
         xml_clip = XMLParser(clip_file)
-        
+
         if xml_clip.root is not None:
 
 
             GlobalClipID = xml_clip.getValueFromPath("ClipContent/GlobalClipID")
-        
+
             clip, created = Clip.objects.get_or_create(umid = GlobalClipID, defaults={
               'provider': self,
               'folder_path': path,
             })
-            
-                
+
+
             self.update_or_create_metadata(clip, 'clipname', xml_clip.getValueFromPath("ClipContent/ClipName"))
             self.update_or_create_metadata(clip, 'timecode', xml_clip.getValueFromPath("ClipContent/EssenceList/Video/StartTimecode"))
             self.update_or_create_metadata(clip, 'duration', xml_clip.getValueFromPath("ClipContent/Duration"))
@@ -91,30 +95,33 @@ class Provider(BaseProvider):
 
 
             clip.input_files.all().delete()
-            InputFile = clip.input_files.create(filetype = 'video', path = path + self.video_path + xml_clip.getValueFromPath("ClipContent/ClipName") + self.video_file_extension)
-            
+            InputFile = clip.input_files.create(filetype = 'video', path = os.path.join(path, self.video_path, xml_clip.getValueFromPath("ClipContent/ClipName") + self.video_file_extension))
+
             audios_count = 0
-            
+
             for Audio in xml_clip.getValueFromPath("ClipContent/EssenceList/Audio"):
                 format = xml_clip.getValueFromPath("AudioFormat", root=Audio)
-                InputFile = clip.input_files.create(filetype = 'audio', path = path + self.audio_path + xml_clip.getValueFromPath("ClipContent/ClipName") + str(audios_count).zfill(2) + "." + format)
+                audio_file_path = path + self.audio_path + xml_clip.getValueFromPath("ClipContent/ClipName") + str(audios_count).zfill(2) + "." + format
+                if os.path.isfile(audio_file_path):
+                    InputFile = clip.input_files.create(filetype = 'audio', path = audio_file_path)
                 audios_count += 1
-                
+
             # check for spanned clips
             if len(clip.metadatas.filter(name='Relation_Top_GlobalClipID')) > 0:
                 Relation_Top_GlobalClipID = clip.metadatas.filter(name='Relation_Top_GlobalClipID')[0]
-                clip.spanned = True
-                #if it's the first clip
-                if Relation_Top_GlobalClipID.value == GlobalClipID:
-                    clip.master_clip = True
-                else:
-                    clip.master_clip = False
-                clip.save()
-            
+                if Relation_Top_GlobalClipID.value != 'False':
+                    clip.spanned = True
+                    #if it's the first clip
+                    if Relation_Top_GlobalClipID.value == GlobalClipID:
+                        clip.master_clip = True
+                    else:
+                        clip.master_clip = False
+                    clip.save()
+
             clip.clip_xml = xml_clip.tostring()
 
             return clip
-        
+
         else:
             log.error(etree.tostring(root))
             return False
@@ -137,11 +144,11 @@ class Provider(BaseProvider):
             return proxy, mime_type
         else:
             return "", ""
-    
 
-    def setSpannedClips(self, clips):        
+
+    def setSpannedClips(self, clips):
         for clip in clips:
-        
+
             if clip.spanned and clip.master_clip:
                 order = 1
                 current_clip = clip
@@ -157,12 +164,12 @@ class Provider(BaseProvider):
                     else:
                         break
                     order += 1
-    
+
     def wrapClip(self, clip, output_path, order = 0):
-      
+
         settings = Settings.objects.get(pk=1)
         bmxtranswrap_bin = settings.bmxtranswrap
-      
+
         log.info("processing spanned clip n.%s: %s" % (order, clip.umid))
         if order is 0:
             outputfile = os.path.join(output_path, clip.umid + ".MXF")
@@ -172,36 +179,36 @@ class Provider(BaseProvider):
         command = [ bmxtranswrap_bin,
                 '-p','-t','op1a',
                 '-o', outputfile,'--group']
-        
+
         input_files = clip.input_files.all()
-        
+
         for input_file in input_files:
             command.append(input_file.path)
-        
+
         log.info("Wrapping command will be: %s" % ' '.join(command))
-        
+
         process = sp.Popen(command, stdout = sp.PIPE, stderr = sp.STDOUT, bufsize=10**8)
         stdoutdata, stderrdata = process.communicate()
-        log.info("Output is: %s, error is: %s" % (stdoutdata, stderrdata))
-        
+        log.debug("Output is: %s, error is: %s" % (stdoutdata, stderrdata))
+
         if os.path.isfile(outputfile):
             log.info("Successfully wrapped %s" % outputfile)
             clip.output_file = outputfile
             clip.save()
         return clip
-    
+
     def stitchClip(self, clip, output_path):
         if clip.spanned and clip.master_clip:
-        
+
             settings = Settings.objects.get(pk=1)
             bmxtranswrap_bin = settings.bmxtranswrap
-        
+
             log.info("processing spanned clips")
             outputfile = os.path.join(output_path, clip.umid + ".MXF")
             command = [ bmxtranswrap_bin,
                     '-p','-t','op1a',
                     '-o', outputfile]
-        
+
             clip_sets = clip.spanned_clips.order_by("order")
             for clip_set in clip_sets:
                 spanned_clip = clip_set.clip
@@ -221,15 +228,15 @@ class Provider(BaseProvider):
                 clip.save()
 
         return clip
-    
-    
-    def doExportClip(self, clip, storage_root_path): 
-             
+
+
+    def doExportClip(self, clip, storage_root_path):
+
         if clip.spanned and clip.master_clip:
-        
+
             settings = Settings.objects.get(pk=1)
             tmp_storage = settings.tmp_storage
-        
+
             log.info("Clip is spanned and master")
 
             clips_to_process = []
@@ -240,8 +247,7 @@ class Provider(BaseProvider):
         else:
             log.info("Clip is not spanned or not master")
             clip = self.wrapClip(clip, storage_root_path)
-        
+
         clip = self.stitchClip(clip, storage_root_path)
 
         return clip
-

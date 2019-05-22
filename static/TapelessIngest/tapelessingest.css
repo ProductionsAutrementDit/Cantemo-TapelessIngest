@@ -1,5 +1,5 @@
 td.LOADING p {
-    background-image: url('/sitemedia/img/icon-button-loader-transparent.gif?7d9e1ad8d7e4') !important; 
+    background-image: url('/sitemedia/img/icon-button-loader-transparent.gif?7d9e1ad8d7e4') !important;
     background-size: 16px 16px !important;
     background-position: 4px !important;
     background-repeat: no-repeat !important;
@@ -107,6 +107,20 @@ td.status-IMPORTED p {
 #FolderView input,
 #MetadataView input {
   max-width: 100%;
+}
+
+.folders-clips-count {
+  display: inline;
+  padding: .2em .6em .3em;
+  font-size: 75%;
+  font-weight: 700;
+  line-height: 1;
+  color: #fff;
+  text-align: center;
+  white-space: nowrap;
+  vertical-align: baseline;
+  border-radius: .25em;
+  background-color: #5bc0de;
 }
 
 .tapelessingest-panels {

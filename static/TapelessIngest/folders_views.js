@@ -1,20 +1,20 @@
 ! function(FolderTable, $, undefined) {
-    
+
     FolderTable.addFolder = Backbone.View.extend({
         tagName: "div",
         events: {},
         initialize: function(options) {
-            this.pathcancelbuttontext = options.pathcancelbuttontext || gettext("Cancel"), 
-            this.title = options.title || gettext("Add Path To Folders"), 
-            this.formURL = options.formURL || "/tapelessingest/browser/", 
-            this.dialogButtons = {}, 
-            this.dialogOptions = options.dialogoptions || {}, 
-            this.getForm(null), 
+            this.pathcancelbuttontext = options.pathcancelbuttontext || gettext("Cancel"),
+            this.title = options.title || gettext("Add Path To Folders"),
+            this.formURL = options.formURL || "/tapelessingest/browser/",
+            this.dialogButtons = {},
+            this.dialogOptions = options.dialogoptions || {},
+            this.getForm(null),
             this.open()
         },
         getForm: function(path) {
             var self = this;
-            $.ajax({  
+            $.ajax({
         			type: "POST",
         			url: this.formURL,
         			data      : {
@@ -80,7 +80,7 @@
             Backbone.View.prototype.remove.call(this)
         }
     }),
-    
+
     FolderTable.FolderTableItemView = Backbone.View.extend({
         tagName: "tr",
         className: "folderitem",
@@ -117,7 +117,7 @@
                   $("#ClipTable").trigger("cntmo.prtl.ClipTableMainView.updateModelEvent");
               }
             }), this.model.view.remove();
-            
+
         },
         addContextPlugin: function(ev, pluginName, callBackEvent, label) {
             this.viewplugin[pluginName] = {
@@ -131,11 +131,11 @@
         removeView: function() {
             this.undelegateEvents(), this.$el.removeData().unbind(), this.remove(), Backbone.View.prototype.remove.call(this)
         }
-        
+
     }),
-    
+
     FolderTable.FolderTableView = Backbone.View.extend({
-        
+
         el: $("#FolderView"),
         id: "FolderView",
         tagName: "div",
@@ -207,7 +207,7 @@
         sendPath: function(event) {
             event && event.preventDefault();
             var self = this;
-            var path = $(self.el).find("#path").val();
+            var path = encodeURI($(self.el).find("#path").val());
             self.addPath(null, path);
         },
         addPath: function(ev, path) {
@@ -227,7 +227,7 @@
                     })
                 }
             })
-          
+
         },
         browseFolders: function() {
           new cntmo.prtl.FolderTable.addFolder({
@@ -238,5 +238,5 @@
                     })
         }
     })
-  
+
 }(cntmo.prtl.FolderTable = cntmo.prtl.FolderTable || {}, jQuery);
