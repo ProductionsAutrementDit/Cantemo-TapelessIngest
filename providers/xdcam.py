@@ -1,190 +1,266 @@
 # coding: utf-8
 
 import logging
-
-import subprocess as sp
-
 import os.path
-from portal.plugins.TapelessIngest.metadatas import XMLParser
-from portal.plugins.TapelessIngest.models import Clip, ClipFile, ClipMetadata, Settings
 
-from portal.plugins.TapelessIngest.providers.providers import Provider as BaseProvider
+from portal.plugins.TapelessIngest.metadatas import XMLParser
+from portal.plugins.TapelessIngest.providers.providers import (
+    Provider as BaseProvider,
+)
 
 log = logging.getLogger(__name__)
 
+
 # Classe ProviderP2: Récupère les clips à partir des fichiers XML du dossier CLIP
 class Provider(BaseProvider):
-
     def __init__(self):
         BaseProvider.__init__(self)
         self.name = "XDCAM"
         self.machine_name = "xdcam"
-        self.base_path = ""
-        self.clips_path = ""
+        self.absolute_path = ""
+        self.subfolder_path = ""
         self.index_xml = None
         self.card_xml_file = None
+        self.clips_file_extension = "XML"
+        self.folder = None
+        self.clip_count = 0
 
-    def checkPath(self, path):
-        self.base_path = path
-        if os.path.isdir(path + '/PRIVATE'):
-            self.base_path = os.path.join(path, 'PRIVATE')
+    def getExtensions(self):
+        return [".mxf", ".mp4"]
 
-        folders = [
-          "XDROOT",
-          "BPAV",
-          "M4ROOT",
-          "",
-        ]
-        for possible_folder in folders:
-            possible_path = os.path.join(self.base_path, possible_folder)
-            if os.path.isfile(os.path.join(possible_path, 'MEDIAPRO.XML')):
-                self.clips_path = possible_path
-                self.card_xml_file = os.path.join(possible_path, 'MEDIAPRO.XML')
-                return True
-        return False
+    def getSubPaths(self):
+        return ["((PRIVATE/)?(M4ROOT/|XDROOT/))?(Clip|CLIP)"]
 
+    def getMediaProMetadatas(self, metadatas, mediapro_xml):
+        metadatas["extension"] = mediapro_xml.getValueFromPath(
+            "Contents/Material[@umid='%s']/@type" % metadatas["umid"]
+        )
+        metadatas["proxy"] = mediapro_xml.getValueFromPath(
+            "Contents/Material[@umid='%s']/Proxy/@uri" % metadatas["umid"]
+        )
+        metadatas["video_codec"] = mediapro_xml.getValueFromPath(
+            "Contents/Material[@umid='%s']/@videoType" % metadatas["umid"]
+        )
+        metadatas["thumbnail"] = mediapro_xml.getValueFromPath(
+            "Contents/Material[@umid='%s']/RelevantInfo[@type='JPG']/@uri"
+            % metadatas["umid"]
+        )
+        metadatas["clip_xml_file"] = mediapro_xml.getValueFromPath(
+            "Contents/Material[@umid='%s']/RelevantInfo[@type='XML']/@uri"
+            % metadatas["umid"]
+        )
+        media_file = mediapro_xml.getValueFromPath(
+            "Contents/Material[@umid='%s']/@uri" % metadatas["umid"]
+        )
+        clipname = os.path.basename(media_file)
+        metadatas["media_file"] = media_file
+        metadatas["clipname"] = clipname
+        return metadatas
 
-    def getClipFilePaths(self, clipname, folder_path):
+    def getAllClipMetadatas(self, metadatas, xml_clip):
+        metadatas["umid"] = xml_clip.getValueFromPath("TargetMaterial/@umidRef")
+        metadatas["timecode"] = xml_clip.getValueFromPath(
+            "LtcChangeTable/LtcChange[@frameCount='0']/@value"
+        )
+        metadatas["duration"] = xml_clip.getValueFromPath("Duration/@value")
+        metadatas["framerate"] = xml_clip.getValueFromPath(
+            "LtcChangeTable/@tcFps"
+        )
+        metadatas["shooting_date"] = xml_clip.getValueFromPath(
+            "CreationDate/@value"
+        )
+        metadatas["device_manufacturer"] = xml_clip.getValueFromPath(
+            "Device/@manufacturer"
+        )
+        metadatas["device_model"] = xml_clip.getValueFromPath(
+            "Device/@modelName"
+        )
+        metadatas["device_serial"] = xml_clip.getValueFromPath(
+            "Device/@serialNo"
+        )
+        metadatas["latitude_ref"] = xml_clip.getValueFromPath(
+            "AcquisitionRecord/Group[@name='ExifGPS']/Item[@name='LatitudeRef']/@value"
+        )
+        metadatas["GPSlatitude"] = xml_clip.getValueFromPath(
+            "AcquisitionRecord/Group[@name='ExifGPS']/Item[@name='Latitude']/@value"
+        )
+        metadatas["GPSlongitude_ref"] = xml_clip.getValueFromPath(
+            "AcquisitionRecord/Group[@name='ExifGPS']/Item[@name='LongitudeRef']/@value"
+        )
+        metadatas["GPSlongitude"] = xml_clip.getValueFromPath(
+            "AcquisitionRecord/Group[@name='ExifGPS']/Item[@name='Longitude']/@value"
+        )
+        metadatas["GPSaltitude_ref"] = xml_clip.getValueFromPath(
+            "AcquisitionRecord/Group[@name='ExifGPS']/Item[@name='AltitudeRef']/@value"
+        )
+        metadatas["GPSaltitude"] = xml_clip.getValueFromPath(
+            "AcquisitionRecord/Group[@name='ExifGPS']/Item[@name='Altitude']/@value"
+        )
+        metadatas["GPStimestamp"] = xml_clip.getValueFromPath(
+            "AcquisitionRecord/Group[@name='ExifGPS']/Item[@name='TimeStamp']/@value"
+        )
+        metadatas["GPSstatus"] = xml_clip.getValueFromPath(
+            "AcquisitionRecord/Group[@name='ExifGPS']/Item[@name='Status']/@value"
+        )
+        metadatas["GPSmeasure_mode"] = xml_clip.getValueFromPath(
+            "AcquisitionRecord/Group[@name='ExifGPS']/Item[@name='MeasureMode']/@value"
+        )
+        metadatas["GPSdop"] = xml_clip.getValueFromPath(
+            "AcquisitionRecord/Group[@name='ExifGPS']/Item[@name='DOP']/@value"
+        )
+        metadatas["GPSmapdatum"] = xml_clip.getValueFromPath(
+            "AcquisitionRecord/Group[@name='ExifGPS']/Item[@name='MapDatum']/@value"
+        )
+        metadatas["GPSdatestamp"] = xml_clip.getValueFromPath(
+            "AcquisitionRecord/Group[@name='ExifGPS']/Item[@name='DateStamp']/@value"
+        )
+        metadatas["GPSdifferential"] = xml_clip.getValueFromPath(
+            "AcquisitionRecord/Group[@name='ExifGPS']/Item[@name='Differential']/@value"
+        )
 
-        possible_paths = []
-        filename, file_extension = os.path.splitext(clipname)
-        if file_extension == '.SMI':
-            filename_mp4 = filename + '.MP4'
-            possible_paths.append(os.path.join(folder_path, 'BPAV/CLPR', filename, filename_mp4))
-        else:
-            folders = [
-                "",
-                "Clip",
-                "CLIP",
-                "XDROOT/Clip",
-                "M4ROOT/CLIP",
-                "PRIVATE",
-                "PRIVATE/XDROOT/Clip",
-                "PRIVATE/BPAV",
-                "PRIVATE/M4ROOT/CLIP",
-            ]
-            for folder in folders:
-                possible_paths.append(os.path.join(folder_path, folder, clipname))
+        metadatas["provider"] = self.machine_name
 
-        return possible_paths
+        return metadatas
 
-    def getAllClips(self, folder):
-        # get all clip from MEDIAPRO.XML file
-        clips = []
-        path = folder.path
-        # Parse MEDIAPRO.XML
-        self.clips_xml = XMLParser(self.card_xml_file)
-        # If parsing is successful
-        if self.clips_xml.root is not None:
-            for material in self.clips_xml.getValueFromPath('Contents/Material', True):
-                metadatas_file = os.path.join(self.clips_path, self.clips_xml.getValueFromPath("RelevantInfo[@type='XML']/@uri", root=material))
-                material_file_relative_path = self.clips_xml.getValueFromPath("@uri", root=material)
-                if not material_file_relative_path.startswith("."):
-                    material_file_relative_path = "." + material_file_relative_path
-                material_file = os.path.join(self.clips_path, material_file_relative_path)
-                umid = self.clips_xml.getValueFromPath("@umid", root=material)
-                extra_infos = {}
-                extra_infos['extension'] = self.clips_xml.getValueFromPath("@type", root=material)
-                extra_infos['proxy'] = self.clips_xml.getValueFromPath("Proxy/@uri", root=material)
-                extra_infos['video_codec'] = self.clips_xml.getValueFromPath("@videoType", root=material)
+    # Create a clip object from an XML file
+    def getMetadatasFromFile(self, media_file, metadatas, context):
+        filename, file_extension = os.path.splitext(media_file["name"])
+        media_absolute_path = os.path.join(
+            context["folder"].root_path, media_file["parent"]
+        )
+        clip_xml = None
+        # Get Metadata File
+        if os.path.isfile(
+            os.path.join(media_absolute_path, filename + "M01.XML")
+        ):
+            metadatas["clip_xml_file"] = f"./Clip/{filename}M01.XML"
+            clip_xml = XMLParser(
+                os.path.join(media_absolute_path, filename + "M01.XML")
+            )
+            metadatas = self.getAllClipMetadatas(metadatas, clip_xml)
+            # Bonus: get MEDIAPRO_XML
+            # there can be multiple media pro if multiple xdcam file structure are in the same folder
+            # So the mediapro_xml context is an dict, keyed by mediapro paths
+            if "mediapro_xml" not in context.keys():
+                context["mediapro_xml"] = {}
+            mediaproxml_path = os.path.join(
+                media_absolute_path, "../MEDIAPRO.XML"
+            )
+            if mediaproxml_path not in context["mediapro_xml"].keys():
+                if os.path.isfile(mediaproxml_path):
+                    context["mediapro_xml"][mediaproxml_path] = XMLParser(
+                        mediaproxml_path
+                    )
+            if mediaproxml_path in context["mediapro_xml"].keys():
+                metadatas = self.getMediaProMetadatas(
+                    metadatas, context["mediapro_xml"][mediaproxml_path]
+                )
 
-                thumbnail = self.clips_xml.getValueFromPath("RelevantInfo[@type='JPG']/@uri", root=material)
-                if thumbnail:
-                    extra_infos['thumbnail'] =  os.path.join(self.clips_path, thumbnail)
-                else:
-                    extra_infos['thumbnail'] = False
+        return metadatas, context
 
-                if extra_infos['extension'] == 'PD-EDL':
-                    # If ther is an EDL file, we have to set spanned clips
-                    components = self.clips_xml.getValueFromPath("Component", raw=True, root=material)
-                    extra_infos['components'] = components
+        # TODO: add PD-EDL handling
+        """"
+        if mediapro_xml is not None:
+            clip.card_xml = mediapro_xml
+            # Search for SMI entries referencing current clip to check if it's master
+            for smi_material in mediapro_xml.getValueFromPath(
+                'Contents/Material[@type="PD-EDL"]', True
+            ):
+                spanned_id = smi_material.get("umid")
+                smi_material_components = mediapro_xml.getValueFromPath(
+                    "Component", True, root=smi_material
+                )
+                previous_component = None
+                next_component = None
+                for smi_material_component in smi_material_components:
+                    if smi_material.get("umid") == umid and previous_component is None:
+                        clip.master_clip = True
+        """
 
-                if os.path.isfile(material_file) and os.path.isfile(metadatas_file):
-                    Clip = self.createClipFromFile(folder, umid, metadatas_file, material_file, extra_infos)
-                    if Clip is not False:
-                        clips.append(Clip)
-                    else:
-                        log.error("Unable to parse %s" % metadatas_file)
-                else:
-                    log.error("Listed clip %s has no video (%s, %s)" % (umid, material_file, metadatas_file))
+    def getClipMediaFiles(self, clip):
+        files = []
+        """
+        if ("extension" in clip.metadatas) and (
+            clip.metadatas["extension"] == "PD-EDL"
+        ):
+            order = 1
+            if len(extra_infos["components"]) == 1:
+                # If there is only one component, no need to make spaned clips:
+                component = extra_infos["components"][0]
+                component_type = self.card_xml.getValueFromPath("@type", root=component)
+                component_uri = self.card_xml.getValueFromPath("@uri", root=component)
+                if component_type == "MP4":
+                    media_file = os.path.join(self.clips_path, component_uri)
+                    files.append({"type": "video", "track": 1, "path": media_file})
+            else:
+                # If it's an EDL clip
+                clip.spanned = True
+                clip.master_clip = True
+
+                for component in extra_infos["components"]:
+                    component_type = self.card_xml.getValueFromPath(
+                        "@type", root=component
+                    )
+
+                    if component_type != "PD-EDL":
+                        component_uri = self.card_xml.getValueFromPath(
+                            "@uri", root=component
+                        )
+                        component_umid = self.card_xml.getValueFromPath(
+                            "@umid", root=component
+                        )
+                        # We get (or create) the spanned clip component
+                        spanned_clip, spanned_clip_created = Clip.objects.get_or_create(
+                            umid=component_umid,
+                            defaults={
+                                "provider": self,
+                                "folder_path": clip.folder_path,
+                            },
+                        )
+                        spanned_clip.spanned = True
+                        spanned_clip.save()
+                        clip.spanned_clips.get_or_create(clip=spanned_clip, order=order)
+                        clip.metadatas["extension"] = component_type
+                        order += 1
+        """
+        media_file_relative_path = os.path.join(
+            clip.path, clip.file.getFileName()
+        )
+        clip_xml_file_relative_path = os.path.join(
+            clip.path, os.path.basename(clip.metadatas["clip_xml_file"])
+        )
+        files.append(
+            {
+                "type": "video",
+                "track": 1,
+                "order": 1,
+                "path": os.path.join(clip.root_path, media_file_relative_path),
+                "file_id": clip.file.getId(),
+            }
+        )
+        files.append(
+            {
+                "type": "metadatas",
+                "track": 1,
+                "order": 1,
+                "path": os.path.join(
+                    clip.root_path, clip_xml_file_relative_path
+                ),
+                "file_id": self.getFileIdFromFullPath(
+                    os.path.join(clip.root_path, clip_xml_file_relative_path)
+                ),
+            }
+        )
+
+        return files
+
+    # Given all clips, nest spanned clips and return only masters
+    def setSpannedClips(self, clips):
+        # Search for SMI files
+        # Build spanned sets from SMI files
         return clips
 
-
-    def createClipFromFile(self, folder, umid, metadatas_file, material_file, extra_infos):
-
-        path = folder.path
-
-        xml_clip = XMLParser(metadatas_file)
-
-        if xml_clip.root is not None:
-            clip, created = Clip.objects.get_or_create(umid = umid, defaults={
-              'provider': self,
-              'folder_path': path
-            })
-
-            log.debug("Create metadatas for %s" % umid)
-
-            timecode = xml_clip.getValueFromPath("LtcChangeTable/LtcChange[@frameCount='0']/@value")
-            timecode_array = reversed([timecode[i:i+2] for i in range(0, len(timecode), 2)])
-
-            self.update_or_create_metadata(clip, 'clipname', os.path.basename(material_file))
-            self.update_or_create_metadata(clip, 'timecode', ':'.join(timecode_array))
-            self.update_or_create_metadata(clip, 'duration', xml_clip.getValueFromPath("Duration/@value"))
-            self.update_or_create_metadata(clip, 'framerate', xml_clip.getValueFromPath("LtcChangeTable/@tcFps"))
-            self.update_or_create_metadata(clip, 'shooting_date', xml_clip.getValueFromPath("CreationDate/@value"))
-            self.update_or_create_metadata(clip, 'device_manufacturer', xml_clip.getValueFromPath("Device/@manufacturer"))
-            self.update_or_create_metadata(clip, 'device_model', xml_clip.getValueFromPath("Device/@modelName"))
-            self.update_or_create_metadata(clip, 'device_serial', xml_clip.getValueFromPath("Device/@serialNo"))
-            if len(extra_infos) > 1:
-                self.update_or_create_metadata(clip, 'video_codec', extra_infos['video_codec'])
-                self.update_or_create_metadata(clip, 'proxy', extra_infos['proxy'])
-                self.update_or_create_metadata(clip, 'thumbnail', extra_infos['thumbnail'])
-
-            clip.input_files.all().delete()
-
-            if extra_infos['extension'] == 'PD-EDL':
-                order = 1
-                if len(extra_infos['components']) == 1:
-                    component = extra_infos['components'][0]
-                    #If ther is only one component, no need to make spaned clips:
-                    component_type = self.clips_xml.getValueFromPath("@type", root=component)
-                    component_uri = self.clips_xml.getValueFromPath("@uri", root=component)
-                    if component_type == 'MP4':
-                        material_file = os.path.join(self.clips_path, component_uri)
-                        InputFile = clip.input_files.create(filetype = 'video', path = material_file)
-                else:
-                    # If it's an EDL clip
-                    clip.spanned = True
-                    clip.master_clip = True
-
-                    for component in extra_infos['components']:
-                        component_type = self.clips_xml.getValueFromPath("@type", root=component)
-
-                        if component_type != 'PD-EDL':
-                            component_uri = self.clips_xml.getValueFromPath("@uri", root=component)
-                            component_umid = self.clips_xml.getValueFromPath("@umid", root=component)
-                            # We get (or create) the spanned clip component from database
-                            spanned_clip, spanned_clip_created = Clip.objects.get_or_create(umid = component_umid, defaults={
-                                'provider': self,
-                                'folder_path': path
-                            })
-                            spanned_clip.spanned = True
-                            spanned_clip.save()
-                            clip.spanned_clips.get_or_create(clip = spanned_clip, order = order)
-                            self.update_or_create_metadata(clip, 'extension', component_type)
-                            order += 1
-            else:
-                InputFile = clip.input_files.create(filetype = 'video', path = material_file)
-
-            clip.clip_xml = xml_clip.tostring()
-
-        else:
-            return False
-
-        return clip
-
     def getThumbnail(self, clip):
-        clip_name = clip.metadatas.filter(name="clipname")[0].value
         thumbnails = clip.metadatas.filter(name="thumbnail")
         if len(thumbnails) > 0:
             thumbnail = thumbnails[0].value
@@ -194,71 +270,3 @@ class Provider(BaseProvider):
 
     def getProxy(self, clip):
         return "", ""
-
-    def copyClip(self, clip, storage_root_path):
-
-        input_file = clip.input_files.all()[0]
-        input_filename, input_file_extension = os.path.splitext(input_file.path)
-
-        outputfile = os.path.join(storage_root_path, clip.umid + input_file_extension)
-        command = [ 'rsync', '--checksum', input_file.path, outputfile ]
-
-        log.info("export clip %s with command %s" % (clip.umid, ' '.join(command)))
-
-        pipe = sp.Popen(command, stdout = sp.PIPE, bufsize=10**8)
-
-        output, err = pipe.communicate(b"input data that is passed to subprocess' stdin")
-
-        if os.path.isfile(outputfile):
-            log.info("Successfully copied %s" % outputfile)
-            clip.output_file = outputfile
-            clip.save()
-        else:
-            log.error("Output file for %s not created" % clip.umid)
-
-        return clip
-
-    def stitchClip(self, clip, storage_root_path):
-
-        settings = Settings.objects.get(pk=1)
-        bmxtranswrap_bin = settings.bmxtranswrap
-
-        input_file_extension = clip.metadatas.filter(name="extension")[0].value
-
-        log.info("processing spanned clips")
-        outputfile = os.path.join(storage_root_path, clip.umid + "." + input_file_extension)
-
-        log.info("Output file will be %s" % outputfile)
-
-        command = [ bmxtranswrap_bin,
-                '-p','-t','op1a',
-                '-o', outputfile]
-
-        clip_sets = clip.spanned_clips.order_by("order")
-        for clip_set in clip_sets:
-            spanned_clip = clip_set.clip
-            input_files = spanned_clip.input_files.all()
-            for input_file in input_files:
-                command.append(input_file.path)
-
-        log.info("Encoding command will be: %s" % ' '.join(command))
-        process = sp.Popen(command, stdout = sp.PIPE, stderr = sp.STDOUT, bufsize=10**8)
-        stdoutdata, stderrdata = process.communicate()
-        log.info("Output is: %s, error is: %s" % (stdoutdata, stderrdata))
-
-        if os.path.isfile(outputfile):
-            log.info("Successfully encoded %s" % outputfile)
-            clip.output_file = outputfile
-            clip.save()
-        else:
-            log.error("Output file for %s not created" % clip.umid)
-
-        return clip
-
-    def doExportClip(self, clip, storage_root_path):
-        if clip.spanned and clip.master_clip:
-            clip = self.stitchClip(clip, storage_root_path)
-        if not clip.spanned:
-            clip = self.copyClip(clip, storage_root_path)
-
-        return clip

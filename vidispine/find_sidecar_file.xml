@@ -1,0 +1,93 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<TaskDefinitionDocument id="127884" xmlns="http://xml.vidispine.com/schema/vidispine">
+    <description>Finding additional sidecar files</description>
+    <extradata>f</extradata>
+    <flags>12</flags>
+    <script>/* main */
+
+function endsWith(str, suffix) {
+    return str.indexOf(suffix, str.length - suffix.length) !== -1;
+}
+
+var sidecarUrisStr = job.getData("sidecarUris");
+var sidecarUris;
+var sidecarSource = false;
+var fileIdsStr = job.getData("sourceFileIds");
+if (!fileIdsStr) {
+  fileIdsStr = job.getData("sourceFileId");
+}
+
+if (fileIdsStr) {
+  var fileIds = fileIdsStr.split(",");
+
+  if (sidecarUrisStr) {
+    sidecarUris = sidecarUrisStr.split('\n');
+  } else {
+    sidecarUris = [];
+  }
+
+  logger.log("SIDECAR FILES: fileIds=" + fileIds);
+  fileIds.forEach(function(fileId) {
+    /* For each source file, get the list of sidecar files */
+    var result = api.user("admin").path("storage/file/" + fileId).dataType("json").get();
+    if (result) {
+      var storage = result.storage;
+      var filename = result.path;
+      logger.log("SIDECAR FILES: Found filename " + filename + " for file id " + fileId);
+
+      /* Remove the extension */
+      var baseFilename = filename.replace(/\.[^/.]+$/, "");
+
+      ["stl", "xmp", "xml"].forEach(function(extension) {
+        if (endsWith(filename, "." + extension)) {
+          /* If it is a sidecar file being imported as binary data do not look for other sidecars */
+          sidecarSource = true;
+          sidecarUris = [];
+        } else {
+          /* import any xmp, xml or stl file which begins with the same */
+          var vsSidecarFiles = api.user("admin")
+              .path("storage/" + storage + "/file/")
+              .queryParam("wildcard", "true")
+              .queryParam("ignorecase", "true")
+              .queryParam("path", baseFilename + "*." + extension)
+              .dataType("json").get();
+
+            vsSidecarFiles.file.forEach(function(file) {
+              if (sidecarUris.indexOf(file.id) == -1) {
+                sidecarUris.push(file.id);
+            }
+          });
+        }
+      });
+    } else {
+      logger.log("SIDECAR FILES: Could not find file with id " + fileId);
+    }
+  });
+
+
+  if (sidecarSource == true) {
+    logger.log("SIDECAR FILES: Importing a sidecar format file as data asset. Extra sidecars disabled for this asset.");
+    job.setData("sidecarUris", "");
+  }
+  if (sidecarUris.length &gt; 0) {
+    var newSidecarUrisStr = sidecarUris.join('\n');
+    logger.log("SIDECAR FILES: Setting sidecarUris to " + newSidecarUrisStr);
+    job.setData("sidecarUris", newSidecarUrisStr);
+  }
+}
+</script>
+    <step>1090</step>
+    <dependency>
+        <step>0</step>
+        <previous>true</previous>
+        <allPrevious>false</allPrevious>
+    </dependency>
+    <parallelDependency>
+        <step>0</step>
+        <previous>true</previous>
+        <allPrevious>false</allPrevious>
+    </parallelDependency>
+    <jobType>PLACEHOLDER_IMPORT</jobType>
+    <cleanup>false</cleanup>
+    <critical>true</critical>
+</TaskDefinitionDocument>

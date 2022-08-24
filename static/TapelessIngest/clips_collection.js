@@ -3,7 +3,7 @@
         model: cntmo.prtl.ClipTable.Clip,
         url: "/tapelessingest/clips/",
         parse: function(data) {
-            return data;
+            return data.results;
         },
         initialize: function() {},
         comparator: function(collection) {
@@ -22,6 +22,6 @@
         getSelectedorAll: function() {
             return 0 === this.getSelected().length ? this.models : this.getSelected()
         },
-      
+
     })
 }(cntmo.prtl.ClipTable = cntmo.prtl.ClipTable || {}, jQuery);

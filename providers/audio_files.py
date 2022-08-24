@@ -9,7 +9,8 @@ import os
 import uuid
 
 from portal.plugins.TapelessIngest.metadatas import XMLParser
-from portal.plugins.TapelessIngest.models import Clip, ClipFile, ClipMetadata, Settings
+from portal.plugins.TapelessIngest.models.clip import Clip, ClipFile, ClipMetadata
+from portal.plugins.TapelessIngest.models.settings import Settings
 
 from portal.plugins.TapelessIngest.providers.providers import Provider as BaseProvider
 
@@ -35,12 +36,12 @@ class Provider(BaseProvider):
         else:
             return False
 
-    def getAllClips(self, folder):
+    def getAllClips(self, path):
         clips = []
 
-        infos = self.getFilesInfos(folder)
+        infos = self.getFilesInfos(path)
         for material in infos.findall('Contents/Material'):
-            Clip = self.createClipFromFile(folder, material)
+            Clip = self.createClipFromFile(path, material)
             if Clip is not False:
                 Clip.media_xml = etree.tostring(infos)
                 clips.append(Clip)
@@ -50,12 +51,10 @@ class Provider(BaseProvider):
         return clips
 
 
-    def getClipFilePaths(self, clipname, folder_path):
-        return [os.path.join(folder_path, clipname)]
+    def getClipFilePaths(self, clipname, path):
+        return [os.path.join(path, clipname)]
 
-    def getFilesInfos(self, folder):
-
-        path = folder.path
+    def getFilesInfos(self, path):
 
         self.card_xml_file = os.path.join(path, "cantemo_ingest_log.xml")
 
@@ -96,9 +95,7 @@ class Provider(BaseProvider):
 
         return root
 
-    def createClipFromFile(self, folder, material):
-
-        path = folder.path
+    def createClipFromFile(self, path, material):h
 
         umid = material.get('umid')
         format = material.find('format')
@@ -106,7 +103,8 @@ class Provider(BaseProvider):
 
         clip, created = Clip.objects.get_or_create(umid = umid, defaults={
           'provider': self,
-          'folder_path': path
+          'folder_path': path,
+          'spanned': False
         })
 
         log.debug("Create metadatas for %s" % umid)
@@ -148,14 +146,14 @@ class Provider(BaseProvider):
         for tag in tags:
             key = tag.get("key")
             value = tag.get("value")
-            self.update_or_create_metadata(clip, key, value)
+            clip.metadatas[key] = value
 
-        self.update_or_create_metadata(clip, 'clipname', format.get('filename'))
-        self.update_or_create_metadata(clip, 'timecode', timecode)
-        self.update_or_create_metadata(clip, 'time_base', time_base)
-        self.update_or_create_metadata(clip, 'duration', frames)
-        self.update_or_create_metadata(clip, 'shooting_date', shooting_date)
-        self.update_or_create_metadata(clip, 'audio_codec', audio_codec)
+        clip.metadatas['clipname'] = format.get('filename')
+        clip.metadatas['timecode'] = timecode
+        clip.metadatas['time_base'] = time_base
+        clip.metadatas['duration'] = frames
+        clip.metadatas['shooting_date'] = shooting_date
+        clip.metadatas['audio_codec'] = audio_codec
 
 
         clip.clip_xml = etree.tostring(material)

@@ -1,0 +1,135 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<TaskDefinitionListDocument xmlns="http://xml.vidispine.com/schema/vidispine">
+    <task id="460">
+        <description>Setting up.</description>
+        <extradata>f</extradata>
+        <flags>12</flags>
+        <bean>ShapeImportTaskBean</bean>
+        <method>setup</method>
+        <plugin>false</plugin>
+        <step>100</step>
+        <dependency>
+            <step>0</step>
+            <previous>false</previous>
+            <allPrevious>true</allPrevious>
+        </dependency>
+        <parallelDependency>
+            <step>0</step>
+            <previous>false</previous>
+            <allPrevious>false</allPrevious>
+        </parallelDependency>
+        <jobType>SHAPE_IMPORT</jobType>
+        <cleanup>false</cleanup>
+        <critical>true</critical>
+    </task>
+    <task id="461">
+        <description>Transferring content.</description>
+        <extradata>//</extradata>
+        <flags>12</flags>
+        <bean>ShapeImportTaskBean</bean>
+        <method>transfer</method>
+        <plugin>false</plugin>
+        <step>200</step>
+        <dependency>
+            <step>0</step>
+            <previous>false</previous>
+            <allPrevious>false</allPrevious>
+        </dependency>
+        <parallelDependency>
+            <step>0</step>
+            <previous>true</previous>
+            <allPrevious>false</allPrevious>
+        </parallelDependency>
+        <jobType>SHAPE_IMPORT</jobType>
+        <cleanup>false</cleanup>
+        <critical>true</critical>
+    </task>
+    <task id="462">
+        <description>Performing media check.</description>
+        <extradata>//</extradata>
+        <flags>12</flags>
+        <bean>ShapeImportTaskBean</bean>
+        <method>mediaCheck</method>
+        <plugin>false</plugin>
+        <step>300</step>
+        <dependency>
+            <step>0</step>
+            <previous>false</previous>
+            <allPrevious>false</allPrevious>
+        </dependency>
+        <parallelDependency>
+            <step>0</step>
+            <previous>true</previous>
+            <allPrevious>false</allPrevious>
+        </parallelDependency>
+        <jobType>SHAPE_IMPORT</jobType>
+        <cleanup>false</cleanup>
+        <critical>true</critical>
+    </task>
+    <task id="463">
+        <description>Analyzing media check.</description>
+        <extradata>//</extradata>
+        <flags>76</flags>
+        <bean>ShapeImportTaskBean</bean>
+        <method>finalizeImport</method>
+        <plugin>false</plugin>
+        <step>400</step>
+        <dependency>
+            <step>0</step>
+            <previous>true</previous>
+            <allPrevious>false</allPrevious>
+        </dependency>
+        <parallelDependency>
+            <step>0</step>
+            <previous>false</previous>
+            <allPrevious>false</allPrevious>
+        </parallelDependency>
+        <jobType>SHAPE_IMPORT</jobType>
+        <cleanup>false</cleanup>
+        <critical>true</critical>
+    </task>
+    <task id="464">
+        <description>Remove old essence files.</description>
+        <extradata>//</extradata>
+        <flags>76</flags>
+        <bean>ShapeImportTaskBean</bean>
+        <method>removeOldEssenceFiles</method>
+        <plugin>false</plugin>
+        <step>1000</step>
+        <dependency>
+            <step>0</step>
+            <previous>true</previous>
+            <allPrevious>false</allPrevious>
+        </dependency>
+        <parallelDependency>
+            <step>0</step>
+            <previous>false</previous>
+            <allPrevious>false</allPrevious>
+        </parallelDependency>
+        <jobType>SHAPE_IMPORT</jobType>
+        <cleanup>false</cleanup>
+        <critical>true</critical>
+    </task>
+    <task id="465">
+        <description>Cleaning up.</description>
+        <extradata>f</extradata>
+        <flags>12</flags>
+        <bean>ShapeImportTaskBean</bean>
+        <method>cleanup</method>
+        <plugin>false</plugin>
+        <step>5000</step>
+        <dependency>
+            <step>0</step>
+            <previous>false</previous>
+            <allPrevious>false</allPrevious>
+        </dependency>
+        <parallelDependency>
+            <step>0</step>
+            <previous>false</previous>
+            <allPrevious>false</allPrevious>
+        </parallelDependency>
+        <jobType>SHAPE_IMPORT</jobType>
+        <cleanup>true</cleanup>
+        <critical>true</critical>
+    </task>
+</TaskDefinitionListDocument>

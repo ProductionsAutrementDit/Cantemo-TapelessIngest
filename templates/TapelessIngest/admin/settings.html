@@ -2,7 +2,13 @@
 {% load i18n %}
 {% block title %} TapelessIngest {% endblock %}
 {% block heading %} TapelessIngest Settings {% endblock heading %}
-
+{% block extra_script %}
+<script type="text/javascript" charset="utf-8">
+    var STATIC_URL = '{{ STATIC_URL }}';
+    var metadatas_count = parseInt('{{ metadatas|length }}',10)-1;
+</script>
+<script type="text/javascript" src="{{ STATIC_URL }}js/libs/select2/select2.js"></script>
+{% endblock %}
 {% block content %}
 <style>
     .file_valid {
@@ -16,75 +22,93 @@
 
 <div class="itemcontent">
 
-    <form action="{% url tapelessingest:settings %}" method="POST" class="formmain">
+    <form method="POST" class="formmain">
         {% csrf_token %}
         <fieldset>
-
-            <h3><strong>Global settings</strong></h3>
-            <ul>
-                <li>
-                    <label for="storage">Target storage</label>
-                    {{ settings_form.storage_id }} {% if storage_root_path %}{{ storage_root_path }}{% endif %}
-                </li>
-
-                <li>
-                    <label for="storage">Temporary storage</label>
-                    {{ settings_form.tmp_storage }}
-                </li>
-
-                <li>
-                    <label for="storage">Base folder</label>
-                    {{ settings_form.base_folder }}
-                </li>
-
-                <li>
-                    <label for="storage">BMXTransWrap library</label>
-                    {{ settings_form.bmxtranswrap }}
-                </li>
-
-                <li>
-                    <label for="storage">MXF2Raw library</label>
-                    {{ settings_form.mxf2raw }}
-                </li>
+            <ul class="tabs">
+                <li><a href="#settings_tab"><em>{% trans "Global Settings" %}</em></a></li>
+                <li><a href="#ignoredfolders_tab"><em>{% trans "Ignored Folders" %}</em></a></li>
+                <li><a href="#renamedfolders_tab"><em>{% trans "Renamed Folders" %}</em></a></li>
+                <li><a href="#metadatasmapping_tab"><em>{% trans "Metadatas Mappings" %}</em></a></li>
             </ul>
-            <h3><strong>Metadatas mappings</strong></h3>
-            <table class="generictbl dataTable" id="videotagtable" aria-describedby="videotagtable_info">
-              {% if forloop.first %}
-              <thead>
-                <tr>
-                  {% for field in metadatas_form.visible_fields %}
-                  <th>{{ field.label|capfirst }}</th>
-                  {% endfor %}
-                </tr>
-              </thead>
-              {% endif %}
-              <tbody>
-                {% for metadata in metadatas %}
-                <tr class="{% cycle row1,row2 %}">
-                    <td>{{metadata.metadata_provider}}</td>
-                    <td>{{metadata.metadata_portal}} <a href="{% url tapelessingest:metadata_remove metadata_id=metadata.pk %}">Remove</a></td>
-                </tr>
-                {% endfor %}
-                <tr>
-                {% for field in metadatas_form.visible_fields %}
-                  <td>
-                  {# Include the hidden fields in the form #}
-                  {% if forloop.first %}
-                    {% for hidden in metadatas_form.hidden_fields %}
-                    {{ hidden }}
-                    {% endfor %}
-                  {% endif %}
-                    {{ field.errors.as_ul }}
-                    {{ field }}
-                  </td>
-                {% endfor %}
-                </tr>
-              </tbody>
-            </table>
+
+            <div class="panes">
+                <div id="settings_tab" class="clearfix tab">
+                    <ul>
+                        <li>
+                            <label for="settings-storage_id">Target storage</label>
+                            {{ settings_form.storage_id }} {% if storage_root_path %}{{ storage_root_path }}{% endif %}
+                        </li>
+        
+                        <li>
+                            <label for="settings-tmp_storage">Temporary storage</label>
+                            {{ settings_form.tmp_storage }}
+                        </li>
+        
+                        <li>
+                            <label for="settings-base_folder">Base folder</label>
+                            {{ settings_form.base_folder }}
+                        </li>
+        
+                        <li>
+                            <label for="settings-bmxtranswrap">BMXTransWrap library</label>
+                            {{ settings_form.bmxtranswrap }}
+                        </li>
+        
+                        <li>
+                            <label for="settings-mxf2raw">MXF2Raw library</label>
+                            {{ settings_form.mxf2raw }}
+                        </li>
+                    </ul>
+                </div>
+                <div id="ignoredfolders_tab" class="clearfix tab">
+                    <label for="settings-collections_ignore_folder_str">Ignore these folder when creating collection</label>
+                    {{ settings_form.collections_ignore_folder_str }}
+                </div>
+                <div id="renamedfolders_tab" class="clearfix tab">
+                    <label for="settings-collections_rename_folder_str">Rename these folder when creating collection</label>
+                    {{ settings_form.collections_rename_folder_str }}
+                </div>
+                <div id="metadatasmapping_tab" class="clearfix tab">
+                    <ul>
+                        {{ metadatas_form.management_form }}
+                        {{ metadatas_form.non_form_errors }}
+                        <table class="generictbl" id="tablemetadatasmapping">
+                            <tr>
+                                <th>{% trans 'Camera metadata' %}</th>
+                                <th>{% trans 'Portal metadata' %}</th>
+                                <th></th>
+                                <th>{% trans 'Remove?' %}</th>
+                            </tr>
+                            {% for form in metadatas_form %}
+                                {% if form.non_field_errors or form.errors %}
+                                <tr>
+                                    <td colspan=3>
+                                        {{form.non_field_errors}}
+                                    </td>
+                                </tr>
+                                {% endif %}
+                                <tr>
+                                    {% for field in form %}
+                                        <td class="form-select2">{{field.errors}} {{field}}</td>
+                                    {% endfor %}
+                                </tr>
+                            {% endfor %}
+                            <tr id="metadata-empty-form">
+                                {% for field in metadatas_form.empty_form %}
+                                    <td class="metadata-new-form-__prefix__">{{field.errors}} {{field}}</td>
+                                {% endfor %}
+                            </tr>
+                        </table>
+                        <li class="mono"><button id="addmmbut" class="button">{% trans "Add Mapping" %}</button></li>
+                    </ul>
+                </div>
+            </div>
 
             <ul>
                 <li class="mono">
-                    <input type="Submit"/>
+                    <input type="submit" value="{% trans 'Save &amp; continue' %}" id="submit" class="button"/>
+                    <input type="submit" value="{% trans 'Loading' %}..." id="submit_loading" class="button" style="visibility: hidden" disabled/>
                 </li>
             </ul>
         </fieldset>
@@ -96,3 +120,33 @@
 
 </script>
 {% endblock content %}
+{% block inlinejs %}
+<script>
+    $(document).ready(function() {
+
+        $("ul.tabs").tabs("div.panes > div");
+        $('#metadata-empty-form').hide();
+        
+        $('#tablemetadatasmapping .form-select2 select').select2();
+        
+        var tblRC = metadatas_count + 1,
+        tblEL = 0;
+        
+        $("#addmmbut").click(function(e) {
+            e.preventDefault();
+            var form_idx = $('#id_metadata-TOTAL_FORMS').val();
+            var newElement = $('#metadata-empty-form').clone().removeAttr('id').show();
+            //newElement.find('select').select2();
+            newElement.html(newElement.html().replace(/__prefix__/g, form_idx))
+            $('#tablemetadatasmapping tbody').append(newElement);
+            $('.metadata-new-form-' + form_idx + ' select').select2();
+            $('#id_metadata-TOTAL_FORMS').val(parseInt(form_idx) + 1);
+        });
+        
+        $(".deletegprow").live("click", function() {
+            $(this).parents("tr").remove()
+        })
+    });
+</script>
+
+{% endblock inlinejs %}

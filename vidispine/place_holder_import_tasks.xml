@@ -1,0 +1,887 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<TaskDefinitionListDocument xmlns="http://xml.vidispine.com/schema/vidispine">
+    <task id="339">
+        <description>Creating entities.</description>
+        <extradata>d</extradata>
+        <flags>12</flags>
+        <bean>ContentImportTaskBean</bean>
+        <method>createEntities</method>
+        <plugin>false</plugin>
+        <step>100</step>
+        <dependency>
+            <step>0</step>
+            <previous>false</previous>
+            <allPrevious>true</allPrevious>
+        </dependency>
+        <parallelDependency>
+            <step>0</step>
+            <previous>false</previous>
+            <allPrevious>false</allPrevious>
+        </parallelDependency>
+        <jobType>PLACEHOLDER_IMPORT</jobType>
+        <cleanup>false</cleanup>
+        <critical>true</critical>
+    </task>
+    <task id="340">
+        <description>Transferring file to storage.</description>
+        <extradata>//</extradata>
+        <flags>12</flags>
+        <bean>ContentImportTaskBean</bean>
+        <method>transferContent</method>
+        <plugin>false</plugin>
+        <step>200</step>
+        <dependency>
+            <step>0</step>
+            <previous>true</previous>
+            <allPrevious>false</allPrevious>
+        </dependency>
+        <parallelDependency>
+            <step>0</step>
+            <previous>false</previous>
+            <allPrevious>false</allPrevious>
+        </parallelDependency>
+        <jobType>PLACEHOLDER_IMPORT</jobType>
+        <cleanup>false</cleanup>
+        <critical>true</critical>
+    </task>
+    <task id="341">
+        <description>Finalizing the transfer.</description>
+        <extradata>d</extradata>
+        <flags>12</flags>
+        <bean>ContentImportTaskBean</bean>
+        <method>finalizeTransfer</method>
+        <plugin>false</plugin>
+        <step>300</step>
+        <dependency>
+            <step>0</step>
+            <previous>true</previous>
+            <allPrevious>false</allPrevious>
+        </dependency>
+        <parallelDependency>
+            <step>0</step>
+            <previous>false</previous>
+            <allPrevious>false</allPrevious>
+        </parallelDependency>
+        <jobType>PLACEHOLDER_IMPORT</jobType>
+        <cleanup>false</cleanup>
+        <critical>true</critical>
+    </task>
+    <task id="342">
+        <description>Performing media check.</description>
+        <extradata>//,noxmp</extradata>
+        <flags>12</flags>
+        <bean>ContentImportTaskBean</bean>
+        <method>performMediaCheck</method>
+        <plugin>false</plugin>
+        <step>400</step>
+        <dependency>
+            <step>0</step>
+            <previous>false</previous>
+            <allPrevious>false</allPrevious>
+        </dependency>
+        <parallelDependency>
+            <step>200</step>
+            <previous>false</previous>
+            <allPrevious>false</allPrevious>
+        </parallelDependency>
+        <jobType>PLACEHOLDER_IMPORT</jobType>
+        <cleanup>false</cleanup>
+        <critical>true</critical>
+    </task>
+    <task id="343">
+        <description>Analyzing media check.</description>
+        <extradata>//</extradata>
+        <flags>76</flags>
+        <bean>ContentImportTaskBean</bean>
+        <method>finalizeJob</method>
+        <plugin>false</plugin>
+        <step>500</step>
+        <dependency>
+            <step>0</step>
+            <previous>true</previous>
+            <allPrevious>false</allPrevious>
+        </dependency>
+        <parallelDependency>
+            <step>0</step>
+            <previous>false</previous>
+            <allPrevious>false</allPrevious>
+        </parallelDependency>
+        <jobType>PLACEHOLDER_IMPORT</jobType>
+        <cleanup>false</cleanup>
+        <critical>true</critical>
+    </task>
+    <task id="127872">
+        <description>Checking mime-type.</description>
+        <extradata>f</extradata>
+        <flags>12</flags>
+        <script>function doubleDigits(n) {
+  if (n &lt; 10) {
+    return "0"+n;
+  }
+  return n;
+}
+
+function tripleDigits(n) {
+  if (n &lt; 10) {
+    return "00" + n;
+  } else if (n &lt; 100) {
+    return "0" + n;
+  }
+  return n;
+}
+
+function getDateString() {
+  var d = new Date();
+  return d.getUTCFullYear() + "-" + doubleDigits(d.getUTCMonth()+1) + "-" + doubleDigits(d.getUTCDate()) 
+    + "T" + doubleDigits(d.getUTCHours()) + ":" + doubleDigits(d.getUTCMinutes()) + ":" + doubleDigits(d.getUTCSeconds()) 
+    + "." + tripleDigits(d.getUTCMilliseconds()) + "Z";
+}
+
+function createMetadataField(type, name) {
+  var field = &lt;MetadataFieldDocument xmlns="http://xml.vidispine.com/schema/vidispine"&gt;
+      &lt;name&gt;{name}&lt;/name&gt;
+      &lt;type&gt;{type}&lt;/type&gt;
+      &lt;/MetadataFieldDocument&gt;;
+  var result = api.user("admin").path("metadata-field/"+name).dataType("xml").input(field, "application/xml").put();
+}
+
+function setMetadataField(name, value) {
+  var metadata = &lt;MetadataDocument xmlns="http://xml.vidispine.com/schema/vidispine"&gt;
+      &lt;timespan start="-INF" end="+INF"&gt;
+      &lt;field&gt;
+      &lt;name&gt;{name}&lt;/name&gt;
+      &lt;value&gt;{value}&lt;/value&gt;
+      &lt;/field&gt;
+    &lt;/timespan&gt;
+    &lt;/MetadataDocument&gt;;
+
+  var itemId = job.getData("itemId");
+  var result = api.user("admin").path("item/"+itemId+"/metadata").dataType("xml").input(metadata, "application/xml").put();
+}
+
+function mimeEquals(m1, m2) {
+  var mime1 = m1.split("/");
+  var mime2 = m2.split("/");
+
+  if (mime1[1] == "*") {
+    return mime1[0] == mime2[0];
+  } else {
+    return mime1[0] == mime2[0] &amp;&amp; mime1[1] == mime2[1];
+  }
+}
+
+function stripDeclaration(xml) {
+  if (xml.indexOf("&lt;?xml") &gt;= 0) {
+    return xml.substring(xml.indexOf("?&gt;") + 2);
+  }
+  return xml;
+}
+
+var portalGroups = "portal_groups";
+var portalImportMap = "portal_importmap";
+
+var INGEST_TIMESTAMP  = "portal_ingested";
+var ORIGINAL_MIMETYPE = "original_mimetype";
+
+if (job.getData(portalGroups) == null) {
+  logger.log("No group metadata found, skipping.");
+} else {
+  if (job.getUser() == null) {
+    job.fatalFail("Could not find a username");
+  }
+  if (job.getData("mimeType") == null) {
+    job.fatalFail("Could not find a mime-type");
+  }
+  createMetadataField("date-sortable", INGEST_TIMESTAMP);
+  setMetadataField(INGEST_TIMESTAMP, getDateString());
+
+  createMetadataField("string", ORIGINAL_MIMETYPE);
+  setMetadataField(ORIGINAL_MIMETYPE, job.getData("mimeType"));
+
+  var username = job.getUser();
+
+  if (username == "system") {
+    username = null;
+  }
+
+  logger.log("Portal groups: "+job.getData(portalGroups));
+  var groupData = job.getData(portalGroups).split(",");
+  for(var i = 0; i &lt; groupData.length; i++) {
+    var groupname = groupData[i];
+    logger.log("Going to get group: " + groupname);
+    var group = api.user("admin").path("group/"+groupname).get();
+    logger.log("Did get group: " + groupname);
+    if (group.notFound != undefined) {
+      job.fatalFail("Group "+groupname+" not found");
+    }
+
+    logger.log("Going to get user " + username);
+    if (username != null &amp;&amp; username != "admin" &amp;&amp; api.user("admin").path("user/"+username+"/belongstogroup/"+groupname).dataType("json").get().notFound != undefined) {
+      job.fatalFail("User "+username+" does not belong to group "+groupname);
+    }
+    logger.log("Did get user " + username);
+
+    if (group.metadata == null) {
+      continue;
+    }
+
+    if (group.metadata.field == null) {
+      continue;
+    }
+
+    var targets = [];
+
+    for(var j = 0; j &lt; group.metadata.field.length; j++) {
+
+      if (group.metadata.field[j].key == portalImportMap) {
+        var importMap = eval("("+group.metadata.field[j].value+")");
+
+        for(var key in importMap) {
+          if (mimeEquals(key, job.getData("mimeType"))) {
+            targets = targets.concat(importMap[key]);
+            logger.log("Found targets via mimetype: " + targets);
+          }
+        }
+
+        if (targets.length == 0) {
+          logger.log("Could not find via mimetype");
+          for(var key in importMap) {
+            /* Attempt to deduce type from the shape document */
+            var containerComponent = null;
+            var videoComponents = [];
+            var audioComponents = [];
+
+            var shapeString = job.getData("shapeDocument");
+            shapeString = stripDeclaration(shapeString);
+
+            default xml namespace = "http://xml.vidispine.com/schema/vidispine";
+            var shape = new XML(shapeString);
+
+            if (shape.containerComponent.length() &gt; 0) {
+              containerComponent = shape.containerComponent[0];
+            }
+            if (shape.videoComponent.length() &gt; 0) {
+              videoComponents = videoComponents.concat(shape.videoComponent);
+            }
+            if (shape.audioComponent.length() &gt; 0) {
+              audioComponents = audioComponents.concat(shape.audioComponent);
+            }
+
+            var detectedType = "none";
+
+            if (containerComponent != null &amp;&amp; containerComponent.duration != null &amp;&amp; containerComponent.duration.samples == 0 &amp;&amp; audioComponents.length == 0) {
+              detectedType = "image";
+            } else if (videoComponents.length &gt; 0) {
+              detectedType = "video";
+            } else if (audioComponents.length &gt; 0) {
+              detectedType = "audio";
+            }
+
+            if (detectedType == "video" &amp;&amp; key == "video/*" || detectedType == "audio" &amp;&amp; key == "audio/*"  || detectedType == "image" &amp;&amp; key == "image/*" ) {
+              targets = targets.concat(importMap[key]);
+              logger.log("Found targets via shape tag: " + targets);
+
+            }
+          }
+        }
+      }
+    }
+
+    if (targets.length &gt; 0) {
+      for (var index = targets.length; index-- &gt; 0;) {
+        var tag = targets[index];
+        try {
+          api.user("admin").path("shape-tag/"+tag).get();
+        } catch(err) {
+          logger.log("Shape tag " + tag + " no longer exists. Removing.");
+          targets.splice(targets.indexOf(tag), 1);
+        }
+      }
+      job.setData("tags", targets);
+    }
+  }
+}
+</script>
+        <step>540</step>
+        <dependency>
+            <step>0</step>
+            <previous>true</previous>
+            <allPrevious>false</allPrevious>
+        </dependency>
+        <parallelDependency>
+            <step>0</step>
+            <previous>true</previous>
+            <allPrevious>false</allPrevious>
+        </parallelDependency>
+        <jobType>PLACEHOLDER_IMPORT</jobType>
+        <cleanup>false</cleanup>
+        <critical>true</critical>
+    </task>
+    <task id="127876">
+        <description>Delegate job to external transcoder</description>
+        <extradata>f</extradata>
+        <flags>12</flags>
+        <script>function transcode_framework() {
+  var portal_uri = getPortalUri();
+  itemId = job.getData("itemId");
+  if (!(itemId &amp;&amp; itemId.length)) {
+    // no item, no transcode
+    return;
+  }
+  logger.log("Portal Transcode Framework itemId: " + itemId);
+
+  tags = job.getData("tags");
+  if (!(tags &amp;&amp; tags.length)) {
+    tags = "";
+  }
+  logger.log("Portal Transcode Framework tags: " + tags);
+
+  if (!job.getData('_portalOriginalTags')) {
+    job.setData('_portalOriginalTags', tags);
+  }
+  jobId = job.getData("jobId"); // this does not work atm. pending feature request
+  if (!(jobId &amp;&amp; jobId.length)) {
+    // workaround
+    jobId = job.getData("_portalJobId");
+    if (!(jobId &amp;&amp; jobId.length)) {
+      jobId = uuid();
+      job.setData("_portalJobId", jobId);
+    }
+  }
+
+  // TODO grab URI and authentication information from metadata?
+  uri = portal_uri + "/API/v1/transcode_framework/";
+  if (!checkProblem) {
+    obj = &lt;object&gt;
+      &lt;job_id&gt;{jobId}&lt;/job_id&gt;
+      &lt;item_id&gt;{itemId}&lt;/item_id&gt;
+      &lt;source_tag&gt;original&lt;/source_tag&gt;
+      &lt;tags&gt;{tags}&lt;/tags&gt;
+      &lt;/object&gt;;
+    r = http.uri(uri + "?api_key=api_key:1kAxNG:2GrNWweRv3-AZltBN6-VXR3R7yU")
+      .input(obj, "application/xml")
+      .dataType("JSON").rich().post();
+    finished(r);
+    return;
+  }
+
+  r = http.uri(uri + jobId + "/?api_key=api_key:1kAxNG:2GrNWweRv3-AZltBN6-VXR3R7yU").dataType("JSON").rich().get();
+  finished(r);
+}
+
+function finished(response) {
+  if (response.status == 502) {
+    job.fail("Failed to contact external transcoder");
+    return;
+  } else if (response.status &lt; 200 || response.status &gt;= 300) {
+    logger.log("Portal Transcode Framework failed to contact transcoder framework: " +
+               response.status);
+    job.fatalFail("Failed to contact transcoder framework: " + response.status);
+    return;
+  }
+  obj = response.output;
+  logger.log("Portal Transcode Framework output " + JSON.stringify(obj));
+
+  if (obj.output_filename &amp;&amp; !job.getData('bestEffortFilename')) {
+    job.setData("bestEffortFilename", obj.output_filename);
+  }
+
+  if ("tags" in obj &amp;&amp; (obj.tags || obj.tags === "")) {
+    logger.log("Portal Transcode Framework setting tags: " + obj.tags);
+    job.setData("tags", obj.tags);
+  } else {
+    logger.log("Portal Transcode Framework tags == null");
+  }
+
+  if (obj.error) {
+    job.setData("_portalError", obj.error);
+    logger.log("Portal Transcode Framework job error: " + obj.error);
+  }
+
+  if (obj.exception) {
+    job.setData("_portalException", obj.exception);
+    logger.log("Portal Transcode Framework job exception: " + obj.exception);
+  }
+
+  if (obj.status === "SKIPPED") {
+    logger.log("Portal Transcode Framework skipped");
+  } else if (obj.status === "NEW" || obj.status === "PENDING") {
+    logger.log("Portal Transcode Framework pending");
+
+    if (!checkProblem) {
+      job.wait("Waiting for external transcoder");
+    } else {
+      job.fail("Waiting for external transcoder");
+    }
+  } else if (obj.status === "RUNNING") {
+    logger.log("Portal Transcode Framework running " + obj.transcode_progress);
+    job.setData("transcodeProgress", obj.transcode_progress);
+    job.fail("Waiting for external transcoder");
+  } else if (obj.status === "FINISHED") {
+    logger.log("Portal Transcode Framework Job finished");
+    job.setData("transcodeProgress", 100);
+  } else if (obj.status === "CANCEL" || obj.status === "CANCELLED") {
+    logger.log("Portal Transcode Framework Job cancelled");
+    if (!checkProblem) {
+      job.fatalFail("Job cancelled");
+    }
+  } else if (obj.status === "FAILED") {
+    var msg = "External transcoder failed";
+    if (obj.error) {
+      msg += ": " + obj.error;
+    }
+    logger.log("Portal Transcode Framework " + msg);
+    if (!checkProblem) {
+      job.fatalFail(msg);
+    }
+  } else if (obj.status === "ERROR") {
+    var msg = "Error in external transcoder";
+    if (obj.error) {
+      msg += ": " + obj.error;
+    }
+    logger.log("Portal Transcode Framework " + msg);
+    if (!checkProblem) {
+      job.fatalFail(msg);
+    }
+  } else if (obj.status === "PLUGIN_NOT_FOUND") {
+    logger.log("Portal Transcode Framework transcoder plugin not found");
+    if (!checkProblem) {
+      job.fatalFail("Transcoder plugin not found");
+    }
+  } else {
+    logger.log("Portal Transcode Framework Got invalid status in job: " + obj.status);
+    if (!checkProblem) {
+      job.fatalFail("Got invalid status in job: " + obj.status);
+    }
+  }
+}
+
+
+transcode_framework();
+
+
+function uuid() {
+  return s4() + s4() + "-" + s4() + "-" + s4() + "-" +
+    s4() + "-" + s4() + s4() + s4();
+}
+
+function s4() {
+  return Math.floor((Math.random() + 1) * 0x10000)
+    .toString(16)
+    .substring(1);
+}
+</script>
+        <step>545</step>
+        <dependency>
+            <step>0</step>
+            <previous>true</previous>
+            <allPrevious>false</allPrevious>
+        </dependency>
+        <parallelDependency>
+            <step>0</step>
+            <previous>true</previous>
+            <allPrevious>false</allPrevious>
+        </parallelDependency>
+        <jobType>PLACEHOLDER_IMPORT</jobType>
+        <cleanup>false</cleanup>
+        <critical>false</critical>
+    </task>
+    <task id="344">
+        <description>Transcoding.</description>
+        <extradata>//</extradata>
+        <flags>12</flags>
+        <bean>ContentImportTaskBean</bean>
+        <method>transcodeLowres</method>
+        <plugin>false</plugin>
+        <step>600</step>
+        <dependency>
+            <step>0</step>
+            <previous>true</previous>
+            <allPrevious>false</allPrevious>
+        </dependency>
+        <parallelDependency>
+            <step>0</step>
+            <previous>false</previous>
+            <allPrevious>false</allPrevious>
+        </parallelDependency>
+        <jobType>PLACEHOLDER_IMPORT</jobType>
+        <cleanup>false</cleanup>
+        <critical>false</critical>
+    </task>
+    <task id="345">
+        <description>Performing media check.</description>
+        <extradata>//,noxmp</extradata>
+        <flags>12</flags>
+        <bean>ContentImportTaskBean</bean>
+        <method>mediaCheckLowres</method>
+        <plugin>false</plugin>
+        <step>700</step>
+        <dependency>
+            <step>0</step>
+            <previous>false</previous>
+            <allPrevious>false</allPrevious>
+        </dependency>
+        <parallelDependency>
+            <step>0</step>
+            <previous>true</previous>
+            <allPrevious>false</allPrevious>
+        </parallelDependency>
+        <jobType>PLACEHOLDER_IMPORT</jobType>
+        <cleanup>false</cleanup>
+        <critical>false</critical>
+    </task>
+    <task id="346">
+        <description>Finishing the job.</description>
+        <extradata>//</extradata>
+        <flags>76</flags>
+        <bean>ContentImportTaskBean</bean>
+        <method>finalizeTranscode</method>
+        <plugin>false</plugin>
+        <step>800</step>
+        <dependency>
+            <step>0</step>
+            <previous>true</previous>
+            <allPrevious>false</allPrevious>
+        </dependency>
+        <parallelDependency>
+            <step>0</step>
+            <previous>false</previous>
+            <allPrevious>false</allPrevious>
+        </parallelDependency>
+        <jobType>PLACEHOLDER_IMPORT</jobType>
+        <cleanup>false</cleanup>
+        <critical>false</critical>
+    </task>
+    <task id="347">
+        <description>Performing final media check.</description>
+        <extradata>d,ng,final</extradata>
+        <flags>12</flags>
+        <bean>ContentImportTaskBean</bean>
+        <method>performMediaCheck</method>
+        <plugin>false</plugin>
+        <step>850</step>
+        <dependency>
+            <step>0</step>
+            <previous>false</previous>
+            <allPrevious>true</allPrevious>
+        </dependency>
+        <parallelDependency>
+            <step>0</step>
+            <previous>false</previous>
+            <allPrevious>false</allPrevious>
+        </parallelDependency>
+        <jobType>PLACEHOLDER_IMPORT</jobType>
+        <cleanup>false</cleanup>
+        <critical>true</critical>
+    </task>
+    <task id="127904">
+        <description>Adding item to collections.</description>
+        <extradata>f</extradata>
+        <flags>12</flags>
+        <script>// Retrieve the id of the item that is being imported
+var portal_add_to_collections = job.getData("portal_add_to_collections");
+
+var itemId = job.getData("itemId");
+
+if (portal_add_to_collections != null &amp;&amp; itemId != null) {
+  logger.log("ADDTOCOLLECTION: Adding item " + itemId + " to collections " + portal_add_to_collections);
+
+  var collections = portal_add_to_collections.split(",");
+
+  for (var i = 0; i &lt; collections.length ; i++) {
+    var collection = collections[i];
+    logger.log("ADDTOCOLLECTION: Adding item " + itemId + " to collections " + collection);
+    try {
+	var result = api.path("collection/" + collection + "/" + itemId).queryParam("type", "item").input("", "text").rich().put();
+	logger.log("ADDTOCOLLECTON: Got the following response: " + result);
+    } catch(err) {
+	logger.log("ADDTOCOLLECTON: Got an error adding to collection: " + err);
+    }
+  }
+} else {
+  logger.log("ADDTOCOLLECTION: No collections specified for item " + itemId + ". Not adding to a collection.");
+}</script>
+        <step>852</step>
+        <dependency>
+            <step>0</step>
+            <previous>true</previous>
+            <allPrevious>false</allPrevious>
+        </dependency>
+        <parallelDependency>
+            <step>0</step>
+            <previous>true</previous>
+            <allPrevious>false</allPrevious>
+        </parallelDependency>
+        <jobType>PLACEHOLDER_IMPORT</jobType>
+        <cleanup>false</cleanup>
+        <critical>true</critical>
+    </task>
+    <task id="348">
+        <description>Updating input shape</description>
+        <extradata>d,final</extradata>
+        <flags>76</flags>
+        <bean>ContentImportTaskBean</bean>
+        <method>finalizeJob</method>
+        <plugin>false</plugin>
+        <step>855</step>
+        <dependency>
+            <step>0</step>
+            <previous>true</previous>
+            <allPrevious>false</allPrevious>
+        </dependency>
+        <parallelDependency>
+            <step>0</step>
+            <previous>false</previous>
+            <allPrevious>false</allPrevious>
+        </parallelDependency>
+        <jobType>PLACEHOLDER_IMPORT</jobType>
+        <cleanup>false</cleanup>
+        <critical>true</critical>
+    </task>
+    <task id="349">
+        <description>Extracting metadata.</description>
+        <extradata>d</extradata>
+        <flags>12</flags>
+        <bean>ContentImportTaskBean</bean>
+        <method>extractMetadata</method>
+        <plugin>false</plugin>
+        <step>860</step>
+        <dependency>
+            <step>0</step>
+            <previous>true</previous>
+            <allPrevious>false</allPrevious>
+        </dependency>
+        <parallelDependency>
+            <step>0</step>
+            <previous>false</previous>
+            <allPrevious>false</allPrevious>
+        </parallelDependency>
+        <jobType>PLACEHOLDER_IMPORT</jobType>
+        <cleanup>false</cleanup>
+        <critical>true</critical>
+    </task>
+    <task id="350">
+        <description>Performing final media check.</description>
+        <extradata>d,ng</extradata>
+        <flags>12</flags>
+        <bean>ContentImportTaskBean</bean>
+        <method>mediaCheckLowres</method>
+        <plugin>false</plugin>
+        <step>870</step>
+        <dependency>
+            <step>0</step>
+            <previous>true</previous>
+            <allPrevious>false</allPrevious>
+        </dependency>
+        <parallelDependency>
+            <step>0</step>
+            <previous>false</previous>
+            <allPrevious>false</allPrevious>
+        </parallelDependency>
+        <jobType>PLACEHOLDER_IMPORT</jobType>
+        <cleanup>false</cleanup>
+        <critical>false</critical>
+    </task>
+    <task id="351">
+        <description>Updating lowres shape</description>
+        <extradata>d</extradata>
+        <flags>76</flags>
+        <bean>ContentImportTaskBean</bean>
+        <method>finalizeLowresShape</method>
+        <plugin>false</plugin>
+        <step>875</step>
+        <dependency>
+            <step>0</step>
+            <previous>true</previous>
+            <allPrevious>false</allPrevious>
+        </dependency>
+        <parallelDependency>
+            <step>0</step>
+            <previous>false</previous>
+            <allPrevious>false</allPrevious>
+        </parallelDependency>
+        <jobType>PLACEHOLDER_IMPORT</jobType>
+        <cleanup>false</cleanup>
+        <critical>false</critical>
+    </task>
+    <task id="352">
+        <description>Checking if the original should be replaced.</description>
+        <extradata>f</extradata>
+        <flags>0</flags>
+        <bean>ReplaceOriginalTaskBean</bean>
+        <method>replaceOriginal</method>
+        <plugin>false</plugin>
+        <step>900</step>
+        <dependency>
+            <step>0</step>
+            <previous>false</previous>
+            <allPrevious>true</allPrevious>
+        </dependency>
+        <parallelDependency>
+            <step>0</step>
+            <previous>false</previous>
+            <allPrevious>false</allPrevious>
+        </parallelDependency>
+        <jobType>PLACEHOLDER_IMPORT</jobType>
+        <cleanup>false</cleanup>
+        <critical>true</critical>
+    </task>
+    <task id="353">
+        <description>Removing original.</description>
+        <extradata>f</extradata>
+        <flags>12</flags>
+        <bean>ReplaceOriginalTaskBean</bean>
+        <method>removeOriginal</method>
+        <plugin>false</plugin>
+        <step>1000</step>
+        <dependency>
+            <step>0</step>
+            <previous>false</previous>
+            <allPrevious>true</allPrevious>
+        </dependency>
+        <parallelDependency>
+            <step>0</step>
+            <previous>false</previous>
+            <allPrevious>false</allPrevious>
+        </parallelDependency>
+        <jobType>PLACEHOLDER_IMPORT</jobType>
+        <cleanup>false</cleanup>
+        <critical>true</critical>
+    </task>
+    <task id="127884">
+        <description>Finding additional sidecar files</description>
+        <extradata>f</extradata>
+        <flags>12</flags>
+        <script>/* main */
+
+function endsWith(str, suffix) {
+    return str.indexOf(suffix, str.length - suffix.length) !== -1;
+}
+
+var sidecarUrisStr = job.getData("sidecarUris");
+var sidecarUris;
+var sidecarSource = false;
+var fileIdsStr = job.getData("sourceFileIds");
+if (!fileIdsStr) {
+  fileIdsStr = job.getData("sourceFileId");
+}
+
+if (fileIdsStr) {
+  var fileIds = fileIdsStr.split(",");
+
+  if (sidecarUrisStr) {
+    sidecarUris = sidecarUrisStr.split('\n');
+  } else {
+    sidecarUris = [];
+  }
+
+  logger.log("SIDECAR FILES: fileIds=" + fileIds);
+  fileIds.forEach(function(fileId) {
+    /* For each source file, get the list of sidecar files */
+    var result = api.user("admin").path("storage/file/" + fileId).dataType("json").get();
+    if (result) {
+      var storage = result.storage;
+      var filename = result.path;
+      logger.log("SIDECAR FILES: Found filename " + filename + " for file id " + fileId);
+
+      /* Remove the extension */
+      var baseFilename = filename.replace(/\.[^/.]+$/, "");
+
+      ["stl", "xmp", "xml"].forEach(function(extension) {
+        if (endsWith(filename, "." + extension)) {
+          /* If it is a sidecar file being imported as binary data do not look for other sidecars */
+          sidecarSource = true;
+          sidecarUris = [];
+        } else {
+          /* import any xmp, xml or stl file which begins with the same */
+          var vsSidecarFiles = api.user("admin")
+              .path("storage/" + storage + "/file/")
+              .queryParam("wildcard", "true")
+              .queryParam("ignorecase", "true")
+              .queryParam("path", baseFilename + "*." + extension)
+              .dataType("json").get();
+
+            vsSidecarFiles.file.forEach(function(file) {
+              if (sidecarUris.indexOf(file.id) == -1) {
+                sidecarUris.push(file.id);
+            }
+          });
+        }
+      });
+    } else {
+      logger.log("SIDECAR FILES: Could not find file with id " + fileId);
+    }
+  });
+
+
+  if (sidecarSource == true) {
+    logger.log("SIDECAR FILES: Importing a sidecar format file as data asset. Extra sidecars disabled for this asset.");
+    job.setData("sidecarUris", "");
+  }
+  if (sidecarUris.length &gt; 0) {
+    var newSidecarUrisStr = sidecarUris.join('\n');
+    logger.log("SIDECAR FILES: Setting sidecarUris to " + newSidecarUrisStr);
+    job.setData("sidecarUris", newSidecarUrisStr);
+  }
+}
+</script>
+        <step>1090</step>
+        <dependency>
+            <step>0</step>
+            <previous>true</previous>
+            <allPrevious>false</allPrevious>
+        </dependency>
+        <parallelDependency>
+            <step>0</step>
+            <previous>true</previous>
+            <allPrevious>false</allPrevious>
+        </parallelDependency>
+        <jobType>PLACEHOLDER_IMPORT</jobType>
+        <cleanup>false</cleanup>
+        <critical>true</critical>
+    </task>
+    <task id="354">
+        <description>Importing sidecar files.</description>
+        <extradata>d</extradata>
+        <flags>12</flags>
+        <bean>SidecarImportTaskBean</bean>
+        <method>importSidecarFiles</method>
+        <plugin>false</plugin>
+        <step>1100</step>
+        <dependency>
+            <step>0</step>
+            <previous>false</previous>
+            <allPrevious>true</allPrevious>
+        </dependency>
+        <parallelDependency>
+            <step>0</step>
+            <previous>false</previous>
+            <allPrevious>false</allPrevious>
+        </parallelDependency>
+        <jobType>PLACEHOLDER_IMPORT</jobType>
+        <cleanup>false</cleanup>
+        <critical>false</critical>
+    </task>
+    <task id="355">
+        <description>Cleaning up.</description>
+        <extradata>d</extradata>
+        <flags>12</flags>
+        <bean>ContentImportTaskBean</bean>
+        <method>cleanup</method>
+        <plugin>false</plugin>
+        <step>5000</step>
+        <dependency>
+            <step>0</step>
+            <previous>false</previous>
+            <allPrevious>false</allPrevious>
+        </dependency>
+        <parallelDependency>
+            <step>0</step>
+            <previous>false</previous>
+            <allPrevious>false</allPrevious>
+        </parallelDependency>
+        <jobType>PLACEHOLDER_IMPORT</jobType>
+        <cleanup>true</cleanup>
+        <critical>true</critical>
+    </task>
+</TaskDefinitionListDocument>

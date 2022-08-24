@@ -1,68 +1,51 @@
-{% if clip %}
-<div id="panel_ingestinfos" class="panel" style="display:none;">
-    <h2>Ingest informations</h2>
-    <table class="generictbl">
-      <tbody>
-      <tr class="even">
-        <td>UMID</td>
-        <td>{{ clip.pk }}</td>
-      </tr>
-      <tr class="odd">
-        <td>Created on</td>
-        <td>{{ clip.created_on }}</td>
-      </tr>
-      <tr class="even">
-        <td>Imported on</td>
-        <td>{{ clip.imported_on }}</td>
-      </tr>
-      <tr class="odd">
-        <td>Folder path</td>
-        <td>{{ clip.folder_path }}</td>
-      </tr>
-      <tr class="even">
-        <td>Outputed file</td>
-        <td>{{ clip.output_file }}</td>
-      </tr>
-      <tr class="odd">
-        <td>Status</td>
-        <td>{{ clip.status }}</td>
-      </tr>
-      <tr class="even">
-        <td>Is spanned</td>
-        <td>{{ clip.spanned }}</td>
-      </tr>
-      <tr class="odd">
-        <td>Provider</td>
-        <td>{{ clip.provider_name }}</td>
-      </tr>
-      <tr class="even">
-        <td>Collection Id</td>
-        <td>{{ clip.collection_id }}</td>
-      </tr>
-      <tr class="odd">
-        <td colspan="2"><h3>Provider metadatas:</h3> <a href="{% url tapelessingest:metadatas_update_item clip.umid %}">Update item metadatas</a></td>
-      </tr>
-      {% for metadata in clip.metadatas.all %}
-      <tr class={% cycle 'even' 'odd' %}>
-        <td>{{ metadata.name }}</td>
-        <td>{{ metadata.value }}</td>
-      </tr>
-      {% endfor %}
-      <tr class="even">
-        <td>Clip XML</td>
-        <td>{{ clip.clip_xml }}</td>
-      </tr>
-      <tr class="even">
-        <td>Media XML</td>
-        <td>{{ clip.reel.media_xml }}</td>
-      </tr>
-      </tbody>
-    </table>
-
+{% if clips|length %}
+<div class="item-metadata-summary-container">
+    <div class="item-metadata-summary">
+        <div class="meta-table-container">
+            <a onclick="event.preventDefault(); $('#ti-metadatas-content').slideToggle('fast');" href="#"><h6 class="metadata-title item">&#9656; Ingest informations</h6></a>
+            {% for clip in clips %}
+            <div style="display: none" class="metadata-content" id="ti-metadatas-content">
+                <div class="metadata-row">
+                    <div class="metadata-name">UMID</div>
+                    <div class="metadata-value">{{ clip.pk }}</div>
+                </div>
+                <div class="metadata-row">
+                    <div class="metadata-name">Created on</div>
+                    <div class="metadata-value">{{ clip.created_on }}</div>
+                </div>
+                <div class="metadata-row">
+                    <div class="metadata-name">Folder path</div>
+                    <div class="metadata-value">{{ clip.folder_path }}</div>
+                </div>
+                <div class="metadata-row">
+                    <div class="metadata-name">Status</div>
+                    <div class="metadata-value">{{ clip.status }}</div>
+                </div>
+                <div class="metadata-row">
+                    <div class="metadata-name">Provider</div>
+                    <div class="metadata-value">{{ clip.provider_name }}</div>
+                </div>
+                {% for name, value in clip.metadatas.items %}
+                <div class="metadata-row">
+                    <div class="metadata-name">{{ name }}</div>
+                    <div class="metadata-value">{{ value }}</div>
+                </div>
+                {% endfor %}
+                {% if clip.clip_xml %}
+                <div class="metadata-row">
+                    <div class="metadata-name">Clip XML</div>
+                    <div class="metadata-value">Yes</div>
+                </div>
+                {% endif %}
+                {% if clip.reel.media_xml %}
+                <div class="metadata-row">
+                    <div class="metadata-name">Media XML</div>
+                    <div class="metadata-value">Yes</div>
+                </div>
+                {% endif %}
+            </div>
+            {% endfor %}
+        </div>
+    </div>
 </div>
-
-<script>
-
-</script>
-
 {% endif %}

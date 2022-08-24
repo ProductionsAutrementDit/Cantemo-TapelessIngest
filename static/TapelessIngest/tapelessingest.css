@@ -14,7 +14,8 @@ td.LOADING p {
 #cntmo_prtl_ClipTable_selectall_lnk,
 #cntmo_prtl_ClipTable_unselectall_lnk,
 #cntmo_prtl_cliptable_addtocollection {
-  background-color: #4a65ac;
+  border-color: #4a65ac;
+  color: #4a65ac;
 }
 #cntmo_prtl_folder_browse_lnk {
   padding-left: 3em;
@@ -35,19 +36,19 @@ td.LOADING p {
 }
 
 td.status-NOTIMPORTED p {
-  background:#df6819 url('/sitemedia/img/mini-icon-cross.png?7d9e1ad8d7e4') no-repeat 4px center
+  background:#df6819 no-repeat 4px center;
 }
 
 td.status-PROCESSING p {
-  background:#4a65ac url('/sitemedia/img/icon-button-loader-transparent.gif?7d9e1ad8d7e4') no-repeat 4px center
+  background:#4a65ac no-repeat 4px center;
 }
 
 td.status-FAILED p {
-  background:#7d4141 url('/sitemedia/img/mini-icon-cross.png?7d9e1ad8d7e4') no-repeat 4px center
+  background:#7d4141 no-repeat 4px center;
 }
 
 td.status-IMPORTED p {
-  background:#417c49 url('/sitemedia/img/mini-icon-checked.png?7d9e1ad8d7e4') no-repeat 4px center
+  background:#417c49 no-repeat 4px center;
 }
 
 

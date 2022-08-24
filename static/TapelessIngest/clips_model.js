@@ -25,7 +25,7 @@
         },
         ingest: function(opts){
             var self = this,
-            url = self.url() + '/ingest',
+            url = self.url() + '/ingest/',
             // note that these are just $.ajax() options
             options = {
                 url: url,
@@ -37,7 +37,7 @@
         },
         actualize: function(opts){
             var self = this,
-            url = self.url() + '/actualize',
+            url = self.url() + '/actualize/',
             // note that these are just $.ajax() options
             options = {
                 url: url,
@@ -70,7 +70,7 @@
           _.each(response.metadatas, function(metadata) {
             clip.metadatas[metadata.name] = metadata.value
           })
-          clip.count_spanned = clip.spanned_clips.length
+          clip.count_spanned = clip.spanned_clips ? clip.spanned_clips.length : 0;
           return clip;
         }
     })

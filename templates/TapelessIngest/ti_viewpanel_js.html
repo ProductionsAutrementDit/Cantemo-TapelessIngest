@@ -1,0 +1,16 @@
+<script type="text/javascript">
+    $(document).ready(function() {
+        $("#item-ingest-infos-panel").hide();
+        $("#item-ingest-infos-link").click(function(e) {
+            if ($(this).hasClass("collapsed")) {
+                $(this).removeClass('collapsed');
+                $("#item-ingest-infos-panel").show();
+            }
+            else {
+                $(this).addClass('collapsed');
+                $("#item-ingest-infos-panel").hide();
+            }
+            e.preventDefault();
+        })
+    });
+</script>

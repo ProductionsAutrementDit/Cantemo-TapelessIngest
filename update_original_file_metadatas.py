@@ -1,7 +1,7 @@
 from django.conf import settings
 from django.core.exceptions import ObjectDoesNotExist
 
-from portal.plugins.TapelessIngest.models import Clip
+from portal.plugins.TapelessIngest.models.clip import Clip
 from portal.vidispine.iitem import ItemHelper, IngestHelper
 from portal.search.models import SearchHistory
 from portal.api import client
@@ -28,8 +28,8 @@ def update_item_orginial_metadatas(clipId):
 
     infos = get_fileinfo_from_clip(clipId)
 
-    _metadata = {u'groups': {}}
-    original_informations = {u'fields':{}}
+    _metadata = {'groups': {}}
+    original_informations = {'fields':{}}
 
     if infos['is_archived']:
         archived = 'yes'
@@ -42,15 +42,15 @@ def update_item_orginial_metadatas(clipId):
         online = 'no'
 
     original_informations['fields'] = {
-        ORIGINAL_FIELDS['PATH'] : {u'type': u'text', u'value': infos['online_path']},
-        ORIGINAL_FIELDS['CLIP_NAME'] : {u'type': u'text', u'value': infos['clip_name']},
-        ORIGINAL_FIELDS['ARCHIVED'] : {u'type': u'text', u'value': archived},
-        ORIGINAL_FIELDS['ONLINE'] : {u'type': u'text', u'value': online},
-        ORIGINAL_FIELDS['TYPE'] : {u'type': u'text', u'value': infos['type']},
-        ORIGINAL_FIELDS['P5_HANDLE'] : {u'type': u'text', u'value': infos['p5_handle']}
+        ORIGINAL_FIELDS['PATH'] : {'type': 'text', 'value': infos['online_path']},
+        ORIGINAL_FIELDS['CLIP_NAME'] : {'type': 'text', 'value': infos['clip_name']},
+        ORIGINAL_FIELDS['ARCHIVED'] : {'type': 'text', 'value': archived},
+        ORIGINAL_FIELDS['ONLINE'] : {'type': 'text', 'value': online},
+        ORIGINAL_FIELDS['TYPE'] : {'type': 'text', 'value': infos['type']},
+        ORIGINAL_FIELDS['P5_HANDLE'] : {'type': 'text', 'value': infos['p5_handle']}
     }
 
-    _metadata[u'groups'][SUBGROUP] = [original_informations]
+    _metadata['groups'][SUBGROUP] = [original_informations]
 
     mfg_fields = None
 
@@ -61,7 +61,7 @@ def update_item_orginial_metadatas(clipId):
 
     _ith.setItemMetadata(clipId, metadata_document, skipForbidden=True, return_format='xml')
 
-    print "Item %s has been updated\r" % clipId
+    print(("Item %s has been updated\r" % clipId))
 
 def get_fileinfo_from_clip(clipId):
     nsdchat_bin = '/usr/local/aw/bin/nsdchat'
@@ -77,7 +77,7 @@ def get_fileinfo_from_clip(clipId):
         all_possible_paths = []
         for path in possible_paths:
             new_path = path
-            for key, value in replace_options.items():
+            for key, value in list(replace_options.items()):
                 new_path = new_path.replace(key, value)
             all_possible_paths.append(new_path)
         is_online = False
@@ -165,7 +165,7 @@ def apply_to_saved_search(search_id):
             try:
                 update_item_orginial_metadatas(item_id)
             except:
-                print "Unexpected error for %s: %s" % (item_id, sys.exc_info()[0])
+                print(("Unexpected error for %s: %s" % (item_id, sys.exc_info()[0])))
         if len(elastic_results['hits']['hits']) < number:
             count = elastic_results['hits']['total']
             break
@@ -201,7 +201,7 @@ def apply_to_search_history(search_id, user):
             try:
                 update_item_orginial_metadatas(item_id)
             except:
-                print "Unexpected error for %s: %s" % (item_id, sys.exc_info()[0])
+                print(("Unexpected error for %s: %s" % (item_id, sys.exc_info()[0])))
         if results.data['has_next'] == False:
             break
         page = page + 1

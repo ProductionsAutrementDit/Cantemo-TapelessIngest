@@ -1,13 +1,12 @@
 """
 
 """
-import logging
 
-from django.conf.urls.defaults import *
+from django.conf.urls import url
 
 from rest_framework import routers
 
-from portal.plugins.TapelessIngest import views
+from . import views
 
 # This new app handles the request to the URL by responding with the view which is loaded
 # from portal.plugins.TapelessIngest.views.py. Inside that file is a class which responsedxs to the
@@ -16,24 +15,41 @@ from portal.plugins.TapelessIngest import views
 
 router = routers.SimpleRouter()
 
-router.register(r'clips', views.ClipViewSet, 'clips')
-router.register(r'folders', views.FolderViewSet, 'folders')
-router.register(r'tapelessstorages', views.TapelessStorageViewSet, 'tapelessstorages')
-router.register(r'tapelessstoragespaths', views.TapelessStoragePathViewSet, 'tapelessstoragespaths')
-
-urlpatterns = patterns('portal.plugins.TapelessIngest.views',
-    url(r'^api/browser$', views.FileNavigationView.as_view()),
-    url(r'^browser/$', 'IngestFileNavigationView', kwargs={'template': 'TapelessIngest/folders.html'}, name='browser'),
-    url(r'^add_target_collection_form$', 'addTargetCollection', kwargs={'template': 'TapelessIngest/includes/collection_add_target_form.html'}, name='addTargetCollection'),
-    url(r'^admin/$', 'SettingsView', kwargs={'template': 'TapelessIngest/admin/settings.html'}, name='settings'),
-    url(r'^admin/metadata/(?P<metadata_id>\w+)/remove/$', 'AdminMetadatRemoveView', kwargs={'template': 'TapelessIngest/admin/index.html'}, name='metadata_remove'),
-    url(r'^clips/multiples/(?P<clips_ids>.*)$', views.ClipViewSet.as_view({'get': 'processing'})),
-    url(r'^clips/(?P<clip_id>.*)/thumbnail$', 'getClipThumbnail', kwargs={}, name='clip_thumbnail'),
-    url(r'^clips/(?P<clip_id>.*)/proxy$', 'getClipProxy', kwargs={}, name='clip_proxy'),
-    url(r'^clips/(?P<clip_id>.*)/preview$', 'clipPreview', kwargs={'template': 'TapelessIngest/proxy_player.html'}, name='clip_preview'),
-    url(r'^clips/(?P<clip_id>.*)/metadatas/update-item$', 'MetadatasUpdateItemView', kwargs={'template': 'TapelessIngest/metadatas-update-item.html'}, name='metadatas_update_item'),
-    url(r'^clips/datatable/$', 'UserClipsView', name='clips_datatable', kwargs={'template': 'TapelessIngest/clips_view.html',
-       'currentuser': False}),
-    url(r'^$', 'GenericAppView', kwargs={'template': 'TapelessIngest/index.html'}, name='index'),)
+urlpatterns = [
+    url(r"^api/browser/clips$", views.ClipsInPathsView.as_view()),
+    url(r"^api/browser/clips/jobs$", views.ClipsJobsProgress.as_view()),
+    url(
+        r"^file/(?P<file_id>.*)/thumbnail$",
+        views.getFileThumbnail,
+        kwargs={},
+        name="file_thumbnail",
+    ),
+    url(
+        r"^notification/file/created$", views.FileNotificationView.as_view()
+    ),  # Vidispine notification VX-591
+    url(
+        r"^admin/$",
+        (views.SettingsView.as_view()),
+        name="settings",
+    ),
+    url(
+        r"^clips/(?P<clip_id>.*)/thumbnail$",
+        views.getClipThumbnail,
+        kwargs={},
+        name="clip_thumbnail",
+    ),
+    url(
+        r"^clips/(?P<clip_id>.*)/proxy$",
+        views.getClipProxy,
+        kwargs={},
+        name="clip_proxy",
+    ),
+    url(
+        r"^clips/(?P<clip_id>.*)/preview$",
+        views.clipPreview,
+        kwargs={"template": "TapelessIngest/proxy_player.html"},
+        name="clip_preview",
+    ),
+]
 
 urlpatterns += router.urls

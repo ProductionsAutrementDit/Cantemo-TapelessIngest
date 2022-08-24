@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<TaskDefinitionDocument id="354" xmlns="http://xml.vidispine.com/schema/vidispine">
+    <description>Importing sidecar files.</description>
+    <extradata>d</extradata>
+    <flags>12</flags>
+    <bean>SidecarImportTaskBean</bean>
+    <method>importSidecarFiles</method>
+    <plugin>false</plugin>
+    <step>1100</step>
+    <dependency>
+        <step>0</step>
+        <previous>false</previous>
+        <allPrevious>true</allPrevious>
+    </dependency>
+    <parallelDependency>
+        <step>0</step>
+        <previous>false</previous>
+        <allPrevious>false</allPrevious>
+    </parallelDependency>
+    <jobType>PLACEHOLDER_IMPORT</jobType>
+    <cleanup>false</cleanup>
+    <critical>true</critical>
+</TaskDefinitionDocument>

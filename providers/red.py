@@ -3,18 +3,28 @@
 import logging
 
 import subprocess as sp
-
+import pipes
+import sys
 import os
+import csv
+from datetime import datetime
+from io import StringIO
 from portal.plugins.TapelessIngest.metadatas import XMLParser
-from portal.plugins.TapelessIngest.models import Clip, ClipFile, ClipMetadata, Settings
+from portal.plugins.TapelessIngest.models.clip import (
+    Clip,
+    ClipFile,
+    ClipMetadata,
+)
+from portal.plugins.TapelessIngest.models.settings import Settings
 
-from portal.plugins.TapelessIngest.providers.providers import Provider as BaseProvider
+from portal.plugins.TapelessIngest.providers.providers import (
+    Provider as BaseProvider,
+)
 
 log = logging.getLogger(__name__)
 
 # Classe ProviderP2: Récupère les clips à partir des fichiers XML du dossier CLIP
 class Provider(BaseProvider):
-
     def __init__(self):
         BaseProvider.__init__(self)
         self.name = "RED"
@@ -25,141 +35,109 @@ class Provider(BaseProvider):
         self.card_xml_file = None
         self.clips_file_extension = ".RDC"
 
-    def checkPath(self, path):
-        self.base_path = path
-        if any(x.endwith('.RDC') for x in os.listdir(path)):
-            return True
-        return False
- 
-    def getClipFiles(self, folder):
-        clip_files = []
-        clip_filenames = [ f for f in listdir(folder.path + self.clips_path) if f.endswith(self.clips_file_extension) ]
-        for clip_filename in clip_filenames:
-            clip_files.append(folder.path + self.clips_path + clip_filename)
-        return clip_files
+    def getExtensions(self):
+        return ["_001.r3d"]
 
-    def getAllClips(self, folder):
-        # Get XML files in folder
-        
-        clips = []
+    def getFilters(self, escaped_path):
+        return [
+            {
+                "bool": {
+                    "must": [
+                        {
+                            "regexp": {
+                                "parent": os.path.join(
+                                    escaped_path,
+                                    "[A-Z][0-9]{3}_[0-9A-Z]{6}.RDM/[A-Z][0-9]{3}_[A-Z][0-9]{3}_[0-9A-Z]{6}.RDC",
+                                )
+                            }
+                        },
+                        {"wildcard": {"name": "*_001.R3D"}},
+                    ]
+                }
+            },
+        ]
 
-        clip_files = self.getClipFiles(folder)
-        for clip_file in clip_files:
-            Clip = self.createClipFromFile(folder, clip_file)
-            if Clip is not False:
-                clips.append(Clip)
+    def getAllClipMetadatas(self, media_absolute_path, metadatas):
+        cmd = [
+            "REDline --i "
+            + pipes.quote(media_absolute_path)
+            + " --printMeta 3 --useMeta",
+        ]
+        p = sp.run(cmd, shell=True, capture_output=True, text=True)
+        csvfile = p.stdout
+        reader = csv.DictReader(StringIO(csvfile), delimiter=",")
+        for row in reader:
+            metadatas["clipname"] = row["Clip Name"]
+            metadatas["umid"] = row["UUID"]
+            metadatas["timecode"] = row["Abs TC"]
+            metadatas["shooting_date"] = datetime.strptime(
+                f"{row['Date']} {row['Timestamp']}", "%Y%m%d %H%M%S"
+            ).isoformat()
+            metadatas["device_manufacturer"] = "RED"
+            metadatas["device_model"] = row["Camera Model"]
+            metadatas["device_serial"] = row["Camera PIN"]
+        return metadatas
+
+    def getMetadatasFromFile(self, media_file, metadatas, context):
+        filename, file_extension = os.path.splitext(media_file["name"])
+        if file_extension == ".R3D":
+            metadatas["provider"] = self.machine_name
+            metadatas["clipname"] = media_file["name"]
+            metadatas["file_id"] = media_file["vidispine_id"]
+            metadatas["extension"] = file_extension
+            media_absolute_path = os.path.join(
+                context["folder"].root_path,
+                media_file["parent"],
+                media_file["name"],
+            )
+            metadatas = self.getAllClipMetadatas(media_absolute_path, metadatas)
+        return metadatas, context
+
+    def getClipMediaFiles(self, clip):
+        files = []
+        file_count = 1
+        while True:
+            file_part_name = (
+                clip.metadatas["clipname"]
+                + "_"
+                + "{0:0=3d}".format(file_count)
+                + ".R3D"
+            )
+            file_part_path = os.path.join(clip.absolute_path, file_part_name)
+            if os.path.isfile(file_part_path):
+                file = clip.get_storage_helper().getFileByPath(
+                    clip.storage_id, os.path.join(clip.path, file_part_name)
+                )
+                files.append(
+                    {
+                        "type": "video",
+                        "track": 1,
+                        "order": file_count,
+                        "path": file.getPath(),
+                        "file_id": file.getId(),
+                    }
+                )
             else:
-                log.error("Unable to parse %s" % clip_file)
+                break
+            file_count += 1
+        # As Vidispine doesn't support decoding RED, we try to import the proxy file
 
-        return clips
+        return files
 
-    
-    def createClipFromFile(self, folder, clip_folder):
-        
-        settings = Settings.objects.get(pk=1)
-        redline_bin = settings.redline
-        
-        
-        
-        for x in os.listdir(clip_folder)):
-      
-        path = folder.path
-            
-        if xml_clip.root is not None:
-            clip, created = Clip.objects.get_or_create(umid = umid, defaults={
-              'provider': self,
-              'folder_path': path
-            })
-            
-        else:
-            return False
+    def getImportOptions(self):
+        return {"no-transcode": True}
 
-        return clip
+    def getAdditionalShapesToImport(self, clip):
+        tag_name = "red-proxy"
+        prores_file_name = clip.metadatas["clipname"] + "_001.mov"
+        prores_absolute_file_path = os.path.join(
+            clip.absolute_path, prores_file_name
+        )
+        prores_file_path = os.path.join(clip.path, prores_file_name)
+        prores_file_id = clip.get_storage_helper().getFileByPath(
+            clip.storage_id, prores_file_path
+        )
+        if os.path.isfile(prores_absolute_file_path):
+            return [{"tag": tag_name, "fileId": prores_file_id}]
 
-    def getThumbnail(self, clip):
-        clip_name = clip.metadatas.filter(name="clipname")[0].value
-        thumbnails = clip.metadatas.filter(name="thumbnail")
-        if len(thumbnails) > 0:
-            thumbnail = thumbnails[0].value
-        else:
-            return ""
-        return os.path.join(clip.folder_path, thumbnail)
-
-    def getProxy(self, clip):
-        return "", ""
-        
-    def copyClip(self, clip, storage_root_path):
-      
-        input_file = clip.input_files.all()[0]
-        input_filename, input_file_extension = os.path.splitext(input_file.path)
-                
-        outputfile = os.path.join(storage_root_path, clip.umid + input_file_extension)       
-        
-        
-        
-        command = [ redline_bin,
-                '--i','-t','op1a',
-                '-o', outputfile]
-
-        process = sp.Popen(command, cwd=folder, stdout = sp.PIPE, stderr = sp.STDOUT, bufsize=10**8)
-        stdoutdata, stderrdata = process.communicate()
-
-        log.info("export clip %s with command %s" % (clip.umid, ' '.join(command)))
-        
-        pipe = sp.Popen(command, stdout = sp.PIPE, bufsize=10**8)
-        
-        output, err = pipe.communicate(b"input data that is passed to subprocess' stdin")
-        
-        if os.path.isfile(outputfile):
-            log.info("Successfully copied %s" % outputfile)
-            clip.output_file = outputfile
-            clip.save()
-        else:
-            log.error("Output file for %s not created" % clip.umid)
-        
-        return clip
-    
-    def stitchClip(self, clip, storage_root_path):
-        
-        settings = Settings.objects.get(pk=1)
-        bmxtranswrap_bin = settings.bmxtranswrap
-        
-        input_file_extension = clip.metadatas.filter(name="extension")[0].value
-    
-        log.info("processing spanned clips")
-        outputfile = os.path.join(storage_root_path, clip.umid + "." + input_file_extension)
-        
-        log.info("Output file will be %s" % outputfile)
-        
-        command = [ bmxtranswrap_bin,
-                '-p','-t','op1a',
-                '-o', outputfile]
-    
-        clip_sets = clip.spanned_clips.order_by("order")
-        for clip_set in clip_sets:
-            spanned_clip = clip_set.clip
-            input_files = spanned_clip.input_files.all()
-            for input_file in input_files:
-                command.append(input_file.path)
-
-        log.info("Encoding command will be: %s" % ' '.join(command))
-        process = sp.Popen(command, stdout = sp.PIPE, stderr = sp.STDOUT, bufsize=10**8)
-        stdoutdata, stderrdata = process.communicate()
-        log.info("Output is: %s, error is: %s" % (stdoutdata, stderrdata))
-
-        if os.path.isfile(outputfile):
-            log.info("Successfully encoded %s" % outputfile)
-            clip.output_file = outputfile
-            clip.save()
-        else:
-            log.error("Output file for %s not created" % clip.umid)
-
-        return clip
-    
-    def doExportClip(self, clip, storage_root_path):
-        if clip.spanned and clip.master_clip:
-            clip = self.stitchClip(clip, storage_root_path)
-        if not clip.spanned:
-            clip = self.copyClip(clip, storage_root_path)
-        
-        return clip
+        return None

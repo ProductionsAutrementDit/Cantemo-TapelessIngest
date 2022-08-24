@@ -3,7 +3,7 @@
         model: cntmo.prtl.FolderTable.Folder,
         url: "/tapelessingest/folders/",
         parse: function(data) {
-            return data;
+            return data.results;
         },
         initialize: function() {},
     })
