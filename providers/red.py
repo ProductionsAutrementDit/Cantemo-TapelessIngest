@@ -3,6 +3,7 @@
 import logging
 
 import subprocess as sp
+import urllib
 import pipes
 import sys
 import os
@@ -22,6 +23,7 @@ from portal.plugins.TapelessIngest.providers.providers import (
 )
 
 log = logging.getLogger(__name__)
+
 
 # Classe ProviderP2: Récupère les clips à partir des fichiers XML du dossier CLIP
 class Provider(BaseProvider):
@@ -59,9 +61,7 @@ class Provider(BaseProvider):
 
     def getAllClipMetadatas(self, media_absolute_path, metadatas):
         cmd = [
-            "REDline --i "
-            + pipes.quote(media_absolute_path)
-            + " --printMeta 3 --useMeta",
+            "REDline --i " + pipes.quote(media_absolute_path) + " --printMeta 3 --useMeta",
         ]
         p = sp.run(cmd, shell=True, capture_output=True, text=True)
         csvfile = p.stdout
@@ -79,65 +79,88 @@ class Provider(BaseProvider):
         return metadatas
 
     def getMetadatasFromFile(self, media_file, metadatas, context):
-        filename, file_extension = os.path.splitext(media_file["name"])
+        filename, file_extension = os.path.splitext(media_file.getFileName())
         if file_extension == ".R3D":
             metadatas["provider"] = self.machine_name
-            metadatas["clipname"] = media_file["name"]
-            metadatas["file_id"] = media_file["vidispine_id"]
+            metadatas["clipname"] = filename
+            metadatas["file_id"] = media_file.getId()
             metadatas["extension"] = file_extension
-            media_absolute_path = os.path.join(
-                context["folder"].root_path,
-                media_file["parent"],
-                media_file["name"],
-            )
+            media_absolute_path = self.get_file_absolute_path(media_file)
             metadatas = self.getAllClipMetadatas(media_absolute_path, metadatas)
         return metadatas, context
 
-    def getClipMediaFiles(self, clip):
+    def getClipMainMediaFile(self, clip, rebuild=False):
+        if clip.file is None or rebuild:
+            file_id = None
+            path = os.path.join(clip.path, clip.metadatas["clipname"])
+        else:
+            file_id = clip.file.getId()
+            path = clip.file.getPath()
+        return {
+            "type": "video",
+            "track": 1,
+            "order": 0,
+            "file_id": file_id,
+            "path": path,
+        }
+        return None
+
+    def getClipAdditionalMediaFiles(self, clip):
         files = []
-        file_count = 1
-        while True:
-            file_part_name = (
-                clip.metadatas["clipname"]
-                + "_"
-                + "{0:0=3d}".format(file_count)
-                + ".R3D"
-            )
-            file_part_path = os.path.join(clip.absolute_path, file_part_name)
-            if os.path.isfile(file_part_path):
-                file = clip.get_storage_helper().getFileByPath(
-                    clip.storage_id, os.path.join(clip.path, file_part_name)
-                )
+        main_file_id = clip.file.getId()
+        # Get video files:
+        """
+        file_part_name = (
+            clip.metadatas["clipname"]
+            + "_"
+            + "{0:0=3d}".format(file_count)
+            + ".R3D"
+        )
+        """
+        file_part_name = f"{clip.metadatas['clipname']}_*.R3D"
+        file_part_path = os.path.join(clip.path, file_part_name)
+        _ret = clip.get_storage_helper().getFilesInStorage(
+            1000,
+            0,
+            path=urllib.parse.quote(file_part_path, safe="*/"),
+            sort="filename",
+        )
+        _ret_files = _ret["files"]
+        file_count = 2
+        for _ret_file in _ret_files:
+            if _ret_file.getId() != main_file_id:
                 files.append(
                     {
                         "type": "video",
                         "track": 1,
                         "order": file_count,
-                        "path": file.getPath(),
-                        "file_id": file.getId(),
+                        "path": _ret_file.getPath(),
+                        "file_id": _ret_file.getId(),
                     }
                 )
-            else:
-                break
-            file_count += 1
-        # As Vidispine doesn't support decoding RED, we try to import the proxy file
+                file_count += 1
 
+        # Get audio file:
+        audio_file_name = clip.metadatas["clipname"] + ".wav"
+        audio_file_path = os.path.join(clip.path, audio_file_name)
+        _ret_audio = clip.get_storage_helper().getFilesInStorage(
+            1000,
+            0,
+            path=urllib.parse.quote(audio_file_path),
+            sort="filename",
+        )
+        if len(_ret_audio["files"]):
+            audio_file = _ret_audio["files"][0]
+            files.append(
+                {
+                    "type": "audio",
+                    "track": 1,
+                    "order": 1,
+                    "path": audio_file.getPath(),
+                    "file_id": audio_file.getId(),
+                }
+            )
         return files
 
     def getImportOptions(self):
-        return {"no-transcode": True}
-
-    def getAdditionalShapesToImport(self, clip):
-        tag_name = "red-proxy"
-        prores_file_name = clip.metadatas["clipname"] + "_001.mov"
-        prores_absolute_file_path = os.path.join(
-            clip.absolute_path, prores_file_name
-        )
-        prores_file_path = os.path.join(clip.path, prores_file_name)
-        prores_file_id = clip.get_storage_helper().getFileByPath(
-            clip.storage_id, prores_file_path
-        )
-        if os.path.isfile(prores_absolute_file_path):
-            return [{"tag": tag_name, "fileId": prores_file_id}]
-
-        return None
+        return {}

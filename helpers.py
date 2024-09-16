@@ -12,14 +12,20 @@ import re
 import logging
 import urllib.parse
 
+from django.conf import settings
 from django.core.cache import cache
 
+from VidiRest.itemapi import ItemAPI
+
 from portal.api import client
+from portal.vidispine.iitem import ItemHelper, IngestHelper
 from portal.vidispine.icollection import CollectionHelper
 from portal.vidispine.istorage import StorageHelper
+from portal.vidispine import signals
+from RestAPIBase.utility import RestAPIBaseComError
 
+from portal.items.cache import invalidate_item_cache
 from portal.plugins.TapelessIngest.models.settings import Settings
-
 
 log = logging.getLogger(__name__)
 PROVIDERS_LIST = [
@@ -66,76 +72,37 @@ class TapelessIngestPath(object):
         return f"{self.storage_id}: {self.path}"
 
 
-class TapelessIngestHelper:
-    def __init__(self):
-        self.ingest_paths = []
-        self.clips = []
-
-    def add_path(self, storage, path):
-        ti_path = TapelessIngestPath(storage, path)
-        self.ingest_paths.append(ti_path)
-
-    @staticmethod
-    def get_provider_by_name(provider_name):
-
-        moduleName = f"portal.plugins.TapelessIngest.providers.{provider_name}"
-        className = "Provider"
-
-        module = __import__(moduleName, {}, {}, className)
-
-        Provider = getattr(module, className)()
-
-        return Provider
-
-    def _get_provider_list(self):
-
-        providers = {}
-
-        for name in PROVIDERS_LIST:
-            Provider = TapelessIngestHelper.get_provider_by_name(name)
-            providers[Provider.machine_name] = Provider
-
-        return providers
-
-    def get_all_clips(self):
-        if len(self.ingest_paths) < 1:
-            return []
-
-        provider_status_list = []
-        providers = self._get_provider_list()
-
-        from portal.plugins.TapelessIngest.providers.file import (
-            Provider as FileProvider,
+class TapelessIngestItemAPI(ItemAPI):
+    def doImportToPlaceholder(
+        self,
+        item_id,
+        query=None,
+        matrix=None,
+        component="container",
+        ingestprofile_groups=None,
+        ignore_sidecars=False,
+        runasuser=None,
+        return_format="json",
+    ):
+        log.info(
+            f"doImportToPlaceholder for {item_id}: query={query} matrix={matrix} component={component} ingestprofile_groups={ingestprofile_groups} ignore_sidecars={ignore_sidecars}  runasuser={runasuser} return_format={return_format}"
+        )
+        return super().doImportToPlaceholder(
+            item_id,
+            query=query,
+            matrix=matrix,
+            component=component,
+            ingestprofile_groups=ingestprofile_groups,
+            ignore_sidecars=ignore_sidecars,
+            runasuser=runasuser,
+            return_format=return_format,
         )
 
-        for machine_name, Provider in list(providers.items()):
-            provider_status_list.append(
-                {"name": machine_name, "status": "inactive"}
-            )
 
-        for ti_path in self.ingest_paths:
-            clips_in_path = []
-            full_path = ti_path.absolute_path
-            if full_path:
-                # Get all available providers
-                for machine_name, Provider in list(providers.items()):
-                    provider_clips = Provider.getAllClipsInPath(ti_path)
-                    if len(provider_clips) > 0:
-                        for provider_status in provider_status_list:
-                            if provider_status["name"] == machine_name:
-                                provider_status.update({"status": "active"})
-                    clips_in_path += provider_clips
-                # If no providers returned clips, get all files instead
-                if len(clips_in_path) == 0:
-                    file_provider = FileProvider()
-                    clips_in_path = file_provider.getAllClipsInPath(ti_path)
-                self.clips += clips_in_path
-            else:
-                raise TapelessIngestException(
-                    f"Cannot get full path from {ti_path}"
-                )
-
-        return self.clips
+class TapelessIngestHelper(IngestHelper):
+    def provideItemAPI(self):
+        if not hasattr(self, "itemapi"):
+            self.itemapi = TapelessIngestItemAPI(self._vsapi)
 
     @staticmethod
     def get_collection_from_path(path, user):
@@ -158,18 +125,14 @@ class TapelessIngestHelper:
 
         ch = CollectionHelper(runas=user)
 
-        cache_key = urllib.parse.quote(
-            f"tapelessingest_path_collection_{filtered_path}"
-        )
+        cache_key = urllib.parse.quote(f"tapelessingest_path_collection_{filtered_path}")
         collection_id = cache.get(cache_key)
         if collection_id is not None:
             return collection_id
 
         parent_id = None
         for index, path_item in enumerate(filtered_path_items):
-            cache_key_subcollection = urllib.parse.quote(
-                f"tapelessingest_subpath_collection_{parent_id}_{path_item}"
-            )
+            cache_key_subcollection = urllib.parse.quote(f"tapelessingest_subpath_collection_{parent_id}_{path_item}")
             cached_parent_id = cache.get(cache_key_subcollection)
             if cached_parent_id is not None:
                 parent_id = cached_parent_id
@@ -188,9 +151,7 @@ class TapelessIngestHelper:
                 },
             }
             if parent_id is None:
-                query_doc["filter"]["terms"].append(
-                    {"name": "parent_collection", "missing": True}
-                )
+                query_doc["filter"]["terms"].append({"name": "parent_collection", "missing": True})
             else:
                 query_doc["filter"]["terms"].append(
                     {
@@ -214,13 +175,9 @@ class TapelessIngestHelper:
                 if total_hits:
                     parent_id = data["results"][0]["id"]
                 else:
-                    collection = ch.createCollection(
-                        collection_name=path_item, settingsprofile_id="VX-6"
-                    )
+                    collection = ch.createCollection(collection_name=path_item, settingsprofile_id="VX-6")
                     if parent_id is not None:
-                        ch.addCollectionToCollection(
-                            parent_id, collection.getId()
-                        )
+                        ch.addCollectionToCollection(parent_id, collection.getId())
                     parent_id = collection.getId()
                 cache.set(cache_key_subcollection, parent_id)
             else:

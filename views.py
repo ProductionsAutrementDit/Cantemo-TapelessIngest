@@ -6,15 +6,23 @@ From here you can follow the Cantemo Portal Developers documentation for specifi
 framework code refer to the Django developers documentation.
 
 """
-import logging
+import logging, re
 import os
+from urllib.parse import quote
 
 from django.shortcuts import redirect
-from django.urls import reverse_lazy
+from django.urls import reverse, reverse_lazy
 from django.core.exceptions import ObjectDoesNotExist
-from django.http import HttpResponse, HttpResponseRedirect, HttpResponseNotFound
+from django.http import (
+    Http404,
+    HttpResponse,
+    HttpResponseNotAllowed,
+    HttpResponseRedirect,
+    HttpResponseNotFound,
+)
 from django.forms import modelformset_factory
 from django.contrib.auth.decorators import login_required
+from django.contrib import messages
 
 from rest_framework import permissions
 from rest_framework import status
@@ -26,19 +34,38 @@ from rest_framework.response import Response
 from portal.generic.baseviews import CView, ClassView
 from portal.generic.decorators import isAdminPermission
 from portal.vidispine.iexception import NotFoundError
+from portal.vidispine.iitem import ItemHelper, IngestHelper
+from portal.vidispine.istorage import StorageHelper, DEFAULT_STORAGE_PRIORITY
+from portal.vidispine.iuser import UserHelper
+from portal.vidispine.igroup import GroupHelper
+from portal.vidispine.isearch import getMetadataFromRequest
+from portal.vidispine.igeneral import performVSAPICall
+from portal.vidispine.utils.metadata import get_writable_metadata
+
+from VidiRest.helpers.vidispine import createMetadataDocumentFromDict
 
 from portal.plugins.TapelessIngest.helpers import TapelessIngestPath
 from portal.plugins.TapelessIngest.models.clip import Clip
 from portal.plugins.TapelessIngest.models.folder import Folder
-from portal.plugins.TapelessIngest.models.settings import Settings, MetadataMapping
-from portal.plugins.TapelessIngest.forms import SettingsForm, MetadataMappingForm
-from portal.plugins.TapelessIngest.serializers import ClipSerializer, FolderSerializer
+from portal.plugins.TapelessIngest.models.settings import (
+    Settings,
+    MetadataMapping,
+)
+from portal.plugins.TapelessIngest.forms import (
+    SettingsForm,
+    MetadataMappingForm,
+)
+from portal.plugins.TapelessIngest.serializers import (
+    ClipSerializer,
+    FolderSerializer,
+)
+
 
 log = logging.getLogger(__name__)
 
 
 class SettingsView(CView):
-    template_name = 'TapelessIngest/admin/settings.html'
+    template_name = "TapelessIngest/admin/settings.html"
     # roles = ['portal_system_transcode_profile_read']
     permission_classes = (isAdminPermission,)
 
@@ -51,7 +78,9 @@ class SettingsView(CView):
             ti_settings.save()
         settings_form = SettingsForm(instance=ti_settings, prefix="settings")
 
-        MetadatasMappingsFormset = modelformset_factory(MetadataMapping, form=MetadataMappingForm, can_delete=True, extra=0)
+        MetadatasMappingsFormset = modelformset_factory(
+            MetadataMapping, form=MetadataMappingForm, can_delete=True, extra=0
+        )
         metadatas_form = MetadatasMappingsFormset(prefix="metadata")
 
         if hasattr(ti_settings, "storage_id"):
@@ -60,11 +89,13 @@ class SettingsView(CView):
         else:
             storage_root_path = ""
 
-        return Response({
-            "settings_form": settings_form,
-            "metadatas_form": metadatas_form,
-            "storage_root_path": storage_root_path
-        })
+        return Response(
+            {
+                "settings_form": settings_form,
+                "metadatas_form": metadatas_form,
+                "storage_root_path": storage_root_path,
+            }
+        )
 
     def post(self, request):
         # Build settings
@@ -73,9 +104,13 @@ class SettingsView(CView):
         except ObjectDoesNotExist:
             ti_settings = Settings(pk=1)
             ti_settings.save()
-        settings_form = SettingsForm(request.POST, instance=ti_settings, prefix="settings")
+        settings_form = SettingsForm(
+            request.POST, instance=ti_settings, prefix="settings"
+        )
 
-        MetadatasMappingsFormset = modelformset_factory(MetadataMapping, form=MetadataMappingForm, can_delete=True, extra=0)
+        MetadatasMappingsFormset = modelformset_factory(
+            MetadataMapping, form=MetadataMappingForm, can_delete=True, extra=0
+        )
         metadatas_form = MetadatasMappingsFormset(request.POST, prefix="metadata")
 
         if hasattr(ti_settings, "storage_id"):
@@ -89,12 +124,14 @@ class SettingsView(CView):
             metadatas_form.save()
             return HttpResponseRedirect(reverse_lazy("tapelessingest:settings"))
         else:
-            return Response({
-                "settings_form": settings_form,
-                "metadatas_form": metadatas_form,
-                "storage_root_path": storage_root_path
-            })
-            
+            return Response(
+                {
+                    "settings_form": settings_form,
+                    "metadatas_form": metadatas_form,
+                    "storage_root_path": storage_root_path,
+                }
+            )
+
 
 class FileNotificationView(APIView):
     """
@@ -108,7 +145,6 @@ class FileNotificationView(APIView):
         return Response({"test": "test"})
 
     def post(self, request):
-
         data = request.data
         log.info(f"request from storage ha been received: {data}")
 
@@ -132,7 +168,9 @@ class FileNotificationView(APIView):
                 shape_tag = field["value"]
 
         if file_id is None:
-            return Response({"error": "no file id in request"}, status=status.HTTP_200_OK)
+            return Response(
+                {"error": "no file id in request"}, status=status.HTTP_200_OK
+            )
         if action is None or action != "NEW":
             return Response({}, status=status.HTTP_200_OK)
 
@@ -142,7 +180,9 @@ class FileNotificationView(APIView):
         _file = sth.getFileById(file_id)
         file_path = _file.getPath()
 
-        log.info(f"File {file_id} have been added to storage {storage_id} with {file_path}")
+        log.info(
+            f"File {file_id} have been added to storage {storage_id} with {file_path}"
+        )
 
         return Response({"ok"}, status=status.HTTP_200_OK)
 
@@ -157,7 +197,7 @@ class ClipsInPathsView(APIView):
                 "You have to provide at least one clip",
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        
+
         if "folder" not in list(request.data.keys()):
             return Response(
                 "You have to provide a folder",
@@ -171,9 +211,10 @@ class ClipsInPathsView(APIView):
             folder_serializer = FolderSerializer(data=serialized_folder)
             if folder_serializer.is_valid():
                 folder = Folder(**folder_serializer.validated_data)
-            
+
             if request.data["clips"] == "__all__":
-                new_clips = folder.ingest(user=request.user)
+                response = folder.ingest(user=request.user)
+                new_clips = response["clips"]
             else:
                 serialized_clips = request.data["clips"]
                 for serialized_clip in serialized_clips:
@@ -181,7 +222,11 @@ class ClipsInPathsView(APIView):
                     if serializer.is_valid():
                         clip = Clip(**serializer.validated_data)
                         try:
-                            clip.ingest(user=request.user, collection_id=folder.collection_id, folder=folder)
+                            clip.ingest(
+                                user=request.user,
+                                collection_id=folder.collection_id,
+                                folder=folder,
+                            )
                         except Exception as e:
                             clip.error = "%s" % e
                         new_clips.append(clip)
@@ -197,7 +242,6 @@ class ClipsInPathsView(APIView):
             )
 
     def put(self, request):
-
         if "paths" not in list(request.data.keys()):
             return Response(
                 "You have to provide at least one path",
@@ -207,15 +251,15 @@ class ClipsInPathsView(APIView):
         if "page" not in list(request.data.keys()):
             page = 1
         else:
-            page = request.data['page']
+            page = request.data["page"]
         if "number" not in list(request.data.keys()):
             number = 25
         else:
-            number = request.data['number']
+            number = request.data["number"]
         if "cursor" not in list(request.data.keys()):
             cursor = None
         else:
-            cursor = request.data['cursor']
+            cursor = request.data["cursor"]
 
         first = (page - 1) * number
 
@@ -224,7 +268,9 @@ class ClipsInPathsView(APIView):
         hits = 0
 
         for path in paths:
-            folder, is_new = Folder.get_or_new(path=path["path"], storage_id=path["storage"])
+            folder, is_new = Folder.get_or_new(
+                path=path["path"], storage_id=path["storage"]
+            )
             subfolders += folder.getSubfolders(request.user)
             response = folder.scan(first=first, number=number, cursor=cursor)
             clips += response["clips"]
@@ -242,8 +288,8 @@ class ClipsInPathsView(APIView):
             "hits": hits,
             "page": page,
             "number": number,
-            "next": page+1,
-            "pages": hits/number
+            "next": page + 1,
+            "pages": hits / number,
         }
 
         return Response(data=datas)
@@ -291,7 +337,6 @@ class ClipsJobsProgress(APIView):
 class getFileThumbnail(ClassView):
     def __call__(self):
         if "file_id" in self.kwargs:
-
             file_id = self.kwargs["file_id"]
 
             from os.path import isfile
@@ -330,7 +375,7 @@ class getFileThumbnail(ClassView):
                     command,
                     stdout=sp.PIPE,
                     stderr=sp.STDOUT,
-                    bufsize=10 ** 8,
+                    bufsize=10**8,
                 )
                 outs, errs = process.communicate()
 
@@ -345,7 +390,6 @@ class getFileThumbnail(ClassView):
 class getClipThumbnail(ClassView):
     def __call__(self):
         if "clip_id" in self.kwargs:
-
             from os.path import isfile
 
             clip = Clip.objects.get(pk=self.kwargs["clip_id"])
@@ -363,7 +407,6 @@ class getClipThumbnail(ClassView):
 class getClipProxy(ClassView):
     def __call__(self):
         if "clip_id" in self.kwargs:
-
             from os.path import isfile
 
             clip = Clip.objects.get(pk=self.kwargs["clip_id"])
@@ -388,7 +431,6 @@ class clipPreview(ClassView):
     def __call__(self):
         ctx = {}
         if "clip_id" in self.kwargs:
-
             clip = Clip.objects.get(pk=self.kwargs["clip_id"])
 
             ctx["clip"] = clip

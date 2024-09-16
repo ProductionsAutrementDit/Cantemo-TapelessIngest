@@ -5,15 +5,18 @@ import logging
 import os
 from portal.vidispine.istorage import StorageHelper
 from portal.plugins.TapelessIngest.metadatas import XMLParser
-from portal.plugins.TapelessIngest.providers.providers import Provider as BaseProvider
+from portal.plugins.TapelessIngest.providers.providers import (
+    Provider as BaseProvider,
+)
+from portal.vidispine.iexception import NotFoundError
 
 log = logging.getLogger(__name__)
 
 
 # Classe ProviderP2: Récupère les clips à partir des fichiers XML du dossier CLIP
 class Provider(BaseProvider):
-    def __init__(self):
-        BaseProvider.__init__(self)
+    def __init__(self, **kwargs):
+        BaseProvider.__init__(self, **kwargs)
         self.name = "Panasonic P2"
         self.machine_name = "panasonicP2"
         self.clips_path = "CONTENTS/CLIP/"
@@ -151,61 +154,129 @@ class Provider(BaseProvider):
         metadatas["provider"] = self.machine_name
         return metadatas
 
+    def isMasterClip(self, clip):
+        if clip.metadatas["Relation_Top_GlobalClipID"] == clip.metadatas["umid"]:
+            return True
+        return False
+
+    def isSpannedClip(self, clip):
+        if clip.metadatas["Relation_Top_GlobalClipID"] not in ["", None]:
+            return True
+        return False
+
+    def isLastSpannedClip(self, clip):
+        if clip.metadatas["Relation_Next_GlobalClipID"] in ["", None]:
+            return True
+        return False
+
+    def isSpannedClipComplete(self, clip):
+        spanned_clips = clip.get_spanned_clips()
+        has_next = True
+        # Load Master clip as first current clip
+        current_clip = any(self.isMasterClip(clip) for clip in spanned_clips)
+        # If master clip is not found, return False
+        if not current_clip:
+            return False
+        while has_next:
+            next_clip = None
+            if current_clip.metadatas["Relation_Next_GlobalClipID"] in ["", None]:
+                # It's last clip
+                has_next = False
+            else:
+                # Search next clip
+                for spanned_clip in spanned_clips:
+                    if (
+                        current_clip.metadatas["Relation_Next_GlobalClipID"]
+                        == spanned_clip.metadatas["umid"]
+                    ):
+                        next_clip = spanned_clip
+                        break
+                if next_clip:
+                    current_clip = next_clip
+                else:
+                    return False
+        return True
+
+    def getClipMainMediaFile(self, clip, rebuild=False):
+        if clip.file is None or rebuild:
+            file_id = None
+            path = os.path.join(clip.path, clip.metadatas["clipname"])
+        else:
+            file_id = clip.file.getId()
+            path = clip.file.getPath()
+        return {
+            "type": "video",
+            "track": 1,
+            "order": 1,
+            "file_id": file_id,
+            "path": path,
+        }
+
     # Get the media files from the clip
-    def getClipMediaFiles(self, clip):
+    def getClipAdditionalMediaFiles(self, clip, create=False):
+        # TODO: get files from spanned clips
+        # for spanned_clip in clip.spanned_clips.all():
+        #    pass
         _sh = StorageHelper()
-
-        files = [
-            {
-                "type": "video",
-                "track": 1,
-                "order": 1,
-                "file_id": clip.file_id,
-            }
-        ]
-
+        files = []
         if "audio_files" in clip.metadatas:
             audios_count = 0
             audio_files = clip.metadatas["audio_files"].split(";")
             for audio_file in audio_files:
                 audio_file_path = os.path.normpath(
                     os.path.join(
-                        os.path.dirname(clip.file.getPath()), "../AUDIO", audio_file
+                        os.path.dirname(clip.file.getPath()),
+                        "../AUDIO",
+                        audio_file,
                     )
                 )
-                file = _sh.getFileByPath(clip.file.getStorage(), audio_file_path)
-                files.append(
-                    {
-                        "type": "audio",
-                        "track": audios_count,
-                        "order": 1,
-                        "file_id": file.getId(),
-                    }
-                )
-                audios_count += 1
+                file = None
+                try:
+                    file = _sh.getFileByPath(clip.file.getStorage(), audio_file_path)
+                except NotFoundError:
+                    log.warning("File %s cannot be found" % audio_file_path)
+                    if create:
+                        file_infos = _sh.createFileEntity(
+                            clip.file.getStorage(),
+                            audio_file_path,
+                            createOnly=True,
+                            state="ARCHIVED",
+                            return_format="json",
+                        )
+                        file = _sh.getFileById(file_infos["id"])
+                if file:
+                    files.append(
+                        {
+                            "type": "audio",
+                            "track": audios_count,
+                            "order": 1,
+                            "path": file.getPath(),
+                            "file_id": file.getId(),
+                        }
+                    )
+                    audios_count += 1
         return files
 
-    def isClipMaster(self, clip):
+    def isMasterClip(self, clip):
         if (
             clip.metadatas["Relation_Top_GlobalClipID"]
-            and clip.metadatas["GlobalClipID"]
-            == clip.metadatas["Relation_Top_GlobalClipID"]
+            and clip.metadatas["GlobalClipID"] == clip.metadatas["umid"]
         ):
             return True
         return False
 
     def getMetadatasFromFile(self, media_file, metadatas, context):
-
-        filename, file_extension = os.path.splitext(media_file["name"])
-        media_absolute_path = os.path.join(
-            context["folder"].root_path, media_file["parent"]
-        )
+        filename, file_extension = os.path.splitext(media_file.getFileName())
+        media_absolute_path = self.get_file_absolute_path(media_file)
+        media_dirname = os.path.dirname(media_absolute_path)
         clip_xml = None
         # Get Metadata File
-        metadata_file_path = os.path.join(
-            media_absolute_path, "../CLIP/" + filename + ".XML"
+        metadata_file_path = os.path.normpath(
+            os.path.join(media_dirname, "../CLIP/" + filename + ".XML")
         )
         if os.path.isfile(metadata_file_path):
+            metadatas["clipname"] = filename
+            metadatas["clip_xml_file"] = metadata_file_path
             clip_xml = XMLParser(metadata_file_path)
             metadatas = self.getAllClipMetadatas(metadatas, clip_xml)
         return metadatas, context
@@ -227,7 +298,8 @@ class Provider(BaseProvider):
             if clip_format == "MP4":
                 mime_type = "video/mp4"
             proxy = os.path.join(
-                clip.folder_path, "CONTENTS/PROXY/" + clip_name + "." + clip_format
+                clip.folder_path,
+                "CONTENTS/PROXY/" + clip_name + "." + clip_format,
             )
             return proxy, mime_type
         else:

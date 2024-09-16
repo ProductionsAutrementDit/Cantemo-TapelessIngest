@@ -45,16 +45,19 @@ class Provider(BaseProvider):
             "Contents/Material[@umid='%s']/RelevantInfo[@type='JPG']/@uri"
             % metadatas["umid"]
         )
-        metadatas["clip_xml_file"] = mediapro_xml.getValueFromPath(
+        clip_xml_file = mediapro_xml.getValueFromPath(
             "Contents/Material[@umid='%s']/RelevantInfo[@type='XML']/@uri"
             % metadatas["umid"]
         )
+        if clip_xml_file:
+            metadatas["clip_xml_file"] = clip_xml_file
         media_file = mediapro_xml.getValueFromPath(
             "Contents/Material[@umid='%s']/@uri" % metadatas["umid"]
         )
-        clipname = os.path.basename(media_file)
         metadatas["media_file"] = media_file
-        metadatas["clipname"] = clipname
+        if media_file:
+            clipname = os.path.basename(media_file)
+            metadatas["clipname"] = clipname
         return metadatas
 
     def getAllClipMetadatas(self, metadatas, xml_clip):
@@ -63,21 +66,13 @@ class Provider(BaseProvider):
             "LtcChangeTable/LtcChange[@frameCount='0']/@value"
         )
         metadatas["duration"] = xml_clip.getValueFromPath("Duration/@value")
-        metadatas["framerate"] = xml_clip.getValueFromPath(
-            "LtcChangeTable/@tcFps"
-        )
-        metadatas["shooting_date"] = xml_clip.getValueFromPath(
-            "CreationDate/@value"
-        )
+        metadatas["framerate"] = xml_clip.getValueFromPath("LtcChangeTable/@tcFps")
+        metadatas["shooting_date"] = xml_clip.getValueFromPath("CreationDate/@value")
         metadatas["device_manufacturer"] = xml_clip.getValueFromPath(
             "Device/@manufacturer"
         )
-        metadatas["device_model"] = xml_clip.getValueFromPath(
-            "Device/@modelName"
-        )
-        metadatas["device_serial"] = xml_clip.getValueFromPath(
-            "Device/@serialNo"
-        )
+        metadatas["device_model"] = xml_clip.getValueFromPath("Device/@modelName")
+        metadatas["device_serial"] = xml_clip.getValueFromPath("Device/@serialNo")
         metadatas["latitude_ref"] = xml_clip.getValueFromPath(
             "AcquisitionRecord/Group[@name='ExifGPS']/Item[@name='LatitudeRef']/@value"
         )
@@ -124,28 +119,22 @@ class Provider(BaseProvider):
 
     # Create a clip object from an XML file
     def getMetadatasFromFile(self, media_file, metadatas, context):
-        filename, file_extension = os.path.splitext(media_file["name"])
-        media_absolute_path = os.path.join(
-            context["folder"].root_path, media_file["parent"]
-        )
+        filename, file_extension = os.path.splitext(media_file.getFileName())
+        media_absolute_path = self.get_file_absolute_path(media_file)
+        media_dirname = os.path.dirname(media_absolute_path)
         clip_xml = None
         # Get Metadata File
-        if os.path.isfile(
-            os.path.join(media_absolute_path, filename + "M01.XML")
-        ):
+        if os.path.isfile(os.path.join(media_dirname, filename + "M01.XML")):
+            metadatas["clipname"] = filename
             metadatas["clip_xml_file"] = f"./Clip/{filename}M01.XML"
-            clip_xml = XMLParser(
-                os.path.join(media_absolute_path, filename + "M01.XML")
-            )
+            clip_xml = XMLParser(os.path.join(media_dirname, filename + "M01.XML"))
             metadatas = self.getAllClipMetadatas(metadatas, clip_xml)
             # Bonus: get MEDIAPRO_XML
             # there can be multiple media pro if multiple xdcam file structure are in the same folder
             # So the mediapro_xml context is an dict, keyed by mediapro paths
             if "mediapro_xml" not in context.keys():
                 context["mediapro_xml"] = {}
-            mediaproxml_path = os.path.join(
-                media_absolute_path, "../MEDIAPRO.XML"
-            )
+            mediaproxml_path = os.path.join(media_dirname, "../MEDIAPRO.XML")
             if mediaproxml_path not in context["mediapro_xml"].keys():
                 if os.path.isfile(mediaproxml_path):
                     context["mediapro_xml"][mediaproxml_path] = XMLParser(
@@ -177,7 +166,22 @@ class Provider(BaseProvider):
                         clip.master_clip = True
         """
 
-    def getClipMediaFiles(self, clip):
+    def getClipMainMediaFile(self, clip, rebuild=False):
+        if clip.file is None or rebuild:
+            file_id = None
+            path = os.path.join(clip.path, clip.metadatas["clipname"])
+        else:
+            file_id = clip.file.getId()
+            path = clip.file.getPath()
+        return {
+            "type": "video",
+            "track": 1,
+            "order": 1,
+            "file_id": file_id,
+            "path": path,
+        }
+
+    def getClipMediaFiles(self, clip, base_path=None):
         files = []
         """
         if ("extension" in clip.metadatas) and (
@@ -223,34 +227,20 @@ class Provider(BaseProvider):
                         clip.metadatas["extension"] = component_type
                         order += 1
         """
-        media_file_relative_path = os.path.join(
-            clip.path, clip.file.getFileName()
-        )
-        clip_xml_file_relative_path = os.path.join(
-            clip.path, os.path.basename(clip.metadatas["clip_xml_file"])
-        )
-        files.append(
-            {
-                "type": "video",
-                "track": 1,
-                "order": 1,
-                "path": os.path.join(clip.root_path, media_file_relative_path),
-                "file_id": clip.file.getId(),
-            }
-        )
-        files.append(
+        if base_path is None:
+            base_path = os.path.basename(clip.metadatas["clip_xml_file"])
+        clip_xml_file_relative_path = os.path.join(clip.path, base_path)
+        files = [
             {
                 "type": "metadatas",
                 "track": 1,
                 "order": 1,
-                "path": os.path.join(
-                    clip.root_path, clip_xml_file_relative_path
-                ),
+                "path": os.path.join(clip.root_path, clip_xml_file_relative_path),
                 "file_id": self.getFileIdFromFullPath(
                     os.path.join(clip.root_path, clip_xml_file_relative_path)
                 ),
             }
-        )
+        ]
 
         return files
 

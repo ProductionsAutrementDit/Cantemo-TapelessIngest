@@ -47,22 +47,6 @@ class Provider:
     def getFilters(self, escaped_path):
         return []
 
-    def isMediaProvider(self, media_file, context):
-        filename, file_extension = os.path.splitext(media_file["name"])
-        if file_extension.lower() not in self.getExtensions():
-            return False
-        if len(self.getSubPaths()) == 0:
-            return True
-        for subpath in self.getSubPaths():
-            if subpath is None:
-                subpath = ""
-            if re.match(
-                os.path.join(context["folder"].path, subpath),
-                media_file["parent"],
-            ):
-                return True
-        return False
-
     def getClipStatus(self, clip):
         status = 0
         # Get the clip status
@@ -81,9 +65,7 @@ class Provider:
             if clip.file_id not in [None, ""]:
                 status = 2
             else:
-                if clip.output_file not in [None, ""] and os.path.isfile(
-                    clip.output_file
-                ):
+                if clip.output_file not in [None, ""] and os.path.isfile(clip.output_file):
                     status = 1
                 else:
                     status = 0
@@ -93,38 +75,47 @@ class Provider:
     def setSpannedClips(self, clips):
         pass
 
+    def isMasterClip(self, clip):
+        return True
+
+    def isSpannedClip(self, clip):
+        return False
+
+    def isSpannedClipComplete(self, clip):
+        return True
+
+    def get_file_absolute_path(self, file):
+        sth = StorageHelper()
+        storage_id = file.getStorage()
+        storage = sth.getStorage(storage_id)
+        storage_methods = storage.getMethods()
+        for s in storage_methods:
+            if s.getBrowse():
+                return os.path.join(s.getFirstURI()["url"], file.getPath())
+        return None
+
     def _createDictFromMetadataMapping(self, clip):
         metadata_dict = {}
         clip_metadatas = clip.metadatas
 
         for clip_metadata_key, clip_metadata_value in clip_metadatas.items():
             # Get metadata mappings
-            metadatamappings = MetadataMapping.objects.filter(
-                metadata_provider=clip_metadata_key
-            )
+            metadatamappings = MetadataMapping.objects.filter(metadata_provider=clip_metadata_key)
             for metadatamapping in metadatamappings:
-                metadata_dict[
-                    metadatamapping.metadata_portal
-                ] = clip_metadata_value
+                metadata_dict[metadatamapping.metadata_portal] = clip_metadata_value
 
         return build_nested(metadata_dict)
 
     def mapMetadatas(self, clip_metadatas, values={}):
         for clip_metadata in clip_metadatas:
             # Get metadata mappings
-            metadatamapping = MetadataMapping.objects.filter(
-                metadata_provider=clip_metadata.name
-            )
+            metadatamapping = MetadataMapping.objects.filter(metadata_provider=clip_metadata.name)
             if len(metadatamapping) > 0:
-                log.debug(
-                    "Field %s will have value: %s"
-                    % (metadatamapping[0].metadata_portal, clip_metadata.value)
-                )
+                log.debug("Field %s will have value: %s" % (metadatamapping[0].metadata_portal, clip_metadata.value))
                 values[metadatamapping[0].metadata_portal] = clip_metadata.value
         return values
 
     def importClipToPlaceholder(self, clip):
-
         _ith = ItemHelper()
         _igh = IngestHelper()
         item = _ith.getItem(clip.item_id)
@@ -132,18 +123,11 @@ class Provider:
         file_uri = None
 
         if item.isPlaceholder():
-
             if clip.file_id is None:
-                log.info(
-                    "Attempting importation of %s (placehloder=%s)"
-                    % (clip.output_file, clip.item_id)
-                )
+                log.info("Attempting importation of %s (placehloder=%s)" % (clip.output_file, clip.item_id))
                 file_uri = "file://" + clip.output_file
             else:
-                log.info(
-                    "Attempting importation of %s (placehloder=%s)"
-                    % (clip.file_id, clip.item_id)
-                )
+                log.info("Attempting importation of %s (placehloder=%s)" % (clip.file_id, clip.item_id))
             try:
                 _res = _igh.importFileToPlaceholder(
                     clip.item_id,
@@ -159,7 +143,6 @@ class Provider:
                 log.info("Import to Placeholder failed: %s" % (e.reason))
 
         else:
-
             log.info("Import to placeholder: file already attached")
             clip.status = 4
 
@@ -205,5 +188,20 @@ class Provider:
     def getImportOptions(self):
         return {}
 
+    def getClipMainMediaFile(self, clip):
+        return None
+
+    def getClipMediaFiles(self, clip):
+        media_file = self.getClipMainMediaFile(clip)
+        if media_file:
+            return [media_file]
+        return None
+
+    def getClipAdditionalMediaFiles(self, clip):
+        return []
+
     def getAdditionalShapesToImport(self, clip):
+        return None
+
+    def getAvailableItem(self, clip):
         return None

@@ -1,51 +1,61 @@
 {% if clips|length %}
 <div class="item-metadata-summary-container">
-    <div class="item-metadata-summary">
-        <div class="meta-table-container">
-            <a onclick="event.preventDefault(); $('#ti-metadatas-content').slideToggle('fast');" href="#"><h6 class="metadata-title item">&#9656; Ingest informations</h6></a>
-            {% for clip in clips %}
-            <div style="display: none" class="metadata-content" id="ti-metadatas-content">
-                <div class="metadata-row">
-                    <div class="metadata-name">UMID</div>
-                    <div class="metadata-value">{{ clip.pk }}</div>
-                </div>
-                <div class="metadata-row">
-                    <div class="metadata-name">Created on</div>
-                    <div class="metadata-value">{{ clip.created_on }}</div>
-                </div>
-                <div class="metadata-row">
-                    <div class="metadata-name">Folder path</div>
-                    <div class="metadata-value">{{ clip.folder_path }}</div>
-                </div>
-                <div class="metadata-row">
-                    <div class="metadata-name">Status</div>
-                    <div class="metadata-value">{{ clip.status }}</div>
-                </div>
-                <div class="metadata-row">
-                    <div class="metadata-name">Provider</div>
-                    <div class="metadata-value">{{ clip.provider_name }}</div>
-                </div>
-                {% for name, value in clip.metadatas.items %}
-                <div class="metadata-row">
-                    <div class="metadata-name">{{ name }}</div>
-                    <div class="metadata-value">{{ value }}</div>
-                </div>
-                {% endfor %}
-                {% if clip.clip_xml %}
-                <div class="metadata-row">
-                    <div class="metadata-name">Clip XML</div>
-                    <div class="metadata-value">Yes</div>
-                </div>
-                {% endif %}
-                {% if clip.reel.media_xml %}
-                <div class="metadata-row">
-                    <div class="metadata-name">Media XML</div>
-                    <div class="metadata-value">Yes</div>
-                </div>
-                {% endif %}
-            </div>
-            {% endfor %}
+  <div class="item-metadata-summary">
+    <div class="meta-table-container">
+      <a
+        onclick="event.preventDefault(); $('#ti-metadatas-content').slideToggle('fast');"
+        href="#"
+        ><h6 class="metadata-title item">&#9656; Ingest informations</h6></a
+      >
+      {% for clip in clips %}
+      <div
+        style="display: none"
+        class="metadata-content"
+        id="ti-metadatas-content"
+      >
+        <div class="metadata-row">
+          <div class="metadata-name">UMID</div>
+          <div class="metadata-value">{{ clip.pk }}</div>
         </div>
+        <div class="metadata-row">
+          <div class="metadata-name">Created on</div>
+          <div class="metadata-value">{{ clip.created_on }}</div>
+        </div>
+        <div class="metadata-row">
+          <div class="metadata-name">Clip path</div>
+          <div class="metadata-value">{{ clip.path }}</div>
+        </div>
+        <div class="metadata-row">
+          <div class="metadata-name">Folder path</div>
+          <div class="metadata-value">{{ clip.folder_path }}</div>
+        </div>
+        <div class="metadata-row">
+          <div class="metadata-name">Status</div>
+          <div class="metadata-value">{{ clip.status }}</div>
+        </div>
+        <div class="metadata-row">
+          <div class="metadata-name">Provider</div>
+          <div class="metadata-value">{{ clip.provider_name }}</div>
+        </div>
+        {% for name, value in clip.metadatas.items %}
+        <div class="metadata-row">
+          <div class="metadata-name">{{ name }}</div>
+          <div class="metadata-value">{{ value }}</div>
+        </div>
+        {% endfor %} {% if clip.clip_xml %}
+        <div class="metadata-row">
+          <div class="metadata-name">Clip XML</div>
+          <div class="metadata-value">Yes</div>
+        </div>
+        {% endif %} {% if clip.reel.media_xml %}
+        <div class="metadata-row">
+          <div class="metadata-name">Media XML</div>
+          <div class="metadata-value">Yes</div>
+        </div>
+        {% endif %}
+      </div>
+      {% endfor %}
     </div>
+  </div>
 </div>
 {% endif %}
