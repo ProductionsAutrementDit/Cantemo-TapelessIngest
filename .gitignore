@@ -109,3 +109,8 @@ venv.bak/
 
 # mkdocs documentation 
 /site 
+# AI tooling (local)
+.claude/
+.serena/
+_bmad/
+_bmad-output/
