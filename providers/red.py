@@ -4,7 +4,7 @@ import logging
 
 import subprocess as sp
 import urllib
-import pipes
+import shlex
 import sys
 import os
 import csv
@@ -61,7 +61,7 @@ class Provider(BaseProvider):
 
     def getAllClipMetadatas(self, media_absolute_path, metadatas):
         cmd = [
-            "REDline --i " + pipes.quote(media_absolute_path) + " --printMeta 3 --useMeta",
+            "REDline --i " + shlex.quote(media_absolute_path) + " --printMeta 3 --useMeta",
         ]
         p = sp.run(cmd, shell=True, capture_output=True, text=True)
         csvfile = p.stdout

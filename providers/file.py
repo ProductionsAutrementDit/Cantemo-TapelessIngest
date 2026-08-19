@@ -5,7 +5,7 @@ import os
 from datetime import datetime
 import json
 import subprocess as sp
-import pipes
+import shlex
 
 from portal.plugins.TapelessIngest.providers.providers import (
     Provider as BaseProvider,
@@ -51,7 +51,7 @@ class Provider(BaseProvider):
         metadatas["shooting_date"] = shooting_date.isoformat()
 
         cmd = [
-            "ffprobe -loglevel quiet -show_format -show_streams -print_format json " + pipes.quote(media_absolute_path)
+            "ffprobe -loglevel quiet -show_format -show_streams -print_format json " + shlex.quote(media_absolute_path)
         ]
         p = sp.Popen(cmd, stdout=sp.PIPE, stderr=sp.PIPE, shell=True)
         output = json.loads(p.stdout.read())

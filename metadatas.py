@@ -48,14 +48,11 @@ class XMLParser:
         if raw or len(metadata_elements) > 1:
             return metadata_elements
         else:
-            if len(metadata_elements) is 1:
-                if return_type is "text":
+            if len(metadata_elements) == 1:
+                if return_type == "text":
                     if isinstance(metadata_elements[0], etree._Element):
                         value = metadata_elements[0].text
-                    elif isinstance(
-                        metadata_elements[0],
-                        (etree._ElementStringResult, etree._ElementUnicodeResult),
-                    ):
+                    elif isinstance(metadata_elements[0], str):
                         value = metadata_elements[0]
                     else:
                         log.debug(
