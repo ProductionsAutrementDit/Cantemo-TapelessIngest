@@ -112,9 +112,15 @@ class Provider:
         storage_id = file.getStorage()
         storage = sth.getStorage(storage_id)
         root_path = browse_root_path(storage)
-        if root_path is not None:
-            return os.path.join(root_path, file.getPath())
-        return None
+        if root_path is None:
+            # Unresolvable root: fail HERE, like the pre-2.1 code failed at
+            # storage.getMethods() — never let None flow onward into the
+            # callers' os.path.dirname(...).
+            raise AttributeError(
+                f"storage {storage_id} has no browse-capable method "
+                f"(no root path for {file.getPath()})"
+            )
+        return os.path.join(root_path, file.getPath())
 
     def _createDictFromMetadataMapping(self, clip):
         metadata_dict = {}

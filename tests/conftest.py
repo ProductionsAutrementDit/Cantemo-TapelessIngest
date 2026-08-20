@@ -80,10 +80,18 @@ class FakeProvider:
     context; the umid is derived deterministically from the full storage path
     (extension stripped) so same-named files in different directories never
     collide.
+
+    Every getMetadatasFromFile call records `context.get("scan_context")`
+    in `seen_scan_contexts`, so tests can assert the provider dict's
+    "scan_context" key is load-bearing (story 2.1: providers resolve
+    absolute paths through it).
     """
 
     name = "Fake Test Provider"
     machine_name = FAKE_PROVIDER_NAME
+
+    def __init__(self):
+        self.seen_scan_contexts = []
 
     def getExtensions(self):
         return [".fake"]
@@ -95,6 +103,7 @@ class FakeProvider:
         return []
 
     def getMetadatasFromFile(self, media_file, metadatas, context):
+        self.seen_scan_contexts.append(context.get("scan_context"))
         metadatas["provider"] = self.machine_name
         metadatas["umid"] = os.path.splitext(media_file.getPath())[0]
         return metadatas, context

@@ -202,6 +202,7 @@ def scan_tapeless_dir(
     number=0,
     providers=None,
     replace=True,
+    *,
     context=None,
 ):
     if user is None:
@@ -249,6 +250,14 @@ def scan_tapeless_dir(
                     folder, is_new = Folder.get_or_new(
                         storage_id=storage, path=folder_path
                     )
+                    if context is not None:
+                        # Seed the memoized root from the run context BEFORE
+                        # any property access, so neither this folder's scan
+                        # nor the recursion's os.scandir(absolute_path)
+                        # re-resolves the storage (real once-per-run, FR-7).
+                        child_root = context.root_path_for(storage)
+                        if child_root:
+                            folder._root_path = child_root
                     # print(f"Scanning {folder.path}...")
                     ingest_message = ""
                     results = folder.ingest(
@@ -409,8 +418,17 @@ class Command(BaseCommand):
         )
 
         folder, is_new = Folder.get_or_new(storage_id=storage, path=path)
+        # Seed the memoized root from the run context so the top-level
+        # os.scandir(folder.absolute_path) never re-resolves the storage.
+        root_path = context.root_path_for(storage)
+        if root_path:
+            folder._root_path = root_path
+        # No KeyError possible: log the resolved VS object when the context
+        # has one, else the raw storage id.
+        storage_info = context.storages.get(storage)
+        storage_label = storage_info.storage if storage_info is not None else storage
         logger.log(
-            f"Scanning folder {folder.path} on storage {context.storages[storage].storage}, with user {user}, starting with {' or '.join(args.startWith)} using only {only}, skipping {args.skip}",
+            f"Scanning folder {folder.path} on storage {storage_label}, with user {user}, starting with {' or '.join(args.startWith)} using only {only}, skipping {args.skip}",
         )
         try:
             count = scan_tapeless_dir(

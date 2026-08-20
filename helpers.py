@@ -52,7 +52,10 @@ class TapelessIngestPath(object):
         storage_helper = StorageHelper()
         self.storage = storage_helper.getStorage(storage_id)
         # Canonical block (scan/context.py): None when no browse-capable
-        # method, matching the previous inline loop.
+        # method. root_path is always SET, as before (the old code
+        # initialized it to None above, then possibly overwrote it).
+        # Deliberate unification: first browse method wins now; the old
+        # inline loop let the last one win (no prod storage has two).
         self.root_path = browse_root_path(self.storage)
 
     @property

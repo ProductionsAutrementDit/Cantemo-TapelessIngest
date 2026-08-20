@@ -7,9 +7,9 @@ Redis ``storage:{id}`` cache (Nov-2025 prod hotfix) is deliberately left
 to the paged/UI property chain.
 """
 
-from typing import Dict, Iterable
+import logging
+from typing import Any, Dict, Iterable, List, Optional
 
-from portal.vidispine.iexception import NotFoundError
 from portal.vidispine.istorage import StorageHelper
 
 from portal.plugins.TapelessIngest.scan.context import (
@@ -19,13 +19,17 @@ from portal.plugins.TapelessIngest.scan.context import (
     browse_root_path,
 )
 
+log = logging.getLogger(__name__)
+
 
 def resolve_storages(storage_ids: Iterable[str]) -> Dict[str, StorageInfo]:
     """Resolve each unique storage id once via a bare ``StorageHelper``.
 
-    An unresolvable storage (``NotFoundError``) yields
-    ``StorageInfo(root_path=None)``; consumers fall back to today's
-    property chain, preserving pin #5's semantics.
+    An unresolvable storage — ``NotFoundError`` or ANY other resolution
+    failure — is logged and yields ``StorageInfo(root_path=None)``:
+    consumers fall back to today's property chain, so a run degrades to
+    the pre-2.1 per-folder "Cannot get full path" errors instead of
+    crashing before the scan starts. Pin #5's semantics are preserved.
     """
     storage_helper = StorageHelper()
     storages: Dict[str, StorageInfo] = {}
@@ -34,7 +38,12 @@ def resolve_storages(storage_ids: Iterable[str]) -> Dict[str, StorageInfo]:
             continue
         try:
             storage = storage_helper.getStorage(storage_id)
-        except NotFoundError:
+        except Exception:
+            log.error(
+                f"resolve_storages: getStorage({storage_id!r}) failed; "
+                f"falling back to per-folder resolution",
+                exc_info=True,
+            )
             storages[storage_id] = StorageInfo(id=storage_id, root_path=None)
             continue
         storages[storage_id] = StorageInfo(
@@ -48,11 +57,11 @@ def resolve_storages(storage_ids: Iterable[str]) -> Dict[str, StorageInfo]:
 def build_context(
     storage_ids: Iterable[str],
     *,
-    user,
-    dry_run,
-    providers,
-    legacy_storages,
-    replace,
+    user: Any,
+    dry_run: bool,
+    providers: Optional[List[str]],
+    legacy_storages: Optional[List[str]],
+    replace: bool,
 ) -> ScanContext:
     """Build the one per-run context for tree mode (commands' ``handle()``)."""
     return ScanContext(
@@ -70,11 +79,11 @@ def build_context(
 def build_default_context(
     folder,
     *,
-    user=None,
-    dry_run=False,
-    providers=None,
-    legacy_storages=None,
-    replace=False,
+    user: Any = None,
+    dry_run: bool = False,
+    providers: Optional[List[str]] = None,
+    legacy_storages: Optional[List[str]] = None,
+    replace: bool = False,
 ) -> ScanContext:
     """Default context for paged callers — root_path-first and lazy.
 

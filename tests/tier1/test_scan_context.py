@@ -26,7 +26,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 # so `scan.context` resolves to this repo's package in a bare interpreter.
 PORTAL_FREEDOM_SCRIPT = (
     "import sys, scan.context; "
-    "assert not [m for m in sys.modules if m.startswith('portal')]"
+    "assert not [m for m in sys.modules if m == 'portal' or m.startswith('portal.')]"
 )
 
 
@@ -88,6 +88,35 @@ def test_browse_root_path_returns_browse_method_url():
     assert browse_root_path(storage) == "/root"
 
 
+def test_browse_root_path_first_browse_method_wins():
+    # Review-ruled contract: FIRST match. (The pre-2.1 property-site loops
+    # let the LAST browse method win — deliberately unified; no storage in
+    # practice has two browse methods.)
+    storage = _Storage(
+        [_Method(browse=True, url="/first"), _Method(browse=True, url="/second")]
+    )
+    assert browse_root_path(storage) == "/first"
+
+
+def test_browse_root_path_tolerates_uri_without_url():
+    class _NoURIMethod:
+        def getBrowse(self):
+            return True
+
+        def getFirstURI(self):
+            return None
+
+    class _NoURLKeyMethod:
+        def getBrowse(self):
+            return True
+
+        def getFirstURI(self):
+            return {}
+
+    assert browse_root_path(_Storage([_NoURIMethod()])) is None
+    assert browse_root_path(_Storage([_NoURLKeyMethod()])) is None
+
+
 def test_storage_info_and_run_options_are_frozen():
     info = StorageInfo(id="VX-41", root_path="/root")
     with pytest.raises(dataclasses.FrozenInstanceError):
@@ -143,3 +172,5 @@ def test_root_path_for_and_absolute_path_for():
     # back to today's property chain with its truthiness semantics.
     assert ctx.absolute_path_for("VX-EMPTY", "2026/AH_x") is None
     assert ctx.absolute_path_for("VX-MISSING", "2026/AH_x") is None
+    # A None path never reaches os.path.join.
+    assert ctx.absolute_path_for("VX-41", None) is None

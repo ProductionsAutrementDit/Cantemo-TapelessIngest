@@ -32,7 +32,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 # so `scan.verification` resolves to this repo's package in a bare interpreter.
 PORTAL_FREEDOM_SCRIPT = (
     "import sys, scan.verification; "
-    "assert not [m for m in sys.modules if m.startswith('portal')]"
+    "assert not [m for m in sys.modules if m == 'portal' or m.startswith('portal.')]"
 )
 
 

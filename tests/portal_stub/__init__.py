@@ -169,11 +169,14 @@ class StorageHelperFake:
 
     - ``set_root(storage_id, root)`` configures a storage whose ``getMethods``
       yields exactly one browse-capable method with that root URL;
-    - an UNCONFIGURED id resolves to a storage with no browse-capable method
-      (-> ``resolve_storages`` yields ``root_path=None``);
+    - ``set_no_browse(storage_id)`` configures a storage with no
+      browse-capable method (-> ``resolve_storages`` yields
+      ``root_path=None``);
     - ``set_missing(storage_id)`` makes ``getStorage`` raise NotFoundError;
-    - ``get_storage_calls`` counts ``getStorage`` per id for the
-      once-per-run acceptance criterion.
+    - an UNCONFIGURED id raises AssertionError naming the id — silent
+      success would hide unintended storage traffic;
+    - ``get_storage_calls`` counts ``getStorage`` per id (all outcomes,
+      the assertion included) for the once-per-run acceptance criterion.
 
     Only ``getStorage`` is implemented — any other method access still
     raises AttributeError, keeping tests off-server honest. The conftest
@@ -183,6 +186,7 @@ class StorageHelperFake:
     """
 
     roots = {}
+    no_browse = set()
     missing = set()
     get_storage_calls = {}
 
@@ -196,12 +200,17 @@ class StorageHelperFake:
         cls.roots[storage_id] = root
 
     @classmethod
+    def set_no_browse(cls, storage_id):
+        cls.no_browse.add(storage_id)
+
+    @classmethod
     def set_missing(cls, storage_id):
         cls.missing.add(storage_id)
 
     @classmethod
     def reset(cls):
         cls.roots.clear()
+        cls.no_browse.clear()
         cls.missing.clear()
         cls.get_storage_calls.clear()
 
@@ -211,10 +220,18 @@ class StorageHelperFake:
         if storage_id in cls.missing:
             raise NotFoundError(f"storage {storage_id} not found (configured)")
         if storage_id in cls.roots:
-            methods = [FakeStorageMethod(browse=True, url=cls.roots[storage_id])]
-        else:
-            methods = [FakeStorageMethod(browse=False)]
-        return FakeStorage(storage_id, methods)
+            return FakeStorage(
+                storage_id,
+                [FakeStorageMethod(browse=True, url=cls.roots[storage_id])],
+            )
+        if storage_id in cls.no_browse:
+            return FakeStorage(storage_id, [FakeStorageMethod(browse=False)])
+        raise AssertionError(
+            f"StorageHelperFake.getStorage called for unconfigured storage id "
+            f"{storage_id!r} — configure it via set_root/set_no_browse/"
+            f"set_missing (silent success would hide unintended storage "
+            f"traffic)"
+        )
 
 
 def _stub_class(name):

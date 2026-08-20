@@ -12,7 +12,7 @@ a read-only mapping proxy at construction.
 import os
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any, Mapping, Optional
+from typing import Any, List, Mapping, Optional
 
 
 def browse_root_path(storage) -> Optional[str]:
@@ -21,12 +21,17 @@ def browse_root_path(storage) -> Optional[str]:
     Duck-typed over the opaque Vidispine storage object; a falsy storage or
     a storage with no browse-capable method resolves to ``None`` (callers
     keep today's truthiness/AttributeError semantics on top of that).
+
+    FIRST-match is the contract (review-ruled): the first browse-capable
+    method's URI wins. This deliberately unifies the pre-2.1 copies — the
+    three property-site loops let the LAST browse method win, the provider
+    copy the first; no storage in practice has two browse methods.
     """
     if not storage:
         return None
     for method in storage.getMethods():
         if method.getBrowse():
-            return method.getFirstURI()["url"]
+            return (method.getFirstURI() or {}).get("url")
     return None
 
 
@@ -44,8 +49,8 @@ class RunOptions:
     """The run-scoped options a passed context carries authoritatively."""
 
     dry_run: bool = False
-    providers: Any = None
-    legacy_storages: Any = None
+    providers: Optional[List[str]] = None
+    legacy_storages: Optional[List[str]] = None
     replace: bool = False
     user: Any = None
 
@@ -81,7 +86,9 @@ class ScanContext:
     def __post_init__(self):
         # Frozen dataclass: bypass the frozen __setattr__ once to install
         # the read-only view; ctx.storages["X"] = ... raises TypeError.
-        object.__setattr__(self, "storages", MappingProxyType(dict(self.storages)))
+        object.__setattr__(
+            self, "storages", MappingProxyType(dict(self.storages or {}))
+        )
 
     def root_path_for(self, storage_id) -> Optional[str]:
         """Resolved browse root for ``storage_id``, or ``None`` on a miss."""
@@ -91,8 +98,12 @@ class ScanContext:
         return info.root_path
 
     def absolute_path_for(self, storage_id, path) -> Optional[str]:
-        """Join ``path`` onto the resolved root; ``None`` on miss/falsy root."""
+        """Join ``path`` onto the resolved root.
+
+        ``None`` on a storage miss, a falsy root, or a ``None`` path —
+        never hand a ``None`` to ``os.path.join``.
+        """
         root_path = self.root_path_for(storage_id)
-        if not root_path:
+        if not root_path or path is None:
             return None
         return os.path.join(root_path, path)

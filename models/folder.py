@@ -134,11 +134,20 @@ class Folder(models.Model):
                 self._root_path = root_path
         return self._root_path
 
+    def _absolute_path_from_root(self, root_path):
+        """The one copy of the absolute-path truthiness semantics.
+
+        Falsy root ("" included, never `is None`) -> False, exactly like
+        the pre-2.1 absolute_path property; scan() reuses this with its
+        context-resolved root.
+        """
+        if root_path:
+            return os.path.join(root_path, self.path)
+        return False
+
     @property
     def absolute_path(self):
-        if self.root_path:
-            return os.path.join(self.root_path, self.path)
-        return False
+        return self._absolute_path_from_root(self.root_path)
 
     def getFile(self, path: str) -> Any:
         """Get a file from storage by relative path.
@@ -384,7 +393,8 @@ class Folder(models.Model):
             )
         else:
             # A passed context's options are authoritative (the commands
-            # pass the same values as kwargs — equal by construction).
+            # pass the same values as kwargs — equal by construction; if a
+            # caller's kwargs ever diverge, the context wins by design).
             user = scan_context.options.user
             providers = scan_context.options.providers
             legacy_storages = scan_context.options.legacy_storages
@@ -403,7 +413,7 @@ class Folder(models.Model):
             # Context miss / falsy root falls back to today's property
             # chain — truthiness semantics, pin #5's AttributeError included.
             root_path = self.root_path
-        absolute_path = os.path.join(root_path, self.path) if root_path else False
+        absolute_path = self._absolute_path_from_root(root_path)
         if absolute_path:
             # One listings cache per scan invocation (AD-4): batched
             # verification, one os.scandir per unique directory.
@@ -426,7 +436,10 @@ class Folder(models.Model):
                 if number == 0 and len(search_result["hits"]["hits"]) == result_number:
                     has_next = True
                     first += result_number
-                context = {
+                # Named provider_context (not `context`) so the mutable
+                # provider dict never shadows the ScanContext kwarg — 2.3
+                # builds on this dict.
+                provider_context = {
                     "folder": self,
                     "clips": [],
                     "scan_context": scan_context,
@@ -447,12 +460,12 @@ class Folder(models.Model):
                                 )
                             (
                                 clip,
-                                context,
+                                provider_context,
                                 created,
                             ) = Clip.get_clip_from_file(
                                 file,
                                 provider_list,
-                                context,
+                                provider_context,
                                 legacy_storages=legacy_storages,
                             )
                             # Seed the clip's memo attributes from the run
@@ -472,7 +485,7 @@ class Folder(models.Model):
                             if clip.metadatas["provider"] not in providers:
                                 providers.append(clip.metadatas["provider"])
                             response["clips"].append(clip)
-                            context["clips"].append(clip)
+                            provider_context["clips"].append(clip)
                         except Exception as e:
                             traceback.print_exc()
                             response["errors"].append(
@@ -506,12 +519,26 @@ class Folder(models.Model):
     ):
         if context is not None:
             # A passed context's options are authoritative (the commands
-            # pass the same values as kwargs — equal by construction).
+            # pass the same values as kwargs — equal by construction; if a
+            # caller's kwargs ever diverge, the context wins by design).
             user = context.options.user
             providers = context.options.providers
             legacy_storages = context.options.legacy_storages
             replace = context.options.replace
             dry_run = context.options.dry_run
+        else:
+            # Paged mode: build the default context HERE so it carries this
+            # call's actual dry_run/replace/user/providers — scan's own
+            # default build could not know them and would misreport the
+            # options on the provider dict's scan_context.
+            context = build_default_context(
+                self,
+                user=user,
+                dry_run=dry_run,
+                providers=providers,
+                legacy_storages=legacy_storages,
+                replace=replace,
+            )
         response = self.scan(
             first=first,
             number=number,

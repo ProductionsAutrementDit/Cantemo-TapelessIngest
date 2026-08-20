@@ -16,6 +16,8 @@ from django.contrib.auth.models import User
 from django.core.management import call_command
 from django.core.management.base import CommandError
 
+from portal.plugins.TapelessIngest.scan.context import ScanContext
+
 COMMANDS = ["scan_tapeless_dir", "check_clips_in_folder"]
 
 BASE_ARGS = ["--storage", "VX-41", "--path", "2026"]
@@ -99,7 +101,9 @@ class _CapturingLogger:
 
 
 @pytest.mark.parametrize("command", COMMANDS)
-def test_since_window_reaches_scan_only_filter(command, migrated_db, monkeypatch):
+def test_since_window_reaches_scan_only_filter(
+    command, migrated_db, monkeypatch, storage_fake
+):
     """End-to-end wiring: the computed window must reach the scan's `only`.
 
     Guards the aliasing contract — `only = only + date_window` instead of
@@ -118,6 +122,7 @@ def test_since_window_reaches_scan_only_filter(command, migrated_db, monkeypatch
     captured = {}
 
     def fake_scan(parent_folder, **kwargs):
+        captured["parent_folder"] = parent_folder
         captured.update(kwargs)
         return 0
 
@@ -126,6 +131,7 @@ def test_since_window_reaches_scan_only_filter(command, migrated_db, monkeypatch
     # No cache.set("storage:VX-41", ...) preset any more (story 2.1): tree
     # mode resolves the storage through the counting StorageHelper fake in
     # tests/portal_stub, and handle()'s log line reads the run context.
+    storage_fake.set_root("VX-41", "/wired-root")
 
     user = User.objects.create(pk=4242, username=f"story14-wiring-{command}")
     now_before = datetime.now()
@@ -143,6 +149,15 @@ def test_since_window_reaches_scan_only_filter(command, migrated_db, monkeypatch
     # args.only starts [] and handle() appends the window in place, so the
     # very list object the scan received must carry the window values.
     assert captured["only"] in candidates
+
+    # Story 2.1 wiring: handle() built one ScanContext carrying the
+    # resolved root, threaded it into the recursion, and seeded the
+    # top-level folder's memoized root from it (real once-per-run).
+    context = captured["context"]
+    assert isinstance(context, ScanContext)
+    assert context.root_path_for("VX-41") == "/wired-root"
+    assert captured["parent_folder"]._root_path == "/wired-root"
+    assert storage_fake.get_storage_calls == {"VX-41": 1}
 
     # Exactly one range line, no per-day lines, no legacy "Scanning from" line.
     window_lines = [

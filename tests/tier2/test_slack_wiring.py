@@ -65,7 +65,7 @@ def _stub_config_parser(token):
     ids=["token-set", "config-absent", "token-empty"],
 )
 def test_config_token_reaches_web_client(
-    command, token, client_built, migrated_db, monkeypatch
+    command, token, client_built, migrated_db, monkeypatch, storage_fake
 ):
     module = importlib.import_module(
         f"portal.plugins.TapelessIngest.management.commands.{command}"
@@ -81,6 +81,7 @@ def test_config_token_reaches_web_client(
     # No cache.set("storage:VX-41", ...) preset any more (story 2.1): tree
     # mode resolves the storage through the counting StorageHelper fake in
     # tests/portal_stub, and handle()'s log line reads the run context.
+    storage_fake.set_root("VX-41", "/wired-root")
 
     user = User.objects.create(pk=4243, username=f"story15-wiring-{command}")
     try:

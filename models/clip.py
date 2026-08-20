@@ -420,6 +420,8 @@ class Clip(models.Model):
         if not hasattr(self, "_root_path"):
             # Canonical block (scan/context.py); no resolvable root leaves
             # _root_path unassigned -> AttributeError, exactly as before.
+            # Deliberate unification: first browse method wins now; the old
+            # inline loop let the last one win (no prod storage has two).
             root_path = browse_root_path(self.storage)
             if root_path is not None:
                 self._root_path = root_path

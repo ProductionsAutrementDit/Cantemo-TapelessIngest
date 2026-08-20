@@ -7,6 +7,8 @@ Folders here deliberately have NO preset ``_root_path`` — resolution goes
 through the context, unlike the story-1.3 pins which bypass it.
 """
 
+import importlib
+
 from portal.plugins.TapelessIngest.models.folder import Folder
 from portal.plugins.TapelessIngest.scan.adapters import build_context
 
@@ -91,3 +93,104 @@ def test_tree_run_resolves_each_storage_once(
     clip = response_a["clips"][0]
     assert clip.root_path == str(tmp_path)
     assert storage_fake.get_storage_calls == {STORAGE_ID: 1}
+
+    # The provider dict's "scan_context" key is load-bearing: every
+    # provider call saw THE run's context object (identity, not equality).
+    assert len(fake_provider.seen_scan_contexts) == 2
+    assert all(seen is ctx for seen in fake_provider.seen_scan_contexts)
+
+
+def test_real_recursion_resolves_storage_once(
+    migrated_db, es_fake, es_page, fake_provider, storage_fake, tmp_path, monkeypatch
+):
+    """The REAL scan_tapeless_dir over a tmp tree: one getStorage total.
+
+    Demonstrated 2.1-review shortfall: the recursion's
+    os.scandir(parent_folder.absolute_path) used to re-resolve the storage
+    per folder through the property chain. With the ctx seeding in place,
+    a whole tree run costs exactly one getStorage per unique storage id.
+    """
+    module = importlib.import_module(
+        "portal.plugins.TapelessIngest.management.commands.scan_tapeless_dir"
+    )
+
+    root_rel = "2026"
+    (tmp_path / root_rel / "AH_child_one").mkdir(parents=True)
+    (tmp_path / root_rel / "AH_child_two").mkdir(parents=True)
+
+    storage_fake.set_root(STORAGE_ID, str(tmp_path))
+    ctx = build_context(
+        [STORAGE_ID],
+        user=None,
+        dry_run=True,
+        providers=[fake_provider.machine_name],
+        legacy_storages=[],
+        replace=False,
+    )
+
+    class _RecordingLogger:
+        def __init__(self):
+            self.messages = []
+
+        def log(self, message):
+            self.messages.append(message)
+
+    # The module's OWN global logger (sanctioned — not portal mocking).
+    monkeypatch.setattr(module, "logger", _RecordingLogger())
+
+    parent = Folder(storage_id=STORAGE_ID, path=root_rel)
+    # handle() seeds the top-level folder's memoized root from the ctx;
+    # mirror that here — the recursion seeds every child itself.
+    parent._root_path = ctx.root_path_for(STORAGE_ID)
+
+    # One index query per child folder: empty page, hits=0 -> the
+    # recursion descends into the (empty) child directory via scandir.
+    es_fake.push(es_page([], total=0))
+    es_fake.push(es_page([], total=0))
+
+    count = module.scan_tapeless_dir(
+        parent,
+        storage=STORAGE_ID,
+        ingest=False,
+        user=object(),
+        startwith=["AH_"],
+        providers=[fake_provider.machine_name],
+        replace=False,
+        context=ctx,
+    )
+
+    assert count == 2
+    # Real once-per-run: the build_context resolution was the ONLY
+    # getStorage for the entire tree walk (scandir + ingest + recursion).
+    assert storage_fake.get_storage_calls == {STORAGE_ID: 1}
+
+
+def test_paged_ingest_default_ctx_carries_actual_options(
+    migrated_db, es_fake, es_page, fake_provider, tmp_path
+):
+    """Paged mode (no ctx passed): ingest builds the default ctx itself.
+
+    The provider dict's scan_context must report ingest's ACTUAL options —
+    scan's own default build could not know dry_run/replace (2.1 review
+    item: misreported options).
+    """
+    rel = "2026/AH_20260101_pagedopts"
+    (tmp_path / rel).mkdir(parents=True)
+    (tmp_path / rel / "CLIPOPT.fake").write_bytes(b"clip data")
+    es_fake.push(es_page([_source(f"{rel}/CLIPOPT.fake", "VX-41-OPT")], total=1))
+
+    folder = Folder(storage_id=STORAGE_ID, path=rel)
+    # Paged seam: preset memo, StorageHelper never involved.
+    folder._root_path = str(tmp_path)
+
+    response = folder.ingest(
+        dry_run=True, replace=True, providers=[fake_provider.machine_name]
+    )
+
+    assert response["processed"] == 1
+    [seen] = fake_provider.seen_scan_contexts
+    assert seen is not None
+    assert seen.options.dry_run is True
+    assert seen.options.replace is True
+    assert seen.options.providers == [fake_provider.machine_name]
+    assert seen.root_path_for(STORAGE_ID) == str(tmp_path)
