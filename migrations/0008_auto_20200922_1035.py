@@ -17,7 +17,9 @@ class Migration(migrations.Migration):
         # On the prod DB this constraint historically cascaded away with the
         # column drop, so prod (where 0008 is already recorded as applied and
         # never re-runs) and fresh builds now agree; sqlite's table-rebuild
-        # under Django 5.2 requires it explicitly.
+        # under Django 5.2 requires it explicitly. Prod (192.168.0.90) is the
+        # only existing deployment, so no other DB can have applied 0001-0007
+        # without 0008.
         migrations.AlterUniqueTogether(
             name="folder",
             unique_together=set(),

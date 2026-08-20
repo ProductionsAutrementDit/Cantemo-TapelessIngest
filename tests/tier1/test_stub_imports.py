@@ -14,6 +14,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
 def _import_and_assert_in_repo(dotted):
     module = importlib.import_module(dotted)
+    assert module.__file__ is not None, f"{dotted} resolved as a namespace package"
     module_file = Path(module.__file__).resolve()
     assert module_file.is_relative_to(
         REPO_ROOT

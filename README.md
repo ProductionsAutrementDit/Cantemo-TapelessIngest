@@ -7,10 +7,13 @@ OpenSearch, no prod DB. Dev dependencies live in a local venv and are never
 deployed:
 
 ```
-/opt/homebrew/bin/python3.14 -m venv .venv
+python3 -m venv .venv          # requires Python 3.14, matching prod
 .venv/bin/pip install -r requirements-dev.txt
 .venv/bin/pytest tests/
 ```
+
+The pytest/black pins in `requirements-dev.txt` are latest stable as of
+2026-08-20; the runtime deps mirror the verified prod versions.
 
 Tier 1 (`tests/tier1/`) proves the plugin modules import through the stub;
 Tier 2 (`tests/tier2/`) migrates a sqlite `:memory:` DB and exercises the ORM.
