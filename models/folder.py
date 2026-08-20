@@ -26,6 +26,7 @@ from portal.plugins.TapelessIngest.helpers import (
 )
 from portal.plugins.TapelessIngest.scan.adapters import build_default_context
 from portal.plugins.TapelessIngest.scan.context import browse_root_path
+from portal.plugins.TapelessIngest.scan.verification import FolderListings
 
 log = logging.getLogger(__name__)
 
@@ -404,6 +405,9 @@ class Folder(models.Model):
             root_path = self.root_path
         absolute_path = os.path.join(root_path, self.path) if root_path else False
         if absolute_path:
+            # One listings cache per scan invocation (AD-4): batched
+            # verification, one os.scandir per unique directory.
+            listings = FolderListings()
             search_doc = self.build_search_doc(provider_list)
             has_next = True
             while has_next:
@@ -422,19 +426,22 @@ class Folder(models.Model):
                 if number == 0 and len(search_result["hits"]["hits"]) == result_number:
                     has_next = True
                     first += result_number
-                context = {"folder": self, "clips": [], "scan_context": scan_context}
+                context = {
+                    "folder": self,
+                    "clips": [],
+                    "scan_context": scan_context,
+                    "listings": listings,
+                }
                 if not count_only:
-                    # Note: File existence checks are performed per-file for data integrity.
-                    # For large batches, consider trusting Elasticsearch index or
-                    # pre-scanning with os.scandir() for better performance.
                     for result in search_result["hits"]["hits"]:
                         try:
                             file = VSFile(
                                 result["_source"], settings.VIDISPINE_REPLACE_URLS
                             )
-                            # Validate file exists on filesystem
+                            # Validate file exists on filesystem (batched:
+                            # one scandir per directory, DC-2 guard intact)
                             file_absolute_path = os.path.join(root_path, file.getPath())
-                            if not os.path.exists(file_absolute_path):
+                            if not listings.exists(file_absolute_path):
                                 raise TapelessIngestException(
                                     f"File {file} does not exist ({file_absolute_path})"
                                 )
