@@ -42,8 +42,9 @@ def test_single_page_scan_counters(
     (tmp_path / rel / "CLIPOLD.fake").write_bytes(b"old clip data")
     # CLIPGONE.fake is deliberately absent from disk (index/filesystem desync).
 
-    # Pre-existing umid: the FakeProvider derives umid from the file name stem.
-    Clip(umid="CLIPOLD").save()
+    # Pre-existing umid: the FakeProvider derives umid from the full storage
+    # path with the extension stripped.
+    Clip(umid=f"{rel}/CLIPOLD").save()
 
     es_fake.push(
         es_page(
@@ -59,24 +60,35 @@ def test_single_page_scan_counters(
     folder = _folder(tmp_path, rel)
     response = folder.scan(providers=[fake_provider.machine_name])
 
+    # (0, 25): scan forwards its OWN first/number defaults explicitly on
+    # every query_elastic call — the fake accepts no defaults for them.
     assert es_fake.calls == [(0, 25)]
     assert set(response.keys()) == SCAN_KEYS
     assert response["hits"] == 3
     assert response["processed"] == 3
     assert response["created"] == 1
-    # Ledger bug pinned as-is (do not fix): already_ingested counts every
-    # successfully processed clip, because get_clip_from_file always sets
-    # clip.file (clip.py:332) — not only clips already known to the index.
+    # Ledger bug pinned as-is (do not fix, tests/pinned-bugs.md):
+    # already_ingested counts every successfully processed clip, because
+    # get_clip_from_file always sets clip.file (clip.py:332) — not only
+    # clips already known to the index.
     assert response["already_ingested"] == 2
     gone_abs = tmp_path / rel / "CLIPGONE.fake"
+    # Caveat: the exact wording after "Error scanning file {path}: " partly
+    # reflects the stub VSFile.__str__ (the path); prod's default repr would
+    # embed an object address there. The pinned production part is the
+    # "Error scanning file {path}: ..." template and the swallow-and-continue
+    # behavior.
     assert response["errors"] == [
         f"Error scanning file {rel}/CLIPGONE.fake: "
         f"File {rel}/CLIPGONE.fake does not exist ({gone_abs})"
     ]
-    assert [clip.umid for clip in response["clips"]] == ["CLIPNEW", "CLIPOLD"]
+    assert [clip.umid for clip in response["clips"]] == [
+        f"{rel}/CLIPNEW",
+        f"{rel}/CLIPOLD",
+    ]
 
-    # Ledger quirk pinned as-is: a "scan" is not read-only — it persists
-    # provider_names and scanned_on on the folder.
+    # Ledger quirk pinned as-is (tests/pinned-bugs.md): a "scan" is not
+    # read-only — it persists provider_names and scanned_on on the folder.
     saved = Folder.objects.get(storage_id=STORAGE_ID, path=rel)
     assert saved.provider_names == fake_provider.machine_name
     assert saved.scanned_on is not None

@@ -8,6 +8,7 @@ used (providers=None would fall back to the real PROVIDERS_LIST → ffprobe).
 
 import pytest
 
+from portal.plugins.TapelessIngest.models.clip import Clip
 from portal.plugins.TapelessIngest.models.folder import Folder
 
 STORAGE_ID = "VX-41"
@@ -22,10 +23,15 @@ def _folder(root="/golden-root"):
 
 
 def test_count_multi_page_call_sequence(es_fake, es_page, fake_provider):
+    # Pages deliberately carry DIFFERENT totals so the hits pin discriminates:
+    # scan overwrites response["hits"] from each page, so the LAST page's
+    # total wins (ledger entry "hits reflects only the last page's total",
+    # tests/pinned-bugs.md).
     es_fake.push(es_page([{}] * 100, total=137))
-    es_fake.push(es_page([{}] * 37, total=137))
+    es_fake.push(es_page([{}] * 37, total=140))
 
-    response = _folder().scan(
+    folder = _folder()
+    response = folder.scan(
         number=0, count_only=True, providers=[fake_provider.machine_name]
     )
 
@@ -33,12 +39,20 @@ def test_count_multi_page_call_sequence(es_fake, es_page, fake_provider):
     assert es_fake.calls == [(0, 100), (100, 100)]
     assert response == {
         "clips": [],
-        "hits": 137,
+        "hits": 140,
         "errors": [],
         "created": 0,
         "already_ingested": 0,
         "processed": 0,
     }
+    # Golden-doc wiring: scan must send exactly build_search_doc's output for
+    # the provider list it resolved (same interpreter → same set ordering, so
+    # plain equality needs no seed machinery), with doc_type ["file"], on
+    # every page.
+    expected_doc = folder.build_search_doc(
+        Clip._get_provider_list([fake_provider.machine_name])
+    )
+    assert es_fake.call_docs == [(expected_doc, ["file"])] * 2
 
 
 def test_count_single_page(es_fake, es_page, fake_provider):
@@ -53,6 +67,23 @@ def test_count_single_page(es_fake, es_page, fake_provider):
     assert response["processed"] == 0
     assert response["clips"] == []
     assert response["errors"] == []
+
+
+def test_count_exactly_full_final_page(es_fake, es_page, fake_provider):
+    # Boundary at total % page_size == 0: the loop only stops on a NON-full
+    # page, so an exactly-full final page costs one extra (empty) query.
+    es_fake.push(es_page([{}] * 100, total=200))
+    es_fake.push(es_page([{}] * 100, total=200))
+    es_fake.push(es_page([], total=200))
+
+    response = _folder().scan(
+        number=0, count_only=True, providers=[fake_provider.machine_name]
+    )
+
+    assert es_fake.calls == [(0, 100), (100, 100), (200, 100)]
+    assert response["hits"] == 200
+    assert response["processed"] == 0
+    assert response["clips"] == []
 
 
 def test_no_resolvable_root(es_fake, fake_provider):
@@ -75,18 +106,21 @@ def test_no_resolvable_root(es_fake, fake_provider):
 
 
 def test_storage_none_raises_attributeerror(es_fake, fake_provider):
-    # Ledger bug pinned as-is (do not fix): with storage=None and no preset
-    # _root_path, root_path raises AttributeError instead of filling errors.
+    # Ledger bug pinned as-is (do not fix, tests/pinned-bugs.md): with
+    # storage=None and no preset _root_path, root_path raises AttributeError
+    # instead of filling errors. match= pins the root_path bug specifically,
+    # not just any AttributeError from a stub.
     folder = Folder(storage_id=None, path=PATH)
 
-    with pytest.raises(AttributeError):
+    with pytest.raises(AttributeError, match="_root_path"):
         folder.scan(number=0, count_only=True, providers=[fake_provider.machine_name])
 
     assert es_fake.calls == []
 
 
 def test_cursor_is_ignored(es_fake, es_page, fake_provider):
-    # Ledger quirk pinned as-is: the cursor argument is accepted but ignored.
+    # Ledger quirk pinned as-is (tests/pinned-bugs.md): the cursor argument
+    # is accepted but ignored.
     providers = [fake_provider.machine_name]
 
     es_fake.push(es_page([{}] * 3, total=3))

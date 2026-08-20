@@ -1,0 +1,2 @@
+# Golden fixtures are byte-pinned (AD-3): no EOL conversion, ever.
+tests/fixtures/*.json -text

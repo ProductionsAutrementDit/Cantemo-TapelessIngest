@@ -38,14 +38,25 @@ class QueryElasticFake:
     import query_elastic`), so this very instance — installed into the stub
     module before any plugin import — is the object `Folder.scan` calls.
 
-    FIFO response queue + `(first, number)` call log; the conftest autouse
-    reset fixture clears both after every test so unconsumed responses never
-    leak into a later test.
+    FIFO response queue + `(first, number)` call log + per-call
+    `(search_doc, doc_type)` log (so tests can pin the exact query document
+    scan sends); the conftest autouse reset fixture asserts the queue was
+    fully consumed and clears everything after every test so unconsumed
+    responses never leak into a later test.
+
+    `first`/`number` are deliberately required keyword arguments: Folder.scan
+    always passes both explicitly, so the fake must never paper over a caller
+    relying on defaults of the real query_elastic.
     """
 
     def __init__(self):
         self.queue = []
         self.calls = []
+        self.call_docs = []
+
+    @property
+    def last_search_doc(self):
+        return self.call_docs[-1][0] if self.call_docs else None
 
     def push(self, response):
         """Queue one raw search result dict to be returned by the next call."""
@@ -54,9 +65,11 @@ class QueryElasticFake:
     def reset(self):
         self.queue.clear()
         self.calls.clear()
+        self.call_docs.clear()
 
-    def __call__(self, search_doc, doc_type=None, first=0, number=25, **kwargs):
+    def __call__(self, search_doc, doc_type=None, *, first, number, **kwargs):
         self.calls.append((first, number))
+        self.call_docs.append((search_doc, doc_type))
         if not self.queue:
             raise AssertionError(
                 "query_elastic fake called with an empty response queue "
@@ -85,28 +98,38 @@ class VSFile:
         self._source = source
         self._replace_urls = replace_urls
 
+    def _get(self, key):
+        try:
+            return self._source[key]
+        except KeyError:
+            raise KeyError(
+                f"VSFile stub _source is missing key {key!r} "
+                f"(present: {sorted(self._source)})"
+            ) from None
+
     def getPath(self):
-        return self._source["path"]
+        return self._get("path")
 
     def getHash(self):
-        return self._source["hash"]
+        return self._get("hash")
 
     def getStorage(self):
-        return self._source["storage"]
+        return self._get("storage")
 
     def getId(self):
-        return self._source["id"]
+        return self._get("id")
 
     def getSize(self):
-        return self._source["size"]
+        return self._get("size")
 
     def getFileName(self):
-        return os.path.basename(self._source["path"])
+        return os.path.basename(self._get("path"))
 
     def __str__(self):
         # Deterministic rendering so error strings built from f"{file}" are
-        # exactly assertable in tests (prod's default repr embeds id()).
-        return self._source["path"]
+        # exactly assertable in tests (prod's default repr embeds id()) —
+        # see the caveat in tests/pinned-bugs.md.
+        return self._get("path")
 
 
 class StorageHelper:
@@ -252,15 +275,20 @@ def install():
         f"(portal.plugins.__path__ resolution depends on it), got {REPO_ROOT}"
     )
 
+    # Clobber check FIRST — even on a repeat call, a real distribution that
+    # appeared since the first install must be reported, never overwritten.
+    for root in _STUBBED_ROOTS:
+        existing = sys.modules.get(root)
+        if existing is not None and not getattr(existing, "__portal_stub__", False):
+            raise RuntimeError(
+                f"real {root!r} already imported; refusing to stub (AD-11: "
+                f"off-server tests must never mask a live Portal environment)"
+            )
+
     already = sys.modules.get("portal")
     if already is not None and getattr(already, "__portal_stub__", False):
         log.debug("portal_stub already installed; skipping")
         return
-
-    for root in _STUBBED_ROOTS:
-        existing = sys.modules.get(root)
-        if existing is not None and not getattr(existing, "__portal_stub__", False):
-            raise RuntimeError("real portal already imported; refusing to stub")
 
     for dotted, attrs in _MODULES.items():
         module = ModuleType(dotted)
@@ -275,17 +303,23 @@ def install():
     # Wire each stub module onto its parent package, so attribute access like
     # `pyxb.utils` after `import pyxb.utils` works exactly as for real packages.
     # Missing parents (a future _MODULES edit skipping one) are auto-created
-    # rather than KeyError-ing at install.
+    # along the FULL dotted chain rather than KeyError-ing at install.
+    def _ensure_module(dotted):
+        module = sys.modules.get(dotted)
+        if module is None:
+            module = ModuleType(dotted)
+            module.__portal_stub__ = True
+            module.__path__ = []
+            sys.modules[dotted] = module
+            if "." in dotted:
+                parent_name, _, child_name = dotted.rpartition(".")
+                setattr(_ensure_module(parent_name), child_name, module)
+        return module
+
     for dotted in _MODULES:
         if "." in dotted:
             parent_name, _, child_name = dotted.rpartition(".")
-            parent = sys.modules.get(parent_name)
-            if parent is None:
-                parent = ModuleType(parent_name)
-                parent.__portal_stub__ = True
-                parent.__path__ = []
-                sys.modules[parent_name] = parent
-            setattr(parent, child_name, sys.modules[dotted])
+            setattr(_ensure_module(parent_name), child_name, sys.modules[dotted])
 
     # The one real path: `portal.plugins.TapelessIngest` must resolve to this
     # repo (its directory is literally named TapelessIngest under the parent).

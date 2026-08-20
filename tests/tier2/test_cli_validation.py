@@ -1,14 +1,19 @@
 """Tier 2: fail-fast CLI validation via call_command on both commands.
 
-Every `pytest.raises(CommandError)` pins `match=` to the exact matrix
-message, so a validation regression that reaches a later stage (e.g. the
-user lookup) fails the test instead of passing on the wrong error —
-order-independent proof that the abort precedes any DB/config work.
+Order-independent via match= pinning: every `pytest.raises(CommandError)`
+pins `match=` to the exact matrix message, so a validation regression that
+reaches a later stage (e.g. the user lookup) fails the test instead of
+passing on the wrong error, regardless of test execution order or the
+session-scoped DB state left by earlier tests.
 """
 
+import importlib
 import re
+from datetime import datetime, timedelta
 
 import pytest
+from django.contrib.auth.models import User
+from django.core.cache import cache
 from django.core.management import call_command
 from django.core.management.base import CommandError
 
@@ -63,8 +68,103 @@ def test_unknown_user_id_aborts(command, user_id, migrated_db):
 
 
 @pytest.mark.parametrize("command", COMMANDS)
+def test_future_from_aborts(command):
+    # Command-boundary check of the future-date rejection; no migrated_db —
+    # a valid abort never reaches the DB.
+    with pytest.raises(CommandError, match=re.escape("--from date is in the future")):
+        call_command(command, *BASE_ARGS, "--userId", "1", "--from", "2999-01-01")
+
+
+@pytest.mark.parametrize("command", COMMANDS)
 def test_missing_required_userid_raises_commanderror(command):
     # call_command surfaces argparse's required-argument failure as a
     # CommandError (Django CommandParser), not SystemExit.
     with pytest.raises(CommandError, match=re.escape("--userId")):
         call_command(command, *BASE_ARGS)
+
+
+class _CapturingLogger:
+    """Stands in for the module's CustomLogger: no Slack WebClient, no I/O."""
+
+    last = None
+
+    def __init__(self):
+        self.messages = []
+        _CapturingLogger.last = self
+
+    def log(self, message):
+        self.messages.append(message)
+
+    def send_messages_to_slack(self):
+        pass
+
+
+class _AbsentConfigParser:
+    """Stands in for ConfigParser: /etc/cantemo/portal/portal.conf does not
+    exist on dev machines, so the real cp.get would raise NoSectionError."""
+
+    def read(self, path):
+        return []
+
+    def get(self, section, option):
+        return "portal-conf-absent-stub-token"
+
+
+@pytest.mark.parametrize("command", COMMANDS)
+def test_since_window_reaches_scan_only_filter(command, migrated_db, monkeypatch):
+    """End-to-end wiring: the computed window must reach the scan's `only`.
+
+    Guards the aliasing contract — `only = only + date_window` instead of
+    `only += date_window` would silently disable the cron's --since filter
+    while every pure-helper test stayed green. The command module's OWN
+    `scan_tapeless_dir`, `ConfigParser`, and `CustomLogger` attributes are
+    minimally monkeypatched (our module, sanctioned — not portal mocking;
+    story 1.5 makes absent config graceful, at which point the config
+    workaround can shrink), and the storage cache is pre-seeded so
+    Folder.storage never calls the no-op stub StorageHelper.
+    """
+    module = importlib.import_module(
+        f"portal.plugins.TapelessIngest.management.commands.{command}"
+    )
+    captured = {}
+
+    def fake_scan(parent_folder, **kwargs):
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(module, "scan_tapeless_dir", fake_scan)
+    monkeypatch.setattr(module, "ConfigParser", _AbsentConfigParser)
+    monkeypatch.setattr(module, "CustomLogger", _CapturingLogger)
+    cache.set("storage:VX-41", "VX-41", 300)
+
+    user = User.objects.create(pk=4242, username=f"story14-wiring-{command}")
+    now_before = datetime.now()
+    try:
+        call_command(command, *BASE_ARGS, "--userId", "4242", "--since", "1d")
+    finally:
+        user.delete()  # keep the auth table empty for the unknown-user tests
+        cache.delete("storage:VX-41")
+    now_after = datetime.now()
+
+    # Two candidate windows tolerate a midnight rollover mid-test.
+    candidates = [
+        [(now - timedelta(days=1)).strftime("%Y%m%d"), now.strftime("%Y%m%d")]
+        for now in (now_before, now_after)
+    ]
+    # args.only starts [] and handle() appends the window in place, so the
+    # very list object the scan received must carry the window values.
+    assert captured["only"] in candidates
+
+    # Exactly one range line, no per-day lines, no legacy "Scanning from" line.
+    window_lines = [
+        m
+        for m in _CapturingLogger.last.messages
+        if m.startswith("Scanning folders from ")
+    ]
+    assert window_lines == [
+        f"Scanning folders from {captured['only'][0]} to {captured['only'][-1]} "
+        f"(2 day folders)"
+    ]
+    assert not any(
+        m.startswith("Scanning from ") for m in _CapturingLogger.last.messages
+    )

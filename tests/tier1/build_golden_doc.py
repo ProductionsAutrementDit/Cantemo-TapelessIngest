@@ -15,6 +15,7 @@ requires human sign-off.
 import json
 import os
 import sys
+import warnings
 from pathlib import Path
 
 # Run-by-path has no import context: repo root first on sys.path so
@@ -25,6 +26,14 @@ from tests.portal_stub import install  # noqa: E402
 
 install()
 
+_prior_settings = os.environ.get("DJANGO_SETTINGS_MODULE")
+if _prior_settings not in (None, "tests.tier2_settings"):
+    warnings.warn(
+        f"DJANGO_SETTINGS_MODULE was already set to {_prior_settings!r}; "
+        f"overriding with 'tests.tier2_settings' for the golden recording",
+        RuntimeWarning,
+        stacklevel=1,
+    )
 os.environ["DJANGO_SETTINGS_MODULE"] = "tests.tier2_settings"
 
 import django  # noqa: E402

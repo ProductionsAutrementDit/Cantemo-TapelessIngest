@@ -53,6 +53,27 @@ def test_parse_since_rejects_malformed(value):
         parse_since(value, NOW)
 
 
+@pytest.mark.parametrize(
+    "value", ["999999999d", "9999999999w", "99999999999m", "3000y"]
+)
+def test_parse_since_rejects_out_of_range(value):
+    # Extreme but well-formed periods overflow datetime arithmetic
+    # (OverflowError from timedelta, ValueError from relativedelta) —
+    # both must surface as a CommandError, never a raw traceback.
+    with pytest.raises(
+        CommandError, match=re.escape(f"--since '{value}' out of range")
+    ):
+        parse_since(value, NOW)
+
+
+def test_parse_since_zero_days_pinned():
+    # Accepted, documented behavior: --since 0d yields a window of just
+    # today's folder.
+    start = parse_since("0d", NOW)
+    assert start == NOW
+    assert compute_date_window(start, NOW) == ["20260820"]
+
+
 def test_parse_from_valid():
     assert parse_from("2026-08-01") == datetime(2026, 8, 1)
 

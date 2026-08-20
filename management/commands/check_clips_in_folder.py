@@ -22,7 +22,7 @@ Ingest found tapeless clips in all subdirectories.
 """
 epilog = """
 Example: Ingest all tapeless clips in folder 2022, in subfolders starting with AH_, with admin user:
-./scan_tapeless_dir.py --storage VX-41 --path 2022 --userId 1 --startWith AH_ --dryrun
+./check_clips_in_folder.py --storage VX-41 --path 2022 --userId 1 --startWith AH_ --dryrun
 """
 import os
 import re
@@ -93,13 +93,16 @@ def parse_since(value, now):
         )
     number = int(match.group(1))
     unit = match.group(2)
-    if unit == "d":
-        return now - timedelta(days=number)
-    if unit == "w":
-        return now - timedelta(weeks=number)
-    if unit == "m":
-        return now - relativedelta(months=number)
-    return now - relativedelta(years=number)
+    try:
+        if unit == "d":
+            return now - timedelta(days=number)
+        if unit == "w":
+            return now - timedelta(weeks=number)
+        if unit == "m":
+            return now - relativedelta(months=number)
+        return now - relativedelta(years=number)
+    except (OverflowError, ValueError) as e:
+        raise CommandError(f"--since '{value}' out of range") from e
 
 
 def parse_from(value):
@@ -107,11 +110,16 @@ def parse_from(value):
     try:
         return datetime.strptime(value, "%Y-%m-%d")
     except ValueError:
-        raise CommandError(f"Invalid --from '{value}': expected YYYY-MM-DD")
+        raise CommandError(f"Invalid --from '{value}': expected YYYY-MM-DD") from None
 
 
 def compute_date_window(from_date, now):
-    """Return one YYYYMMDD value per day from from_date to now, inclusive."""
+    """Return one YYYYMMDD value per day from from_date to now, inclusive.
+
+    The future-start error message is --from-specific by design: only
+    --from can produce a future window start today (--since subtracts a
+    non-negative period from now).
+    """
     if from_date > now:
         raise CommandError("--from date is in the future")
     delta = now - from_date
@@ -246,7 +254,7 @@ class Command(BaseCommand):
             "--startWith",
             nargs="+",
             default=["AH_"],
-            help="Only scan folder which begin with this value "
+            help="Only scan folders which begin with one of these values "
             "(applies to top-level folders only)",
         )
         parser.add_argument(
@@ -272,14 +280,16 @@ class Command(BaseCommand):
             "--from",
             dest="from_date",
             default=None,
-            help="Only scan folders from this date, format YYYY-MM-DD",
+            help="Only scan folders from this date, format YYYY-MM-DD; "
+            "future dates are rejected; overrides --since when both are given",
         )
         # Only scan folders since this period
         parser.add_argument(
             "--since",
             dest="since",
             default=None,
-            help="Only scan folders since this period, format 1d, 2w, 3m, 4y",
+            help="Only scan folders since this period: <number><unit>, "
+            "units d/w/m/y (calendar-aware months/years), e.g. 1d, 2w, 3m, 4y",
         )
         parser.add_argument("--dryrun", action="store_true")
         parser.add_argument("--replace", action="store_true")
@@ -306,7 +316,7 @@ class Command(BaseCommand):
         try:
             user = User.objects.get(pk=args.userId)
         except (User.DoesNotExist, ValueError):
-            raise CommandError(f"Unknown user id '{args.userId}'")
+            raise CommandError(f"Unknown user id '{args.userId}'") from None
 
         # Side effects relocated from module level (approved deviation):
         # config read, Slack token, and logger construction happen at

@@ -66,6 +66,9 @@ Flags, defaults, output, and failure modes are identical to the old scripts
 and Django imports every management command module on *any* `manage.py`
 invocation for command discovery — so `slack_sdk` must be present in Portal's
 Python. It is today: the nightly cron scan uses it.
+The command modules also import `python-dateutil` at module level (for
+calendar-aware `--since` months/years); it is present in prod Portal's Python
+(2.9.0.post0, verified 2026-08-20).
 
 ### Cron switch
 

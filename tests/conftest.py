@@ -77,7 +77,9 @@ class FakeProvider:
     Real providers are unusable off-server (`file` shells out to ffprobe, the
     others parse card structures). Like real providers, getMetadatasFromFile
     mutates the shared `metadatas` dict in place and returns it with the
-    context; the umid is derived deterministically from the file name stem.
+    context; the umid is derived deterministically from the full storage path
+    (extension stripped) so same-named files in different directories never
+    collide.
     """
 
     name = "Fake Test Provider"
@@ -94,15 +96,25 @@ class FakeProvider:
 
     def getMetadatasFromFile(self, media_file, metadatas, context):
         metadatas["provider"] = self.machine_name
-        metadatas["umid"] = os.path.splitext(media_file.getFileName())[0]
+        metadatas["umid"] = os.path.splitext(media_file.getPath())[0]
         return metadatas, context
 
 
 @pytest.fixture(autouse=True)
 def _reset_query_elastic_fake():
-    """Autouse: unconsumed queued responses must never leak into a later test."""
+    """Autouse: unconsumed queued responses must never leak into a later test.
+
+    Over-pushed pages are a test bug, not noise — fail loudly instead of
+    silently discarding them.
+    """
     yield
+    leftover = list(query_elastic_fake.queue)
     query_elastic_fake.reset()
+    assert not leftover, (
+        f"query_elastic fake queue not fully consumed at teardown: "
+        f"{len(leftover)} unused page(s) — the test pushed more responses "
+        f"than scan requested"
+    )
 
 
 @pytest.fixture

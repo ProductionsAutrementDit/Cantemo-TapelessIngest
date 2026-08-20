@@ -8,7 +8,6 @@ human sign-off (a CPython upgrade may legitimately reorder the should-lists).
 """
 
 import os
-import re
 import subprocess
 import sys
 from pathlib import Path
@@ -27,6 +26,7 @@ def test_golden_doc_bytes_match_fixture():
         [sys.executable, str(RECORDER)],
         env=env,
         capture_output=True,
+        timeout=60,
     )
     assert result.returncode == 0, (
         f"golden recorder failed (rc={result.returncode}):\n"
@@ -43,4 +43,6 @@ def test_fixture_contains_golden_inputs():
     """Self-check against a mis-bound recorder producing deterministic garbage."""
     text = FIXTURE.read_text()
     assert f'"storage": "{GOLDEN_STORAGE_ID}"' in text
-    assert re.escape(GOLDEN_PATH) in text
+    # re.escape leaves this path unchanged (no regex-special characters), so
+    # the plain string is what the parent regexps must contain.
+    assert GOLDEN_PATH in text
