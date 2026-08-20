@@ -74,6 +74,9 @@ class CustomLogger:
         self.messages.append(message)
 
     def send_messages_to_slack(self):
+        """Send the run report to Slack. Designed for a single end-of-run
+        call: self.messages is not cleared, so a second call would resend
+        the whole report."""
         if self.slack_client is None:
             self.logger.info(
                 "Slack notification skipped: no Slack client (no [slack] "
@@ -102,6 +105,11 @@ class CustomLogger:
                     current = piece
         if current:
             chunks.append(current)
+        if not chunks:
+            # Non-empty message list packed to nothing (all-empty strings):
+            # every no-send path must leave a log line.
+            self.logger.info("Slack notification skipped: nothing to send")
+            return
         # One boundary around the whole loop, abort on first failure: after
         # a network/auth error the remaining sends would fail identically,
         # and a notification failure must never propagate into the scan run.
@@ -117,6 +125,8 @@ class CustomLogger:
                 f"remaining chunks abandoned",
                 exc_info=True,
             )
+            return
+        self.logger.info(f"Slack notification sent ({len(chunks)} chunks)")
 
 
 logger = None
@@ -378,7 +388,9 @@ class Command(BaseCommand):
         # command start instead of import time.
         cp = ConfigParser()
         cp.read("/etc/cantemo/portal/portal.conf")
-        SLACK_ACCESS_TOKEN = cp.get("slack", "ACCESS_TOKEN", fallback=None)
+        # raw=True: a literal % in the token must not trigger configparser
+        # interpolation (InterpolationSyntaxError escapes the fallback).
+        SLACK_ACCESS_TOKEN = cp.get("slack", "ACCESS_TOKEN", raw=True, fallback=None)
         logger = CustomLogger()
 
         storage = args.storage

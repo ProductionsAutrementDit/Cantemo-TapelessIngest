@@ -10,7 +10,6 @@ attributes of our own command modules are stubbed — never Portal, never
 slack_sdk internals.
 """
 
-import importlib
 import inspect
 import logging
 
@@ -71,7 +70,8 @@ def error_records(caplog):
 # --- chunking ---------------------------------------------------------------
 
 
-def test_short_report_sent_as_single_message(module, custom_logger):
+def test_short_report_sent_as_single_message(module, custom_logger, caplog):
+    caplog.set_level(logging.INFO, logger=LOGGER_NAME)
     client = RecordingClient()
     custom_logger.slack_client = client
     for message in ["first line", "second line", "third line"]:
@@ -82,6 +82,13 @@ def test_short_report_sent_as_single_message(module, custom_logger):
     assert client.calls == [
         {"channel": CHANNEL, "text": "first line\nsecond line\nthird line"}
     ]
+    # Positive confirmation for cron observability: one success INFO line.
+    successes = [
+        r
+        for r in caplog.records
+        if r.getMessage() == "Slack notification sent (1 chunks)"
+    ]
+    assert len(successes) == 1
 
 
 def test_long_report_chunked_in_order_and_complete(module, custom_logger):
@@ -201,6 +208,26 @@ def test_absent_config_skips_send_without_error(module, custom_logger, caplog):
         r
         for r in caplog.records
         if r.levelno == logging.INFO and "skipped" in r.getMessage()
+    ]
+    assert len(skips) == 1
+
+
+def test_all_empty_messages_skip_is_logged(module, custom_logger, caplog):
+    # Non-empty list that packs to zero chunks (all-empty strings): no call,
+    # no error, but the no-send path still leaves a log line.
+    caplog.set_level(logging.INFO, logger=LOGGER_NAME)
+    client = RecordingClient()
+    custom_logger.slack_client = client
+    custom_logger.messages = ["", ""]
+
+    assert custom_logger.send_messages_to_slack() is None
+
+    assert client.calls == []
+    assert not error_records(caplog)
+    skips = [
+        r
+        for r in caplog.records
+        if r.getMessage() == "Slack notification skipped: nothing to send"
     ]
     assert len(skips) == 1
 
