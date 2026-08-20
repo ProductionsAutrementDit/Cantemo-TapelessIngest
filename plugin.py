@@ -11,9 +11,7 @@ from portal.pluginbase.core import Plugin, implements
 from portal.generic.plugin_interfaces import (
     IPluginURL,
     IPluginBlock,
-    IAppRegister,
-    IContextProcessor,
-    ITranscoderPlugin,
+    IAppRegister
 )
 
 log = logging.getLogger(__name__)
@@ -78,7 +76,7 @@ class TapelessIngestItemJSPlugin(Plugin):
     implements(IPluginBlock)
 
     def __init__(self):
-        self.name = "MediaViewInLineJS"
+        self.name = "header_css_js"
         self.plugin_guid = "36341c2d-4a39-45f7-b4a1-9748e0ff186f"
 
     def return_string(self, tagname, *args):    
@@ -87,31 +85,8 @@ class TapelessIngestItemJSPlugin(Plugin):
             "template": "TapelessIngest/ti_viewpanel_js.html",
             "context": {},
         }
-    
-    
+
 ti_block_js = TapelessIngestItemJSPlugin()
-
-class TapelessIngestItemPanelPlugin(Plugin):
-    implements(IPluginBlock)
-
-    def __init__(self):
-        self.name = "ItemTechMetadataPlugin"
-        self.plugin_guid = "98182183-7950-4b27-a442-eba65221d854"
-
-    def return_string(self, tagname, *args):
-        from portal.plugins.TapelessIngest.models.clip import Clip
-
-        _context = args[1]
-        cur_item = _context["item"]
-        clips = Clip.objects.filter(item_id=cur_item.getId())
-        return {
-            "guid": self.plugin_guid,
-            "template": "TapelessIngest/ti_viewpanel.html",
-            "context": {"item_id": cur_item.getId(), "clips": clips},
-        }
-
-
-ti_block = TapelessIngestItemPanelPlugin()
 
 
 # Register the app

@@ -3,10 +3,12 @@ import traceback
 import uuid
 import os
 import re
+from typing import Optional, Dict, List, Any
 from django.db import models
 from django.utils import timezone
 from django.conf import settings
-from elasticsearch_dsl import Search, Q
+from django.core.cache import cache
+from opensearch_dsl import Search, Q
 
 from VidiRest.objects.storage import VSFile
 
@@ -50,7 +52,16 @@ class Folder(models.Model):
         unique_together = ["path", "storage_id"]
 
     @classmethod
-    def get_or_new(cls, defaults=None, **kwargs):
+    def get_or_new(cls, defaults: Optional[Dict[str, Any]] = None, **kwargs: Any) -> tuple['Folder', bool]:
+        """Get existing folder or create a new one without saving to database.
+
+        Args:
+            defaults: Optional dictionary of default values for new folder
+            **kwargs: Query parameters to find existing folder
+
+        Returns:
+            Tuple of (folder instance, is_new flag) where is_new is True if folder was created
+        """
         try:
             return cls.objects.get(**kwargs), False
         except cls.DoesNotExist:
@@ -60,25 +71,51 @@ class Folder(models.Model):
             # Try to create an object using passed params.
             return cls(**params), True
 
-    def get_storage_helper(self):
+    def get_storage_helper(self) -> Any:
+        """Get or create StorageHelper instance for this folder.
+
+        Returns:
+            StorageHelper instance for accessing Vidispine storage API
+        """
         if not hasattr(self, "_sth"):
             self._sth = StorageHelper()
         return self._sth
 
     @property
-    def storage(self):
+    def storage(self) -> Optional[Any]:
+        """Get Vidispine storage object for this folder with Redis caching.
+
+        Returns:
+            Storage object or None if storage_id is not set or not found
+        """
         if not hasattr(self, "_storage"):
             if self.storage_id is None:
                 return None
+
+            # Try to get from cache first
+            cache_key = f"storage:{self.storage_id}"
+            cached_storage = cache.get(cache_key)
+            if cached_storage is not None:
+                self._storage = cached_storage
+                return self._storage
+
+            # If not in cache, fetch from API
             _sth = self.get_storage_helper()
             try:
                 self._storage = _sth.getStorage(self.storage_id)
+                # Cache for 5 minutes
+                cache.set(cache_key, self._storage, 300)
             except NotFoundError:
                 return None
         return self._storage
 
     @storage.setter
-    def storage(self, storage):
+    def storage(self, storage: Any) -> None:
+        """Set storage object and update storage_id.
+
+        Args:
+            storage: Vidispine storage object
+        """
         self._storage = storage
         self.storage_id = storage.getId()
 
@@ -98,12 +135,31 @@ class Folder(models.Model):
             return os.path.join(self.root_path, self.path)
         return False
 
-    def getFile(self, path):
+    def getFile(self, path: str) -> Any:
+        """Get a file from storage by relative path.
+
+        Args:
+            path: Relative path to the file within the folder
+
+        Returns:
+            VSFile object for the requested file
+        """
         subpath = os.path.join(self.path, path)
         vsfile = self._sth.getFileByPath(self.storage_id, path=subpath)
         return vsfile
 
-    def getFiles(self, path, number=0, first=0, user=None):
+    def getFiles(self, path: str, number: int = 0, first: int = 0, user: Optional[Any] = None) -> List[Dict[str, Any]]:
+        """Get all files in a folder path with pagination.
+
+        Args:
+            path: Relative path within the folder
+            number: Maximum number of files to return (0 for all)
+            first: Starting index for pagination
+            user: User context for API calls
+
+        Returns:
+            List of file dictionaries
+        """
         subpath = os.path.join(self.path, path)
         files = []
         page = 1
@@ -130,12 +186,28 @@ class Folder(models.Model):
 
     @property
     def collection(self):
+        """Get Vidispine collection object for this folder with Redis caching.
+
+        Returns:
+            Collection object or None if collection_id is not set or not found
+        """
         if not hasattr(self, "_collection"):
             if self.collection_id is None:
                 return None
+
+            # Try to get from cache first
+            cache_key = f"collection:{self.collection_id}"
+            cached_collection = cache.get(cache_key)
+            if cached_collection is not None:
+                self._collection = cached_collection
+                return self._collection
+
+            # If not in cache, fetch from API
             ch = CollectionHelper()
             try:
                 self._collection = ch.getCollection(self.collection_id)
+                # Cache for 3 minutes
+                cache.set(cache_key, self._collection, 180)
             except NotFoundError:
                 return None
         return self._collection
@@ -168,8 +240,8 @@ class Folder(models.Model):
             providers_names.append(provider_object.machine_name)
         self.provider_names = ",".join(providers_names)
 
-    def getCollection(self, user):
-        return TapelessIngestHelper.get_collection_from_path(self.path, user)
+    def getCollection(self, user, dryrun=False):
+        return TapelessIngestHelper.get_collection_from_path(self.path, user, dryrun)
 
     def get_helper(self):
         if hasattr(self, "_tih"):
@@ -322,18 +394,21 @@ class Folder(models.Model):
                     first += result_number
                 context = {"folder": self, "clips": []}
                 if not count_only:
+                    # Note: File existence checks are performed per-file for data integrity.
+                    # For large batches, consider trusting Elasticsearch index or
+                    # pre-scanning with os.scandir() for better performance.
                     for result in search_result["hits"]["hits"]:
                         try:
                             file = VSFile(
                                 result["_source"], settings.VIDISPINE_REPLACE_URLS
                             )
-                            # Does file exists?
+                            # Validate file exists on filesystem
                             file_absolute_path = os.path.join(
                                 self.root_path, file.getPath()
                             )
-                            if os.path.exists(file_absolute_path) is False:
+                            if not os.path.exists(file_absolute_path):
                                 raise TapelessIngestException(
-                                    f"File {file} does not exists ({file_absolute_path})"
+                                    f"File {file} does not exist ({file_absolute_path})"
                                 )
                             (
                                 clip,

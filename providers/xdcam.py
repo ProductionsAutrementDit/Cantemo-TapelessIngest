@@ -29,7 +29,10 @@ class Provider(BaseProvider):
         return [".mxf", ".mp4"]
 
     def getSubPaths(self):
-        return ["((PRIVATE/)?(M4ROOT/|XDROOT/))?(Clip|CLIP)"]
+        return [
+            "((PRIVATE/)?(M4ROOT/|XDROOT/))?(Clip|CLIP)",
+            "(BPAV/)?(CLPR/)?128_[0-9]{4}(L|R)_01",
+        ]
 
     def getMediaProMetadatas(self, metadatas, mediapro_xml):
         metadatas["extension"] = mediapro_xml.getValueFromPath(

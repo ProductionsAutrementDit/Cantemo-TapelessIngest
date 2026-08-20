@@ -3,7 +3,6 @@ import logging
 from django.db import models
 from portal.vidispine.iitem import ItemHelper
 
-from django.utils.translation import ugettext_lazy as _
 
 log = logging.getLogger(__name__)
 

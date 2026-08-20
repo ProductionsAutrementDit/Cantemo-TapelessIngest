@@ -1,8 +1,7 @@
 """
 
 """
-
-from django.conf.urls import url
+from django.urls import re_path
 
 from rest_framework import routers
 
@@ -16,38 +15,36 @@ from . import views
 router = routers.SimpleRouter()
 
 urlpatterns = [
-    url(r"^api/browser/clips$", views.ClipsInPathsView.as_view()),
-    url(r"^api/browser/clips/jobs$", views.ClipsJobsProgress.as_view()),
-    url(
+    re_path(r"^api/browser/clips$", views.ClipsInPathsView.as_view()),
+    re_path(r"^api/browser/clips/jobs$", views.ClipsJobsProgress.as_view()),
+    re_path(r"^api/item/(?P<item_id>.*)/clips$", views.ClipsByItemView.as_view(), name="clips_by_item"),
+    re_path(
         r"^file/(?P<file_id>.*)/thumbnail$",
         views.getFileThumbnail,
         kwargs={},
         name="file_thumbnail",
     ),
-    url(
+    re_path(
         r"^notification/file/created$", views.FileNotificationView.as_view()
     ),  # Vidispine notification VX-591
-    url(
+    re_path(
         r"^admin/$",
         (views.SettingsView.as_view()),
         name="settings",
     ),
-    url(
+    re_path(
         r"^clips/(?P<clip_id>.*)/thumbnail$",
         views.getClipThumbnail,
-        kwargs={},
         name="clip_thumbnail",
     ),
-    url(
+    re_path(
         r"^clips/(?P<clip_id>.*)/proxy$",
         views.getClipProxy,
-        kwargs={},
         name="clip_proxy",
     ),
-    url(
+    re_path(
         r"^clips/(?P<clip_id>.*)/preview$",
         views.clipPreview,
-        kwargs={"template": "TapelessIngest/proxy_player.html"},
         name="clip_preview",
     ),
 ]

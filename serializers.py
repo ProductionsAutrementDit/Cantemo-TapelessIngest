@@ -1,10 +1,13 @@
 import os
+import logging
 
 from django.core.exceptions import MultipleObjectsReturned, ObjectDoesNotExist
 
 from rest_framework import serializers
 from portal.plugins.TapelessIngest.models.clip import Clip, SpannedClips, ClipMetadata
 from portal.plugins.TapelessIngest.models.folder import Folder
+
+log = logging.getLogger(__name__)
 
 
 class ClipMetadataSerializer(serializers.ModelSerializer):
@@ -121,7 +124,7 @@ class ClipSerializer(serializers.ModelSerializer):
         )
 
     def is_valid(self, raise_exception=False):
-        print("Call clip serializer")
+        log.debug("Call clip serializer")
         # hack to add a "get_or_create" feature to serializer
         if hasattr(self, "initial_data"):
             obj_id = self.initial_data.get("umid")

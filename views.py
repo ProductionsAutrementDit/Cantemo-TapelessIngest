@@ -6,23 +6,16 @@ From here you can follow the Cantemo Portal Developers documentation for specifi
 framework code refer to the Django developers documentation.
 
 """
-import logging, re
+import logging
 import os
-from urllib.parse import quote
-
-from django.shortcuts import redirect
-from django.urls import reverse, reverse_lazy
+from django.urls import reverse_lazy
 from django.core.exceptions import ObjectDoesNotExist
 from django.http import (
-    Http404,
     HttpResponse,
-    HttpResponseNotAllowed,
     HttpResponseRedirect,
     HttpResponseNotFound,
 )
 from django.forms import modelformset_factory
-from django.contrib.auth.decorators import login_required
-from django.contrib import messages
 
 from rest_framework import permissions
 from rest_framework import status
@@ -34,15 +27,6 @@ from rest_framework.response import Response
 from portal.generic.baseviews import CView, ClassView
 from portal.generic.decorators import isAdminPermission
 from portal.vidispine.iexception import NotFoundError
-from portal.vidispine.iitem import ItemHelper, IngestHelper
-from portal.vidispine.istorage import StorageHelper, DEFAULT_STORAGE_PRIORITY
-from portal.vidispine.iuser import UserHelper
-from portal.vidispine.igroup import GroupHelper
-from portal.vidispine.isearch import getMetadataFromRequest
-from portal.vidispine.igeneral import performVSAPICall
-from portal.vidispine.utils.metadata import get_writable_metadata
-
-from VidiRest.helpers.vidispine import createMetadataDocumentFromDict
 
 from portal.plugins.TapelessIngest.helpers import TapelessIngestPath
 from portal.plugins.TapelessIngest.models.clip import Clip
@@ -334,6 +318,23 @@ class ClipsJobsProgress(APIView):
         return Response(data=datas)
 
 
+class ClipsByItemView(APIView):
+    """API endpoint to get clips associated with a specific item"""
+    renderer_classes = (JSONRenderer,)
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, item_id):
+        try:
+            clips = Clip.objects.filter(item_id=item_id)
+            serializer = ClipSerializer(clips, many=True)
+            return Response(serializer.data, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response(
+                {"error": str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+
 class getFileThumbnail(ClassView):
     def __call__(self):
         if "file_id" in self.kwargs:
@@ -428,6 +429,9 @@ class getClipProxy(ClassView):
 
 
 class clipPreview(ClassView):
+
+    template_name = "TapelessIngest/proxy_player.html"
+
     def __call__(self):
         ctx = {}
         if "clip_id" in self.kwargs:

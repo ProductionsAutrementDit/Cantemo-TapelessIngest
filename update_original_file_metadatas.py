@@ -9,8 +9,11 @@ from VidiRest.helpers.vidispine import createMetadataDocumentFromDict
 import subprocess as sp
 import json
 import sys
+import logging
 
 import os
+
+log = logging.getLogger(__name__)
 
 
 NEW_GROUP = 'Film'
@@ -61,7 +64,7 @@ def update_item_orginial_metadatas(clipId):
 
     _ith.setItemMetadata(clipId, metadata_document, skipForbidden=True, return_format='xml')
 
-    print(("Item %s has been updated\r" % clipId))
+    log.info("Item %s has been updated", clipId)
 
 def get_fileinfo_from_clip(clipId):
     nsdchat_bin = '/usr/local/aw/bin/nsdchat'
@@ -164,8 +167,8 @@ def apply_to_saved_search(search_id):
             item_id = hit["_id"]
             try:
                 update_item_orginial_metadatas(item_id)
-            except:
-                print(("Unexpected error for %s: %s" % (item_id, sys.exc_info()[0])))
+            except Exception as e:
+                log.error("Unexpected error for %s: %s", item_id, e, exc_info=True)
         if len(elastic_results['hits']['hits']) < number:
             count = elastic_results['hits']['total']
             break
@@ -200,8 +203,8 @@ def apply_to_search_history(search_id, user):
             item_id = hit["id"]
             try:
                 update_item_orginial_metadatas(item_id)
-            except:
-                print(("Unexpected error for %s: %s" % (item_id, sys.exc_info()[0])))
+            except Exception as e:
+                log.error("Unexpected error for %s: %s", item_id, e, exc_info=True)
         if results.data['has_next'] == False:
             break
         page = page + 1

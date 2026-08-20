@@ -18,15 +18,6 @@ from portal.plugins.TapelessIngest.utilities import build_nested
 
 log = logging.getLogger(__name__)
 
-SERVER_CONNECTION = {
-    "ps_protocol": "http",
-    "ps_address": "portal.studiopad.fr",
-    "ps_port": "8080",
-    "ps_http_user": "admin",
-    "ps_http_pwd": "13netpad$",
-}
-
-
 class Provider:
     def __init__(self, folder=None):
         self.name = "Provider Name"
@@ -58,14 +49,23 @@ class Provider:
                     status = 4
                 else:
                     status = 3
-            except Exception as x:
+            except NotFoundError:
+                log.warning("Item %s not found, resetting item_id for clip %s", clip.item_id, clip.umid)
+                clip.item_id = ""
+            except VSAPIError as e:
+                log.error("Vidispine API error checking item %s: %s", clip.item_id, e)
+                clip.item_id = ""
+            except Exception as e:
+                log.error("Unexpected error checking clip status for %s: %s", clip.umid, e, exc_info=True)
                 clip.item_id = ""
 
         if clip.item_id in [None, ""]:
             if clip.file_id not in [None, ""]:
                 status = 2
             else:
-                if clip.output_file not in [None, ""] and os.path.isfile(clip.output_file):
+                if clip.output_file not in [None, ""] and os.path.isfile(
+                    clip.output_file
+                ):
                     status = 1
                 else:
                     status = 0
@@ -100,7 +100,9 @@ class Provider:
 
         for clip_metadata_key, clip_metadata_value in clip_metadatas.items():
             # Get metadata mappings
-            metadatamappings = MetadataMapping.objects.filter(metadata_provider=clip_metadata_key)
+            metadatamappings = MetadataMapping.objects.filter(
+                metadata_provider=clip_metadata_key
+            )
             for metadatamapping in metadatamappings:
                 metadata_dict[metadatamapping.metadata_portal] = clip_metadata_value
 
@@ -109,44 +111,16 @@ class Provider:
     def mapMetadatas(self, clip_metadatas, values={}):
         for clip_metadata in clip_metadatas:
             # Get metadata mappings
-            metadatamapping = MetadataMapping.objects.filter(metadata_provider=clip_metadata.name)
+            metadatamapping = MetadataMapping.objects.filter(
+                metadata_provider=clip_metadata.name
+            )
             if len(metadatamapping) > 0:
-                log.debug("Field %s will have value: %s" % (metadatamapping[0].metadata_portal, clip_metadata.value))
+                log.debug(
+                    "Field %s will have value: %s"
+                    % (metadatamapping[0].metadata_portal, clip_metadata.value)
+                )
                 values[metadatamapping[0].metadata_portal] = clip_metadata.value
         return values
-
-    def importClipToPlaceholder(self, clip):
-        _ith = ItemHelper()
-        _igh = IngestHelper()
-        item = _ith.getItem(clip.item_id)
-
-        file_uri = None
-
-        if item.isPlaceholder():
-            if clip.file_id is None:
-                log.info("Attempting importation of %s (placehloder=%s)" % (clip.output_file, clip.item_id))
-                file_uri = "file://" + clip.output_file
-            else:
-                log.info("Attempting importation of %s (placehloder=%s)" % (clip.file_id, clip.item_id))
-            try:
-                _res = _igh.importFileToPlaceholder(
-                    clip.item_id,
-                    uri=file_uri,
-                    file_id=clip.file_id,
-                    tags="lowres",
-                )
-                log.info("Import to placeholder job started")
-                clip.status = 4
-            except NotFoundError as e:
-                log.info("Import to Placeholder failed: %s" % ("Not found"))
-            except VSAPIError as e:
-                log.info("Import to Placeholder failed: %s" % (e.reason))
-
-        else:
-            log.info("Import to placeholder: file already attached")
-            clip.status = 4
-
-        return clip
 
     def getSpannedClips(self, clip):
         return False

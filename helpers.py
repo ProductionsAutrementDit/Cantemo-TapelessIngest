@@ -7,33 +7,30 @@ Ingest helpers for the tapeless clips.
 
 .. Copyright 2020 PAD
 """
+
 import os
 import re
 import logging
 import urllib.parse
 
-from django.conf import settings
-from django.core.cache import cache
+from django.core.cache import cache  # type: ignore
 
-from VidiRest.itemapi import ItemAPI
+from VidiRest.itemapi import ItemAPI  # type: ignore
 
-from portal.api import client
-from portal.vidispine.iitem import ItemHelper, IngestHelper
-from portal.vidispine.icollection import CollectionHelper
-from portal.vidispine.istorage import StorageHelper
-from portal.vidispine import signals
-from RestAPIBase.utility import RestAPIBaseComError
+from portal.api import client  # type: ignore
+from portal.vidispine.iitem import IngestHelper  # type: ignore
+from portal.vidispine.icollection import CollectionHelper  # type: ignore
+from portal.vidispine.istorage import StorageHelper  # type: ignore
 
-from portal.items.cache import invalidate_item_cache
-from portal.plugins.TapelessIngest.models.settings import Settings
+from portal.plugins.TapelessIngest.models.settings import Settings  # type: ignore
 
 log = logging.getLogger(__name__)
 PROVIDERS_LIST = [
-    "red",
     "panasonicP2",
     "xdcam",
     "hdslr",
     "zoom",
+    "red",
     "avchd",
     "atomos",
     "file",
@@ -105,7 +102,7 @@ class TapelessIngestHelper(IngestHelper):
             self.itemapi = TapelessIngestItemAPI(self._vsapi)
 
     @staticmethod
-    def get_collection_from_path(path, user):
+    def get_collection_from_path(path, user, dryrun=False):
         settings = Settings.objects.get(pk=1)
         path_items = path.split(os.sep)
         ignore_list = settings.collections_ignore_folder
@@ -125,14 +122,18 @@ class TapelessIngestHelper(IngestHelper):
 
         ch = CollectionHelper(runas=user)
 
-        cache_key = urllib.parse.quote(f"tapelessingest_path_collection_{filtered_path}")
+        cache_key = urllib.parse.quote(
+            f"tapelessingest_path_collection_{filtered_path}"
+        )
         collection_id = cache.get(cache_key)
         if collection_id is not None:
             return collection_id
 
         parent_id = None
         for index, path_item in enumerate(filtered_path_items):
-            cache_key_subcollection = urllib.parse.quote(f"tapelessingest_subpath_collection_{parent_id}_{path_item}")
+            cache_key_subcollection = urllib.parse.quote(
+                f"tapelessingest_subpath_collection_{parent_id}_{path_item}"
+            )
             cached_parent_id = cache.get(cache_key_subcollection)
             if cached_parent_id is not None:
                 parent_id = cached_parent_id
@@ -151,7 +152,9 @@ class TapelessIngestHelper(IngestHelper):
                 },
             }
             if parent_id is None:
-                query_doc["filter"]["terms"].append({"name": "parent_collection", "missing": True})
+                query_doc["filter"]["terms"].append(
+                    {"name": "parent_collection", "missing": True}
+                )
             else:
                 query_doc["filter"]["terms"].append(
                     {
@@ -175,7 +178,9 @@ class TapelessIngestHelper(IngestHelper):
                 if total_hits:
                     parent_id = data["results"][0]["id"]
                 else:
-                    collection = ch.createCollection(collection_name=path_item, settingsprofile_id="VX-6")
+                    collection = ch.createCollection(
+                        collection_name=path_item, settingsprofile_id="VX-6"
+                    )
                     if parent_id is not None:
                         ch.addCollectionToCollection(parent_id, collection.getId())
                     parent_id = collection.getId()
