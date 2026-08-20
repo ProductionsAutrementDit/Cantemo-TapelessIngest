@@ -452,7 +452,13 @@ class Folder(models.Model):
                                 result["_source"], settings.VIDISPINE_REPLACE_URLS
                             )
                             # Validate file exists on filesystem (batched:
-                            # one scandir per directory, DC-2 guard intact)
+                            # one scandir per directory, DC-2 guard intact).
+                            # A membership miss is confirmed by one real
+                            # check, so a file created after the listing
+                            # snapshot is still found; a file deleted after
+                            # the snapshot passes here and errors downstream
+                            # — the one residual TOCTOU direction,
+                            # deliberate under AD-4.
                             file_absolute_path = os.path.join(root_path, file.getPath())
                             if not listings.exists(file_absolute_path):
                                 raise TapelessIngestException(

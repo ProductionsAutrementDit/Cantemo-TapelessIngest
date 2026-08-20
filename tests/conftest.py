@@ -82,9 +82,11 @@ class FakeProvider:
     collide.
 
     Every getMetadatasFromFile call records `context.get("scan_context")`
-    in `seen_scan_contexts`, so tests can assert the provider dict's
-    "scan_context" key is load-bearing (story 2.1: providers resolve
-    absolute paths through it).
+    in `seen_scan_contexts` and `context.get("listings")` in
+    `seen_listings`, so tests can assert the provider dict's
+    "scan_context" (story 2.1: providers resolve absolute paths through
+    it) and "listings" (story 2.2: the scan's FolderListings instance,
+    the 2.3 sidecar-probe reuse surface) keys are load-bearing.
     """
 
     name = "Fake Test Provider"
@@ -92,6 +94,7 @@ class FakeProvider:
 
     def __init__(self):
         self.seen_scan_contexts = []
+        self.seen_listings = []
 
     def getExtensions(self):
         return [".fake"]
@@ -104,6 +107,7 @@ class FakeProvider:
 
     def getMetadatasFromFile(self, media_file, metadatas, context):
         self.seen_scan_contexts.append(context.get("scan_context"))
+        self.seen_listings.append(context.get("listings"))
         metadatas["provider"] = self.machine_name
         metadatas["umid"] = os.path.splitext(media_file.getPath())[0]
         return metadatas, context
