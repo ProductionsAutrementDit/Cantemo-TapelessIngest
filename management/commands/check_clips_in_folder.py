@@ -25,20 +25,21 @@ Example: Ingest all tapeless clips in folder 2022, in subfolders starting with A
 ./scan_tapeless_dir.py --storage VX-41 --path 2022 --userId 1 --startWith AH_ --dryrun
 """
 import os
+import re
 from datetime import datetime, timedelta
+from dateutil.relativedelta import relativedelta
 from slack_sdk import WebClient
 
 import argparse
 import logging
 
 from django.contrib.auth.models import User
-from django.core.management.base import BaseCommand
+from django.core.management.base import BaseCommand, CommandError
 
 from configparser import ConfigParser
 
 from portal.plugins.TapelessIngest.models.folder import Folder
 from portal.plugins.TapelessIngest.helpers import TapelessIngestException
-
 
 SLACK_ACCESS_TOKEN = None
 
@@ -78,6 +79,54 @@ PROVIDERS = [
 ]
 
 LEGACY_STORAGES = ["VX-2", "VX-26", "VX-11"]
+
+SINCE_RE = re.compile(r"^(\d+)([dwmy])$")
+
+
+def parse_since(value, now):
+    """Parse a --since period (e.g. 10d, 2w, 3m, 1y) into a window start."""
+    match = SINCE_RE.match(value)
+    if not match:
+        raise CommandError(
+            f"Invalid --since '{value}': expected <number><unit>, "
+            f"unit one of d/w/m/y"
+        )
+    number = int(match.group(1))
+    unit = match.group(2)
+    if unit == "d":
+        return now - timedelta(days=number)
+    if unit == "w":
+        return now - timedelta(weeks=number)
+    if unit == "m":
+        return now - relativedelta(months=number)
+    return now - relativedelta(years=number)
+
+
+def parse_from(value):
+    """Parse a --from date (YYYY-MM-DD) into a datetime."""
+    try:
+        return datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        raise CommandError(f"Invalid --from '{value}': expected YYYY-MM-DD")
+
+
+def compute_date_window(from_date, now):
+    """Return one YYYYMMDD value per day from from_date to now, inclusive."""
+    if from_date > now:
+        raise CommandError("--from date is in the future")
+    delta = now - from_date
+    return [
+        (from_date + timedelta(days=i)).strftime("%Y%m%d")
+        for i in range(delta.days + 1)
+    ]
+
+
+def format_window_log(date_window):
+    """Single range line summarizing the date window (FR-33)."""
+    return (
+        f"Scanning folders from {date_window[0]} to {date_window[-1]} "
+        f"({len(date_window)} day folders)"
+    )
 
 
 def scan_tapeless_dir(
@@ -197,7 +246,8 @@ class Command(BaseCommand):
             "--startWith",
             nargs="+",
             default=["AH_"],
-            help="Only scan folder which begin with this value",
+            help="Only scan folder which begin with this value "
+            "(applies to top-level folders only)",
         )
         parser.add_argument(
             "--providers",
@@ -235,54 +285,47 @@ class Command(BaseCommand):
         parser.add_argument("--replace", action="store_true")
 
     def handle(self, *cmd_args, **options):
+        global SLACK_ACCESS_TOKEN, logger
+        args = argparse.Namespace(**options)
+
+        # Fail-fast validation (AD-10): every argument defect aborts here
+        # with a CommandError, before config read, Slack client, user
+        # lookup and any index/filesystem/DB work.
+        now = datetime.now()
+        from_date = None
+        if args.since:
+            from_date = parse_since(args.since, now)
+        if args.from_date:
+            # --from wins over --since when both are given (preserved);
+            # both are always validated.
+            from_date = parse_from(args.from_date)
+        date_window = None
+        if from_date is not None:
+            date_window = compute_date_window(from_date, now)
+
+        try:
+            user = User.objects.get(pk=args.userId)
+        except (User.DoesNotExist, ValueError):
+            raise CommandError(f"Unknown user id '{args.userId}'")
+
         # Side effects relocated from module level (approved deviation):
         # config read, Slack token, and logger construction happen at
         # command start instead of import time.
-        global SLACK_ACCESS_TOKEN, logger
         cp = ConfigParser()
         cp.read("/etc/cantemo/portal/portal.conf")
         SLACK_ACCESS_TOKEN = cp.get("slack", "ACCESS_TOKEN")
         logger = CustomLogger()
 
-        args = argparse.Namespace(**options)
-
         storage = args.storage
         path = args.path
-        user = User.objects.get(pk=args.userId)
 
         only = args.only
-        from_date = None
 
-        # If since is provided, calculate from_date
-        if args.since:
-            since = args.since
-            # Get number and unit
-            number = int(since[:-1])
-            unit = since[-1]
-            # Calculate from_date
-            if unit == "d":
-                from_date = datetime.now() - timedelta(days=number)
-            elif unit == "w":
-                from_date = datetime.now() - timedelta(weeks=number)
-            elif unit == "m":
-                from_date = datetime.now() - timedelta(months=number)
-            elif unit == "y":
-                from_date = datetime.now() - timedelta(years=number)
-
-        if args.from_date:
-            # convert date to datetime
-            from_date = datetime.strptime(args.from_date, "%Y-%m-%d")
-
-        if from_date:
-            logger.log(f"Scanning from {from_date}")
-            # For each days since from_date, scan folder
-            now = datetime.now()
-            delta = now - from_date
-            for i in range(delta.days + 1):
-                date = from_date + timedelta(days=i)
-                date_path = date.strftime("%Y%m%d")
-                only += [date_path]
-                logger.log(f"Scanning folders from {date_path}")
+        if date_window is not None:
+            logger.log(format_window_log(date_window))
+            # One YYYYMMDD filter value per window day, appended onto the
+            # same list object as args.only (the scan call reads args.only).
+            only += date_window
 
         folder, is_new = Folder.get_or_new(storage_id=storage, path=path)
         logger.log(
