@@ -24,6 +24,10 @@ DEFAULT_AUTO_FIELD = "django.db.models.AutoField"
 
 USE_TZ = True
 
+# Prod shape VERIFIED 2026-08-20: a dict of URL-prefix rewrites passed through
+# to VSFile; empty off-server (the stub VSFile only stores it).
+VIDISPINE_REPLACE_URLS = {}
+
 # Required: models/folder.py imports django.core.cache at module level and
 # caches storage/collection lookups.
 CACHES = {

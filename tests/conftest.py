@@ -16,6 +16,7 @@ portal.pluginbase.core) and crashes at collection before this file runs.
 import logging
 import os
 import sys
+import warnings
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -28,6 +29,14 @@ from tests.portal_stub import install  # noqa: E402
 
 install()
 
+_prior_settings = os.environ.get("DJANGO_SETTINGS_MODULE")
+if _prior_settings not in (None, "tests.tier2_settings"):
+    warnings.warn(
+        f"DJANGO_SETTINGS_MODULE was already set to {_prior_settings!r}; "
+        f"overriding with 'tests.tier2_settings' for the off-server test run",
+        RuntimeWarning,
+        stacklevel=1,
+    )
 os.environ["DJANGO_SETTINGS_MODULE"] = "tests.tier2_settings"
 
 import django  # noqa: E402
@@ -37,9 +46,92 @@ django.setup()
 import pytest  # noqa: E402
 from django.core.management import call_command  # noqa: E402
 
+from tests.portal_stub import query_elastic_fake  # noqa: E402
+
 
 @pytest.fixture(scope="session")
 def migrated_db():
     """Apply all migrations (0001–0016 + django deps) to sqlite :memory:."""
     call_command("migrate", verbosity=0)
     yield
+
+
+@pytest.fixture(autouse=True)
+def _flush_db_after_db_test(request):
+    """Tier 2 isolation: migrated_db is session-scoped over one sqlite :memory:
+    connection, so rows written by one test would otherwise leak into the next.
+    Flush on teardown, but only for tests that actually requested the DB —
+    Tier 1 must stay DB-free.
+    """
+    yield
+    if "migrated_db" in request.fixturenames:
+        call_command("flush", interactive=False, verbosity=0)
+
+
+FAKE_PROVIDER_NAME = "faketest"
+
+
+class FakeProvider:
+    """Deterministic provider double, injected via the Clip._PROVIDER_CACHE seam.
+
+    Real providers are unusable off-server (`file` shells out to ffprobe, the
+    others parse card structures). Like real providers, getMetadatasFromFile
+    mutates the shared `metadatas` dict in place and returns it with the
+    context; the umid is derived deterministically from the file name stem.
+    """
+
+    name = "Fake Test Provider"
+    machine_name = FAKE_PROVIDER_NAME
+
+    def getExtensions(self):
+        return [".fake"]
+
+    def getSubPaths(self):
+        return []
+
+    def getFilters(self, escaped_path):
+        return []
+
+    def getMetadatasFromFile(self, media_file, metadatas, context):
+        metadatas["provider"] = self.machine_name
+        metadatas["umid"] = os.path.splitext(media_file.getFileName())[0]
+        return metadatas, context
+
+
+@pytest.fixture(autouse=True)
+def _reset_query_elastic_fake():
+    """Autouse: unconsumed queued responses must never leak into a later test."""
+    yield
+    query_elastic_fake.reset()
+
+
+@pytest.fixture
+def es_fake():
+    """The stateful query_elastic fake bound into models/folder.py at import."""
+    return query_elastic_fake
+
+
+@pytest.fixture
+def es_page():
+    """Factory for raw query_elastic result pages."""
+
+    def _page(sources, total):
+        return {
+            "hits": {
+                "total": {"value": total},
+                "hits": [{"_source": source} for source in sources],
+            }
+        }
+
+    return _page
+
+
+@pytest.fixture
+def fake_provider():
+    """Register the FakeProvider under its test-only cache name, then unregister."""
+    from portal.plugins.TapelessIngest.models.clip import Clip
+
+    provider = FakeProvider()
+    Clip._PROVIDER_CACHE[FAKE_PROVIDER_NAME] = provider
+    yield provider
+    Clip._PROVIDER_CACHE.pop(FAKE_PROVIDER_NAME, None)

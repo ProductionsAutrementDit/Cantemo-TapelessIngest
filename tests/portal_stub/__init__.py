@@ -13,6 +13,7 @@ No other Portal mocking is allowed anywhere in the test tree: no
 """
 
 import logging
+import os
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -28,6 +29,92 @@ class Plugin:
 
 def implements(interface):
     """No-op stand-in for portal.pluginbase.core.implements."""
+
+
+class QueryElasticFake:
+    """Stateful stand-in for portal.search.elastic.query_elastic.
+
+    models/folder.py binds the name at import time (`from portal.search.elastic
+    import query_elastic`), so this very instance — installed into the stub
+    module before any plugin import — is the object `Folder.scan` calls.
+
+    FIFO response queue + `(first, number)` call log; the conftest autouse
+    reset fixture clears both after every test so unconsumed responses never
+    leak into a later test.
+    """
+
+    def __init__(self):
+        self.queue = []
+        self.calls = []
+
+    def push(self, response):
+        """Queue one raw search result dict to be returned by the next call."""
+        self.queue.append(response)
+
+    def reset(self):
+        self.queue.clear()
+        self.calls.clear()
+
+    def __call__(self, search_doc, doc_type=None, first=0, number=25, **kwargs):
+        self.calls.append((first, number))
+        if not self.queue:
+            raise AssertionError(
+                "query_elastic fake called with an empty response queue "
+                f"(first={first}, number={number}) — push() a page first"
+            )
+        return self.queue.pop(0)
+
+
+query_elastic_fake = QueryElasticFake()
+
+
+class VSFile:
+    """Functional dict-backed stand-in for VidiRest.objects.storage.VSFile.
+
+    Mapping VERIFIED on prod (2026-08-20, synthetic instantiation of vendor
+    portal/externals/VidiRest/objects/storage.pyc): the getters read `_source`
+    keys path/hash/storage/id/size. `getState` is deliberately omitted (prod
+    derives NOT_IMPORTED from an empty `item` list rather than passing raw
+    `state` through; the pinned code paths never call it, so reaching it here
+    raises AttributeError rather than mismodelling it). `replace_urls`
+    (settings.VIDISPINE_REPLACE_URLS, a dict of URL-prefix rewrites; `{}` in
+    Tier 2 settings) is only passed through.
+    """
+
+    def __init__(self, source, replace_urls=None):
+        self._source = source
+        self._replace_urls = replace_urls
+
+    def getPath(self):
+        return self._source["path"]
+
+    def getHash(self):
+        return self._source["hash"]
+
+    def getStorage(self):
+        return self._source["storage"]
+
+    def getId(self):
+        return self._source["id"]
+
+    def getSize(self):
+        return self._source["size"]
+
+    def getFileName(self):
+        return os.path.basename(self._source["path"])
+
+    def __str__(self):
+        # Deterministic rendering so error strings built from f"{file}" are
+        # exactly assertable in tests (prod's default repr embeds id()).
+        return self._source["path"]
+
+
+class StorageHelper:
+    """Instantiable no-op stand-in for portal.vidispine.istorage.StorageHelper.
+
+    Plugin code instantiates it unconditionally (e.g. Clip.get_clip_from_file);
+    any method access raises AttributeError, keeping tests off-server honest.
+    """
 
 
 def _stub_class(name):
@@ -69,9 +156,7 @@ _MODULES = {
         "IAppRegister": _stub_class("IAppRegister"),
     },
     "portal.search": {},
-    "portal.search.elastic": {
-        "query_elastic": _stub_callable("portal.search.elastic.query_elastic")
-    },
+    "portal.search.elastic": {"query_elastic": query_elastic_fake},
     "portal.api": {},
     "portal.api.client": {
         "get": _stub_callable("portal.api.client.get"),
@@ -94,7 +179,7 @@ _MODULES = {
         "CollectionHelper": _stub_class("CollectionHelper")
     },
     "portal.vidispine.igroup": {"GroupHelper": _stub_class("GroupHelper")},
-    "portal.vidispine.istorage": {"StorageHelper": _stub_class("StorageHelper")},
+    "portal.vidispine.istorage": {"StorageHelper": StorageHelper},
     "portal.vidispine.iuser": {"UserHelper": _stub_class("UserHelper")},
     "portal.vidispine.iexception": {
         "handleRestAPIError": _stub_callable(
@@ -129,7 +214,7 @@ _MODULES = {
     "VidiRest": {},
     "VidiRest.itemapi": {"ItemAPI": _stub_class("ItemAPI")},
     "VidiRest.objects": {},
-    "VidiRest.objects.storage": {"VSFile": _stub_class("VSFile")},
+    "VidiRest.objects.storage": {"VSFile": VSFile},
     "VidiRest.objects.shape": {"VSShape": _stub_class("VSShape")},
     "VidiRest.helpers": {},
     "VidiRest.helpers.vidispine": {
@@ -152,15 +237,30 @@ _MODULES = {
 }
 
 
+# Top-level distributions this package stubs; a real, already-imported one
+# must never be silently overwritten.
+_STUBBED_ROOTS = ("portal", "VidiRest", "RestAPIBase", "pyxb")
+
+
 def install():
     """Idempotently seed sys.modules with the stub modules.
 
     Must run before any django/plugin import (the conftest owns the ordering).
     """
+    assert REPO_ROOT.name == "TapelessIngest", (
+        f"portal_stub expects the repo directory to be named 'TapelessIngest' "
+        f"(portal.plugins.__path__ resolution depends on it), got {REPO_ROOT}"
+    )
+
     already = sys.modules.get("portal")
     if already is not None and getattr(already, "__portal_stub__", False):
         log.debug("portal_stub already installed; skipping")
         return
+
+    for root in _STUBBED_ROOTS:
+        existing = sys.modules.get(root)
+        if existing is not None and not getattr(existing, "__portal_stub__", False):
+            raise RuntimeError("real portal already imported; refusing to stub")
 
     for dotted, attrs in _MODULES.items():
         module = ModuleType(dotted)
@@ -174,10 +274,18 @@ def install():
 
     # Wire each stub module onto its parent package, so attribute access like
     # `pyxb.utils` after `import pyxb.utils` works exactly as for real packages.
+    # Missing parents (a future _MODULES edit skipping one) are auto-created
+    # rather than KeyError-ing at install.
     for dotted in _MODULES:
         if "." in dotted:
             parent_name, _, child_name = dotted.rpartition(".")
-            setattr(sys.modules[parent_name], child_name, sys.modules[dotted])
+            parent = sys.modules.get(parent_name)
+            if parent is None:
+                parent = ModuleType(parent_name)
+                parent.__portal_stub__ = True
+                parent.__path__ = []
+                sys.modules[parent_name] = parent
+            setattr(parent, child_name, sys.modules[dotted])
 
     # The one real path: `portal.plugins.TapelessIngest` must resolve to this
     # repo (its directory is literally named TapelessIngest under the parent).
