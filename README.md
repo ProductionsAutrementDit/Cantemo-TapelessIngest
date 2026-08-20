@@ -1,5 +1,25 @@
 Hello World!\n
 
+## Running tests
+
+The test suite runs entirely off-server — no Portal, no network, no
+OpenSearch, no prod DB. Dev dependencies live in a local venv and are never
+deployed:
+
+```
+/opt/homebrew/bin/python3.14 -m venv .venv
+.venv/bin/pip install -r requirements-dev.txt
+.venv/bin/pytest tests/
+```
+
+Tier 1 (`tests/tier1/`) proves the plugin modules import through the stub;
+Tier 2 (`tests/tier2/`) migrates a sqlite `:memory:` DB and exercises the ORM.
+
+**AD-11 stub rule:** `tests/portal_stub/` is the ONLY sanctioned mocking of
+Portal and the Cantemo-only distributions (`VidiRest`, `RestAPIBase`,
+`pyxb`). No `unittest.mock.patch("portal...")`, no `monkeypatch` of
+`portal.*`, no per-test `sys.modules` writes anywhere else in the test tree.
+
 ## Management commands
 
 The two production scan scripts are versioned in this repo as Django management

@@ -11,6 +11,17 @@ class Migration(migrations.Migration):
     ]
 
     operations = [
+        # Added 2026-08-20 for fresh-build replayability (off-server test
+        # substrate, story 1.2): the old Folder's unique_together
+        # ("user", "path") must be dropped before RemoveField(folder.user).
+        # On the prod DB this constraint historically cascaded away with the
+        # column drop, so prod (where 0008 is already recorded as applied and
+        # never re-runs) and fresh builds now agree; sqlite's table-rebuild
+        # under Django 5.2 requires it explicitly.
+        migrations.AlterUniqueTogether(
+            name="folder",
+            unique_together=set(),
+        ),
         migrations.RemoveField(
             model_name="folder",
             name="user",

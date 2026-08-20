@@ -1,0 +1,11 @@
+# dev-only, never deployed.
+# Runtime deps pin the verified prod versions (server check 2026-08-20).
+# Pure dev tools (pytest, black) are exempt from prod-mirroring: latest stable.
+Django==5.2.10
+opensearch-dsl==2.1.0
+opensearch-py==2.8.0
+lxml==6.0.2
+slack_sdk==3.43.0
+simplejson==3.20.2
+pytest==9.1.1
+black==26.5.1
