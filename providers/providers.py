@@ -14,9 +14,11 @@ from portal.plugins.TapelessIngest.models.settings import (
     Settings,
     MetadataMapping,
 )
+from portal.plugins.TapelessIngest.scan.context import browse_root_path
 from portal.plugins.TapelessIngest.utilities import build_nested
 
 log = logging.getLogger(__name__)
+
 
 class Provider:
     def __init__(self, folder=None):
@@ -50,13 +52,22 @@ class Provider:
                 else:
                     status = 3
             except NotFoundError:
-                log.warning("Item %s not found, resetting item_id for clip %s", clip.item_id, clip.umid)
+                log.warning(
+                    "Item %s not found, resetting item_id for clip %s",
+                    clip.item_id,
+                    clip.umid,
+                )
                 clip.item_id = ""
             except VSAPIError as e:
                 log.error("Vidispine API error checking item %s: %s", clip.item_id, e)
                 clip.item_id = ""
             except Exception as e:
-                log.error("Unexpected error checking clip status for %s: %s", clip.umid, e, exc_info=True)
+                log.error(
+                    "Unexpected error checking clip status for %s: %s",
+                    clip.umid,
+                    e,
+                    exc_info=True,
+                )
                 clip.item_id = ""
 
         if clip.item_id in [None, ""]:
@@ -84,14 +95,25 @@ class Provider:
     def isSpannedClipComplete(self, clip):
         return True
 
-    def get_file_absolute_path(self, file):
+    def get_file_absolute_path(self, file, context=None):
+        # Context-first (story 2.1): the run's ScanContext resolves the root
+        # with zero storage HTTP calls; the per-call resolution below is the
+        # legacy fallback for context-less callers (e.g. providers/file.py
+        # until 2.3's AD-7 contract threads context provider-internally).
+        if context is not None:
+            scan_context = context.get("scan_context")
+            if scan_context is not None:
+                absolute_path = scan_context.absolute_path_for(
+                    file.getStorage(), file.getPath()
+                )
+                if absolute_path is not None:
+                    return absolute_path
         sth = StorageHelper()
         storage_id = file.getStorage()
         storage = sth.getStorage(storage_id)
-        storage_methods = storage.getMethods()
-        for s in storage_methods:
-            if s.getBrowse():
-                return os.path.join(s.getFirstURI()["url"], file.getPath())
+        root_path = browse_root_path(storage)
+        if root_path is not None:
+            return os.path.join(root_path, file.getPath())
         return None
 
     def _createDictFromMetadataMapping(self, clip):

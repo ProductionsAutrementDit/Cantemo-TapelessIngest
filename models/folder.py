@@ -24,6 +24,8 @@ from portal.plugins.TapelessIngest.helpers import (
     TapelessIngestHelper,
     TapelessIngestException,
 )
+from portal.plugins.TapelessIngest.scan.adapters import build_default_context
+from portal.plugins.TapelessIngest.scan.context import browse_root_path
 
 log = logging.getLogger(__name__)
 
@@ -52,7 +54,9 @@ class Folder(models.Model):
         unique_together = ["path", "storage_id"]
 
     @classmethod
-    def get_or_new(cls, defaults: Optional[Dict[str, Any]] = None, **kwargs: Any) -> tuple['Folder', bool]:
+    def get_or_new(
+        cls, defaults: Optional[Dict[str, Any]] = None, **kwargs: Any
+    ) -> tuple["Folder", bool]:
         """Get existing folder or create a new one without saving to database.
 
         Args:
@@ -122,11 +126,11 @@ class Folder(models.Model):
     @property
     def root_path(self):
         if not hasattr(self, "_root_path"):
-            if self.storage:
-                storage_methods = self.storage.getMethods()
-                for s in storage_methods:
-                    if s.getBrowse():
-                        self._root_path = s.getFirstURI()["url"]
+            # Canonical block (scan/context.py). Pin #5 preserved: with no
+            # resolvable root, _root_path stays unassigned -> AttributeError.
+            root_path = browse_root_path(self.storage)
+            if root_path is not None:
+                self._root_path = root_path
         return self._root_path
 
     @property
@@ -148,7 +152,9 @@ class Folder(models.Model):
         vsfile = self._sth.getFileByPath(self.storage_id, path=subpath)
         return vsfile
 
-    def getFiles(self, path: str, number: int = 0, first: int = 0, user: Optional[Any] = None) -> List[Dict[str, Any]]:
+    def getFiles(
+        self, path: str, number: int = 0, first: int = 0, user: Optional[Any] = None
+    ) -> List[Dict[str, Any]]:
         """Get all files in a folder path with pagination.
 
         Args:
@@ -362,7 +368,25 @@ class Folder(models.Model):
         providers=None,
         count_only=False,
         legacy_storages=[],
+        *,
+        context=None,
     ):
+        scan_context = context
+        if scan_context is None:
+            # Paged callers keep today's signature: a default context is
+            # built inline from the folder's cached properties (AD-14).
+            scan_context = build_default_context(
+                self,
+                user=user,
+                providers=providers,
+                legacy_storages=legacy_storages,
+            )
+        else:
+            # A passed context's options are authoritative (the commands
+            # pass the same values as kwargs — equal by construction).
+            user = scan_context.options.user
+            providers = scan_context.options.providers
+            legacy_storages = scan_context.options.legacy_storages
         provider_list = Clip._get_provider_list(providers)
         providers = []
         response = {
@@ -373,7 +397,13 @@ class Folder(models.Model):
             "already_ingested": 0,
             "processed": 0,
         }
-        if self.absolute_path:
+        root_path = scan_context.root_path_for(self.storage_id)
+        if not root_path:
+            # Context miss / falsy root falls back to today's property
+            # chain — truthiness semantics, pin #5's AttributeError included.
+            root_path = self.root_path
+        absolute_path = os.path.join(root_path, self.path) if root_path else False
+        if absolute_path:
             search_doc = self.build_search_doc(provider_list)
             has_next = True
             while has_next:
@@ -392,7 +422,7 @@ class Folder(models.Model):
                 if number == 0 and len(search_result["hits"]["hits"]) == result_number:
                     has_next = True
                     first += result_number
-                context = {"folder": self, "clips": []}
+                context = {"folder": self, "clips": [], "scan_context": scan_context}
                 if not count_only:
                     # Note: File existence checks are performed per-file for data integrity.
                     # For large batches, consider trusting Elasticsearch index or
@@ -403,9 +433,7 @@ class Folder(models.Model):
                                 result["_source"], settings.VIDISPINE_REPLACE_URLS
                             )
                             # Validate file exists on filesystem
-                            file_absolute_path = os.path.join(
-                                self.root_path, file.getPath()
-                            )
+                            file_absolute_path = os.path.join(root_path, file.getPath())
                             if not os.path.exists(file_absolute_path):
                                 raise TapelessIngestException(
                                     f"File {file} does not exist ({file_absolute_path})"
@@ -420,6 +448,16 @@ class Folder(models.Model):
                                 context,
                                 legacy_storages=legacy_storages,
                             )
+                            # Seed the clip's memo attributes from the run
+                            # context so ingest-time clip.root_path (xdcam)
+                            # stops re-resolving — same seam the paged tests
+                            # already use (preset _root_path).
+                            storage_info = scan_context.storages.get(clip.storage_id)
+                            if storage_info is not None:
+                                if storage_info.storage is not None:
+                                    clip._storage = storage_info.storage
+                                if storage_info.root_path:
+                                    clip._root_path = storage_info.root_path
                             if created:
                                 response["created"] += 1
                             if clip.file is not None:
@@ -456,7 +494,17 @@ class Folder(models.Model):
         replace=False,
         legacy_storages=[],
         dry_run=False,
+        *,
+        context=None,
     ):
+        if context is not None:
+            # A passed context's options are authoritative (the commands
+            # pass the same values as kwargs — equal by construction).
+            user = context.options.user
+            providers = context.options.providers
+            legacy_storages = context.options.legacy_storages
+            replace = context.options.replace
+            dry_run = context.options.dry_run
         response = self.scan(
             first=first,
             number=number,
@@ -464,6 +512,7 @@ class Folder(models.Model):
             user=user,
             providers=providers,
             legacy_storages=legacy_storages,
+            context=context,
         )
         for key in ["ingested", "skipped", "failed", "replaced"]:
             response[key] = 0

@@ -61,7 +61,9 @@ class Provider(BaseProvider):
 
     def getAllClipMetadatas(self, media_absolute_path, metadatas):
         cmd = [
-            "REDline --i " + shlex.quote(media_absolute_path) + " --printMeta 3 --useMeta",
+            "REDline --i "
+            + shlex.quote(media_absolute_path)
+            + " --printMeta 3 --useMeta",
         ]
         p = sp.run(cmd, shell=True, capture_output=True, text=True)
         csvfile = p.stdout
@@ -85,7 +87,7 @@ class Provider(BaseProvider):
             metadatas["clipname"] = filename
             metadatas["file_id"] = media_file.getId()
             metadatas["extension"] = file_extension
-            media_absolute_path = self.get_file_absolute_path(media_file)
+            media_absolute_path = self.get_file_absolute_path(media_file, context)
             metadatas = self.getAllClipMetadatas(media_absolute_path, metadatas)
         return metadatas, context
 

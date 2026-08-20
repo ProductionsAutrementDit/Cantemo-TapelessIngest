@@ -46,6 +46,7 @@ from portal.plugins.TapelessIngest.models.settings import (
     Settings,
     MetadataMapping,
 )
+from portal.plugins.TapelessIngest.scan.context import browse_root_path
 
 log = logging.getLogger(__name__)
 
@@ -191,7 +192,9 @@ class Clip(models.Model):
         super(Clip, self).__init__(*args, **kwargs)
 
     @classmethod
-    def get_provider_by_name(cls, provider_name: str, clip: Optional['Clip'] = None) -> Any:
+    def get_provider_by_name(
+        cls, provider_name: str, clip: Optional["Clip"] = None
+    ) -> Any:
         """Dynamically load and instantiate a provider by name with caching.
 
         Args:
@@ -234,7 +237,9 @@ class Clip(models.Model):
         return filtered_providers
 
     @classmethod
-    def get_or_new(cls, defaults: Optional[Dict[str, Any]] = None, **kwargs: Any) -> Tuple['Clip', bool]:
+    def get_or_new(
+        cls, defaults: Optional[Dict[str, Any]] = None, **kwargs: Any
+    ) -> Tuple["Clip", bool]:
         """Get existing clip or create a new one without saving to database.
 
         Args:
@@ -259,8 +264,8 @@ class Clip(models.Model):
         file: Any,
         provider_list: Optional[List[Any]] = None,
         context: Optional[Dict[str, Any]] = None,
-        legacy_storages: Optional[List[str]] = None
-    ) -> Tuple['Clip', Dict[str, Any], bool]:
+        legacy_storages: Optional[List[str]] = None,
+    ) -> Tuple["Clip", Dict[str, Any], bool]:
         """Extract clip metadata from file and get or create clip instance.
 
         Args:
@@ -356,7 +361,7 @@ class Clip(models.Model):
             self._sth = StorageHelper(slug=self.storage_id)
         return self._sth
 
-    def get_spanned_clips(self) -> List['Clip']:
+    def get_spanned_clips(self) -> List["Clip"]:
         """Get all related spanned clips if this clip is part of a spanned set.
 
         Returns:
@@ -413,11 +418,11 @@ class Clip(models.Model):
             Root path string or None if not available
         """
         if not hasattr(self, "_root_path"):
-            if self.storage:
-                storage_methods = self.storage.getMethods()
-                for s in storage_methods:
-                    if s.getBrowse():
-                        self._root_path = s.getFirstURI()["url"]
+            # Canonical block (scan/context.py); no resolvable root leaves
+            # _root_path unassigned -> AttributeError, exactly as before.
+            root_path = browse_root_path(self.storage)
+            if root_path is not None:
+                self._root_path = root_path
         return self._root_path
 
     @property
@@ -750,7 +755,7 @@ class Clip(models.Model):
         self,
         original_files: List[Any],
         replace: bool,
-        legacy_storages: Optional[List[str]]
+        legacy_storages: Optional[List[str]],
     ) -> bool:
         """Check if original files should be replaced based on criteria.
 
@@ -778,9 +783,7 @@ class Clip(models.Model):
             return False
 
         if self.file.getStorage() in [f.getStorage() for f in original_files]:
-            log.info(
-                f"Importing {self.item_id}: File is on same storage, skipping it"
-            )
+            log.info(f"Importing {self.item_id}: File is on same storage, skipping it")
             return False
 
         if legacy_storages:
@@ -793,10 +796,7 @@ class Clip(models.Model):
         return True
 
     def _remove_original_shapes(
-        self,
-        user: Optional[User],
-        item_helper: Any,
-        storage_helper: Any
+        self, user: Optional[User], item_helper: Any, storage_helper: Any
     ) -> None:
         """Remove existing original shapes before replacement.
 
@@ -813,7 +813,9 @@ class Clip(models.Model):
                 log.info(
                     f"Importing {self.item_id}: Removing file {_file.getId()} from original shape"
                 )
-                storage_helper.removeFileItemRelationship(_file.getStorage(), _file.getId())
+                storage_helper.removeFileItemRelationship(
+                    _file.getStorage(), _file.getId()
+                )
 
             log.info(
                 f"Importing {self.item_id}: Removing original shape {original_shape.getId()}"
@@ -823,9 +825,7 @@ class Clip(models.Model):
             )
 
     def _get_or_create_placeholder_shape(
-        self,
-        user: Optional[User],
-        item_helper: Any
+        self, user: Optional[User], item_helper: Any
     ) -> Optional[str]:
         """Get existing placeholder shape or create a new one.
 
@@ -842,7 +842,9 @@ class Clip(models.Model):
 
         if original_shapes is None or len(original_shapes) == 0:
             log.info(f"Importing {self.item_id}: No original shape found, creating one")
-            response = item_helper.itemapi.createPlaceholderShape(self.item_id, runasuser=user)
+            response = item_helper.itemapi.createPlaceholderShape(
+                self.item_id, runasuser=user
+            )
             return response.decode("UTF-8")
 
         shape = original_shapes[0]
@@ -858,7 +860,7 @@ class Clip(models.Model):
         user_groups: List[str],
         no_transcode: Optional[bool],
         ingest_helper: Any,
-        job_helper: Any
+        job_helper: Any,
     ) -> bool:
         """Import a single-component (no extra files) clip.
 
@@ -889,7 +891,9 @@ class Clip(models.Model):
 
         return False
 
-    def _count_media_components(self, all_files: List[Dict[str, Any]]) -> Tuple[Optional[int], Optional[int]]:
+    def _count_media_components(
+        self, all_files: List[Dict[str, Any]]
+    ) -> Tuple[Optional[int], Optional[int]]:
         """Count audio and video components in file list.
 
         Args:
@@ -903,7 +907,7 @@ class Clip(models.Model):
 
         return (
             None if audio_count == 0 else audio_count,
-            None if video_count == 0 else video_count
+            None if video_count == 0 else video_count,
         )
 
     def _import_multi_component(
@@ -915,7 +919,7 @@ class Clip(models.Model):
         no_transcode: Optional[bool],
         user: Optional[User],
         item_helper: Any,
-        job_helper: Any
+        job_helper: Any,
     ) -> bool:
         """Import a multi-component (with extra files) clip.
 
@@ -1009,7 +1013,7 @@ class Clip(models.Model):
         collection_id: Optional[str] = None,
         user: Optional[User] = None,
         replace: bool = False,
-        legacy_storages: Optional[List[str]] = None
+        legacy_storages: Optional[List[str]] = None,
     ) -> Dict[str, bool]:
         """Import clip files into Vidispine, creating or updating an item.
 
@@ -1063,7 +1067,9 @@ class Clip(models.Model):
         # Handle existing item replacement
         if self.item is not None:
             if not self.file:
-                log.info(f"Importing {self.item_id}: No file to replace with, skipping it")
+                log.info(
+                    f"Importing {self.item_id}: No file to replace with, skipping it"
+                )
                 result["skipped"] = True
                 return result
 
@@ -1072,7 +1078,9 @@ class Clip(models.Model):
                 for original_shape in original_shapes:
                     original_files = original_shape.getAllFiles()
 
-                    if not self._should_replace_original_files(original_files, replace, legacy_storages):
+                    if not self._should_replace_original_files(
+                        original_files, replace, legacy_storages
+                    ):
                         result["skipped"] = True
                         return result
 
@@ -1102,11 +1110,22 @@ class Clip(models.Model):
 
         # Import based on component count
         if len(extra_files) == 0:
-            if self._import_single_component(main_file_id, user_groups, no_transcode, _igh, _ijh):
+            if self._import_single_component(
+                main_file_id, user_groups, no_transcode, _igh, _ijh
+            ):
                 result["ingested"] = True
                 return result
         else:
-            if self._import_multi_component(main_file, extra_files, shape_id, user_groups, no_transcode, user, _ith, _ijh):
+            if self._import_multi_component(
+                main_file,
+                extra_files,
+                shape_id,
+                user_groups,
+                no_transcode,
+                user,
+                _ith,
+                _ijh,
+            ):
                 result["ingested"] = True
                 return result
 

@@ -3,20 +3,25 @@ import logging
 from django.db import models
 from portal.vidispine.iitem import ItemHelper
 
-
 log = logging.getLogger(__name__)
 
 
 class Settings(models.Model):
-    storage_id = models.CharField(max_length=255, blank=True, default="", db_column="storage")
+    storage_id = models.CharField(
+        max_length=255, blank=True, default="", db_column="storage"
+    )
     tmp_storage = models.CharField(max_length=255, blank=True, default="")
     bmxtranswrap = models.CharField(max_length=255, blank=True, default="")
     mxf2raw = models.CharField(max_length=255, blank=True, default="")
     ffmpeg_path = models.CharField(max_length=255, blank=True, default="")
     base_folder = models.CharField(max_length=255, blank=True, default="")
 
-    collections_ignore_folder_str = models.TextField(blank=True, default="", db_column="collections_ignore_folder")
-    collections_rename_folder_str = models.TextField(blank=True, default="", db_column="collections_rename_folder")
+    collections_ignore_folder_str = models.TextField(
+        blank=True, default="", db_column="collections_ignore_folder"
+    )
+    collections_rename_folder_str = models.TextField(
+        blank=True, default="", db_column="collections_rename_folder"
+    )
 
     @property
     def storage(self):
@@ -38,7 +43,9 @@ class Settings(models.Model):
     @property
     def collections_ignore_folder(self):
         if not hasattr(self, "_collections_ignore_folder"):
-            self._collections_ignore_folder = self.collections_ignore_folder_str.split(",")
+            self._collections_ignore_folder = self.collections_ignore_folder_str.split(
+                ","
+            )
         return self._collections_ignore_folder
 
     @collections_ignore_folder.setter
@@ -68,8 +75,10 @@ class Settings(models.Model):
 
 class MetadataMapping(models.Model):
     metadata_provider = models.CharField(max_length=200)
-    metadata_portal = models.CharField(max_length=100, blank=True, null=True, default="")
-    
+    metadata_portal = models.CharField(
+        max_length=100, blank=True, null=True, default=""
+    )
+
     @property
     def metadata_portal_vfield(self):
         ith = ItemHelper()

@@ -51,7 +51,8 @@ class Provider(BaseProvider):
         metadatas["shooting_date"] = shooting_date.isoformat()
 
         cmd = [
-            "ffprobe -loglevel quiet -show_format -show_streams -print_format json " + shlex.quote(media_absolute_path)
+            "ffprobe -loglevel quiet -show_format -show_streams -print_format json "
+            + shlex.quote(media_absolute_path)
         ]
         p = sp.Popen(cmd, stdout=sp.PIPE, stderr=sp.PIPE, shell=True)
         output = json.loads(p.stdout.read())
@@ -65,7 +66,9 @@ class Provider(BaseProvider):
                     umid = umid_hex.lstrip("0x")
                     metadatas["umid"] = umid
                 if "company_name" in output["format"]["tags"].keys():
-                    metadatas["device_manufacturer"] = output["format"]["tags"]["company_name"]
+                    metadatas["device_manufacturer"] = output["format"]["tags"][
+                        "company_name"
+                    ]
                 if "timecode" in output["format"]["tags"].keys():
                     metadatas["timecode"] = output["format"]["tags"]["timecode"]
                 if "modification_date" in output["format"]["tags"].keys():
@@ -92,7 +95,10 @@ class Provider(BaseProvider):
                 if "time_base" in stream.keys():
                     metadatas["framerate"] = stream["time_base"]
                 if "tags" in stream.keys():
-                    if "creation_time" in stream["tags"].keys() and "shooting_date" not in metadatas.keys():
+                    if (
+                        "creation_time" in stream["tags"].keys()
+                        and "shooting_date" not in metadatas.keys()
+                    ):
                         try:
                             shooting_date = datetime.strptime(
                                 stream["tags"]["creation_time"],
@@ -101,7 +107,10 @@ class Provider(BaseProvider):
                             metadatas["shooting_date"] = shooting_date.isoformat()
                         except ValueError:
                             metadatas["shooting_date"] = None
-                    if "timecode" in stream["tags"].keys() and "timecode" not in metadatas.keys():
+                    if (
+                        "timecode" in stream["tags"].keys()
+                        and "timecode" not in metadatas.keys()
+                    ):
                         metadatas["timecode"] = stream["tags"]["timecode"]
 
         return metadatas

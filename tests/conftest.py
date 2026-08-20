@@ -46,7 +46,7 @@ django.setup()
 import pytest  # noqa: E402
 from django.core.management import call_command  # noqa: E402
 
-from tests.portal_stub import query_elastic_fake  # noqa: E402
+from tests.portal_stub import StorageHelperFake, query_elastic_fake  # noqa: E402
 
 
 @pytest.fixture(scope="session")
@@ -115,6 +115,24 @@ def _reset_query_elastic_fake():
         f"{len(leftover)} unused page(s) — the test pushed more responses "
         f"than scan requested"
     )
+
+
+@pytest.fixture(autouse=True)
+def _reset_storage_helper_fake():
+    """Autouse: per-test roots and getStorage counters never leak across tests."""
+    yield
+    StorageHelperFake.reset()
+
+
+@pytest.fixture
+def storage_fake():
+    """The counting StorageHelper fake (class-level state; see portal_stub).
+
+    Tests configure per-test roots via ``storage_fake.set_root(id, root)``
+    and read ``storage_fake.get_storage_calls`` for the once-per-run AC;
+    the autouse reset fixture clears the state after every test.
+    """
+    return StorageHelperFake
 
 
 @pytest.fixture

@@ -26,6 +26,7 @@ from configparser import ConfigParser
 
 from portal.plugins.TapelessIngest.models.folder import Folder
 from portal.plugins.TapelessIngest.helpers import TapelessIngestException
+from portal.plugins.TapelessIngest.scan import adapters
 
 SLACK_ACCESS_TOKEN = None
 
@@ -201,6 +202,7 @@ def scan_tapeless_dir(
     number=0,
     providers=None,
     replace=True,
+    context=None,
 ):
     if user is None:
         logger.log("User has to be provided")
@@ -258,6 +260,7 @@ def scan_tapeless_dir(
                         legacy_storages=LEGACY_STORAGES,
                         dry_run=not ingest,
                         replace=replace,
+                        context=context,
                     )
                     if results["hits"] == 0:
                         count = scan_tapeless_dir(
@@ -268,6 +271,7 @@ def scan_tapeless_dir(
                             count=count,
                             providers=providers,
                             replace=replace,
+                            context=context,
                         )
                     count += 1
                     error_message = ""
@@ -392,9 +396,21 @@ class Command(BaseCommand):
             # same list object as args.only (the scan call reads args.only).
             only += date_window
 
+        # One context per run (story 2.1): the storage is resolved exactly
+        # once here via the adapters, then threaded through the recursion as
+        # an ADDITIONAL kwarg — every existing kwarg still passes unchanged.
+        context = adapters.build_context(
+            [args.storage],
+            user=user,
+            dry_run=args.dryrun,
+            providers=args.providers,
+            legacy_storages=LEGACY_STORAGES,
+            replace=args.replace,
+        )
+
         folder, is_new = Folder.get_or_new(storage_id=storage, path=path)
         logger.log(
-            f"Scanning folder {folder.path} on storage {folder.storage}, with user {user}, starting with {' or '.join(args.startWith)} using only {only}, skipping {args.skip}",
+            f"Scanning folder {folder.path} on storage {context.storages[storage].storage}, with user {user}, starting with {' or '.join(args.startWith)} using only {only}, skipping {args.skip}",
         )
         try:
             count = scan_tapeless_dir(
@@ -407,6 +423,7 @@ class Command(BaseCommand):
                 replace=args.replace,
                 skip=args.skip,
                 only=args.only,
+                context=context,
             )
             logger.log(f"{count} folders scanned")
         except Exception as e:

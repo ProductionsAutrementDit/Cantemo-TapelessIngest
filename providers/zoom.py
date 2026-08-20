@@ -8,11 +8,9 @@ class Provider(FileProvider):
         FileProvider.__init__(self)
         self.name = "ZOOM"
         self.machine_name = "zoom"
-            
+
     def getExtensions(self):
         return [".wav"]
-                        
+
     def getSubPaths(self):
-        return [
-                "FOLDER[0-9]{2}/ZOOM[0-9]{4}"
-            ]
+        return ["FOLDER[0-9]{2}/ZOOM[0-9]{4}"]

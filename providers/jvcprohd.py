@@ -13,6 +13,7 @@ from portal.plugins.TapelessIngest.providers.providers import Provider as BasePr
 
 log = logging.getLogger(__name__)
 
+
 # Classe jvcprohd: Récupère les clips à partir des fichiers XML du dossier CLIP
 class Provider(BaseProvider):
     def __init__(self):
@@ -184,7 +185,7 @@ class Provider(BaseProvider):
 
         log.info("export clip %s with command %s" % (clip.umid, " ".join(command)))
 
-        pipe = sp.Popen(command, stdout=sp.PIPE, bufsize=10 ** 8)
+        pipe = sp.Popen(command, stdout=sp.PIPE, bufsize=10**8)
 
         output, err = pipe.communicate(
             b"input data that is passed to subprocess' stdin"

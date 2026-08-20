@@ -23,6 +23,7 @@ from portal.vidispine.icollection import CollectionHelper  # type: ignore
 from portal.vidispine.istorage import StorageHelper  # type: ignore
 
 from portal.plugins.TapelessIngest.models.settings import Settings  # type: ignore
+from portal.plugins.TapelessIngest.scan.context import browse_root_path
 
 log = logging.getLogger(__name__)
 PROVIDERS_LIST = [
@@ -50,11 +51,9 @@ class TapelessIngestPath(object):
 
         storage_helper = StorageHelper()
         self.storage = storage_helper.getStorage(storage_id)
-        if self.storage:
-            storage_methods = self.storage.getMethods()
-            for s in storage_methods:
-                if s.getBrowse():
-                    self.root_path = s.getFirstURI()["url"]
+        # Canonical block (scan/context.py): None when no browse-capable
+        # method, matching the previous inline loop.
+        self.root_path = browse_root_path(self.storage)
 
     @property
     def absolute_path(self):

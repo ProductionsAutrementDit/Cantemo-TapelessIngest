@@ -13,7 +13,6 @@ from datetime import datetime, timedelta
 
 import pytest
 from django.contrib.auth.models import User
-from django.core.cache import cache
 from django.core.management import call_command
 from django.core.management.base import CommandError
 
@@ -109,9 +108,9 @@ def test_since_window_reaches_scan_only_filter(command, migrated_db, monkeypatch
     `scan_tapeless_dir` and `CustomLogger` attributes are minimally
     monkeypatched (our module, sanctioned — not portal mocking; since story
     1.5 the real config read tolerates an absent portal.conf via
-    fallback=None, so no ConfigParser stub is needed), and the storage
-    cache is pre-seeded so Folder.storage never calls the no-op stub
-    StorageHelper.
+    fallback=None, so no ConfigParser stub is needed); since story 2.1 the
+    storage resolves through the counting StorageHelper fake, so no storage
+    cache preset is needed.
     """
     module = importlib.import_module(
         f"portal.plugins.TapelessIngest.management.commands.{command}"
@@ -124,7 +123,9 @@ def test_since_window_reaches_scan_only_filter(command, migrated_db, monkeypatch
 
     monkeypatch.setattr(module, "scan_tapeless_dir", fake_scan)
     monkeypatch.setattr(module, "CustomLogger", _CapturingLogger)
-    cache.set("storage:VX-41", "VX-41", 300)
+    # No cache.set("storage:VX-41", ...) preset any more (story 2.1): tree
+    # mode resolves the storage through the counting StorageHelper fake in
+    # tests/portal_stub, and handle()'s log line reads the run context.
 
     user = User.objects.create(pk=4242, username=f"story14-wiring-{command}")
     now_before = datetime.now()
@@ -132,7 +133,6 @@ def test_since_window_reaches_scan_only_filter(command, migrated_db, monkeypatch
         call_command(command, *BASE_ARGS, "--userId", "4242", "--since", "1d")
     finally:
         user.delete()  # keep the auth table empty for the unknown-user tests
-        cache.delete("storage:VX-41")
     now_after = datetime.now()
 
     # Two candidate windows tolerate a midnight rollover mid-test.

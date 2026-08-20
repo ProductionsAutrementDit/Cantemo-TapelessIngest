@@ -132,12 +132,89 @@ class VSFile:
         return self._get("path")
 
 
-class StorageHelper:
-    """Instantiable no-op stand-in for portal.vidispine.istorage.StorageHelper.
+class FakeStorageMethod:
+    """One storage-access method on a FakeStorage (browse flag + URI)."""
 
-    Plugin code instantiates it unconditionally (e.g. Clip.get_clip_from_file);
-    any method access raises AttributeError, keeping tests off-server honest.
+    def __init__(self, browse, url=None):
+        self._browse = browse
+        self._url = url
+
+    def getBrowse(self):
+        return self._browse
+
+    def getFirstURI(self):
+        return {"url": self._url}
+
+
+class FakeStorage:
+    """Opaque VS storage stand-in returned by StorageHelperFake.getStorage."""
+
+    def __init__(self, storage_id, methods):
+        self._storage_id = storage_id
+        self._methods = methods
+
+    def getId(self):
+        return self._storage_id
+
+    def getMethods(self):
+        return list(self._methods)
+
+
+class StorageHelperFake:
+    """Configurable counting stand-in for portal.vidispine.istorage.StorageHelper
+    (QueryElasticFake tradition, story 2.1).
+
+    Plugin code instantiates it freshly per call site (with the prod-verified
+    ``slug``/``user``/``runas`` keywords), so all state is CLASS-level:
+
+    - ``set_root(storage_id, root)`` configures a storage whose ``getMethods``
+      yields exactly one browse-capable method with that root URL;
+    - an UNCONFIGURED id resolves to a storage with no browse-capable method
+      (-> ``resolve_storages`` yields ``root_path=None``);
+    - ``set_missing(storage_id)`` makes ``getStorage`` raise NotFoundError;
+    - ``get_storage_calls`` counts ``getStorage`` per id for the
+      once-per-run acceptance criterion.
+
+    Only ``getStorage`` is implemented — any other method access still
+    raises AttributeError, keeping tests off-server honest. The conftest
+    autouse fixture resets the class state after every test. The story-1.3
+    pins bypass this fake entirely (preset ``_root_path``, ``context=None``
+    -> property fallback never reaches a StorageHelper).
     """
+
+    roots = {}
+    missing = set()
+    get_storage_calls = {}
+
+    def __init__(self, slug=None, user=None, runas=None):
+        self.slug = slug
+        self.user = user
+        self.runas = runas
+
+    @classmethod
+    def set_root(cls, storage_id, root):
+        cls.roots[storage_id] = root
+
+    @classmethod
+    def set_missing(cls, storage_id):
+        cls.missing.add(storage_id)
+
+    @classmethod
+    def reset(cls):
+        cls.roots.clear()
+        cls.missing.clear()
+        cls.get_storage_calls.clear()
+
+    def getStorage(self, storage_id):
+        cls = type(self)
+        cls.get_storage_calls[storage_id] = cls.get_storage_calls.get(storage_id, 0) + 1
+        if storage_id in cls.missing:
+            raise NotFoundError(f"storage {storage_id} not found (configured)")
+        if storage_id in cls.roots:
+            methods = [FakeStorageMethod(browse=True, url=cls.roots[storage_id])]
+        else:
+            methods = [FakeStorageMethod(browse=False)]
+        return FakeStorage(storage_id, methods)
 
 
 def _stub_class(name):
@@ -202,7 +279,7 @@ _MODULES = {
         "CollectionHelper": _stub_class("CollectionHelper")
     },
     "portal.vidispine.igroup": {"GroupHelper": _stub_class("GroupHelper")},
-    "portal.vidispine.istorage": {"StorageHelper": StorageHelper},
+    "portal.vidispine.istorage": {"StorageHelper": StorageHelperFake},
     "portal.vidispine.iuser": {"UserHelper": _stub_class("UserHelper")},
     "portal.vidispine.iexception": {
         "handleRestAPIError": _stub_callable(

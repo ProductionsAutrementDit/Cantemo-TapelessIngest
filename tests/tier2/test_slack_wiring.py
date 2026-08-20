@@ -16,7 +16,6 @@ import importlib
 
 import pytest
 from django.contrib.auth.models import User
-from django.core.cache import cache
 from django.core.management import call_command
 
 COMMANDS = ["scan_tapeless_dir", "check_clips_in_folder"]
@@ -79,7 +78,9 @@ def test_config_token_reaches_web_client(
     monkeypatch.setattr(module, "scan_tapeless_dir", lambda parent_folder, **kw: 0)
     monkeypatch.setattr(module, "ConfigParser", _stub_config_parser(token))
     monkeypatch.setattr(module, "WebClient", _RecordingWebClient)
-    cache.set("storage:VX-41", "VX-41", 300)
+    # No cache.set("storage:VX-41", ...) preset any more (story 2.1): tree
+    # mode resolves the storage through the counting StorageHelper fake in
+    # tests/portal_stub, and handle()'s log line reads the run context.
 
     user = User.objects.create(pk=4243, username=f"story15-wiring-{command}")
     try:
@@ -87,7 +88,6 @@ def test_config_token_reaches_web_client(
         constructed = module.logger
     finally:
         user.delete()  # keep the auth table empty for the unknown-user tests
-        cache.delete("storage:VX-41")
 
     if client_built:
         # The real CustomLogger built its client from the config token.

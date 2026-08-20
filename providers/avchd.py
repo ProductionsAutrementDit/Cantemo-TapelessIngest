@@ -8,11 +8,9 @@ class Provider(FileProvider):
         FileProvider.__init__(self)
         self.name = "AVCHD"
         self.machine_name = "avchd"
-            
+
     def getExtensions(self):
         return [".mts", ".m2ts", ".m2t"]
 
     def getSubPaths(self):
-        return [
-                "((PRIVATE/)?AVCHD/)?BDMV/STREAM"
-            ]
+        return ["((PRIVATE/)?AVCHD/)?BDMV/STREAM"]

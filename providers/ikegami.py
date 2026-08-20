@@ -143,7 +143,7 @@ class Provider(BaseProvider):
 
     def getMetadatasFromFile(self, media_file, metadatas, context):
         filename, file_extension = os.path.splitext(media_file.getFileName())
-        media_absolute_path = self.get_file_absolute_path(media_file)
+        media_absolute_path = self.get_file_absolute_path(media_file, context)
         media_dirname = os.path.dirname(media_absolute_path)
         clip_xml = None
         # Get Metadata File
