@@ -43,13 +43,30 @@ from portal.plugins.TapelessIngest.helpers import TapelessIngestException
 
 SLACK_ACCESS_TOKEN = None
 
+# Slack chat.postMessage limits (docs.slack.dev, fetched 2026-08-20): the
+# `text` field should be limited to 4,000 characters for readability, and
+# Slack silently truncates messages containing more than 40,000 characters
+# (there is no msg_too_long error). Chunk at the documented 4,000-character
+# limit so no chunk ever nears the hard-truncation cliff.
+SLACK_MAX_MESSAGE_LENGTH = 4000
+
 
 class CustomLogger:
     def __init__(self):
         self.messages = []
         # Logging through standard Cantemo logging, i.e. to /var/log/cantemo/portal/portal.log
         self.logger = logging.getLogger("portal.plugins.TapelessIngest")
-        self.slack_client = WebClient(token=SLACK_ACCESS_TOKEN)
+        self.slack_client = None
+        if SLACK_ACCESS_TOKEN:
+            try:
+                self.slack_client = WebClient(token=SLACK_ACCESS_TOKEN)
+            except Exception:
+                self.slack_client = None
+                self.logger.error(
+                    "Failed to build Slack client; Slack notification "
+                    "disabled for this run",
+                    exc_info=True,
+                )
 
     def log(self, message):
         print(message)
@@ -57,11 +74,49 @@ class CustomLogger:
         self.messages.append(message)
 
     def send_messages_to_slack(self):
-        all_messages = "\n".join(self.messages)
-        self.slack_client.chat_postMessage(
-            channel="pad-notifications-cantemo",
-            text=all_messages,
-        )
+        if self.slack_client is None:
+            self.logger.info(
+                "Slack notification skipped: no Slack client (no [slack] "
+                "ACCESS_TOKEN in portal.conf, or client construction failed)"
+            )
+            return
+        if not self.messages:
+            self.logger.info("Slack notification skipped: no messages to send")
+            return
+        # Greedy-pack whole messages (joined by newlines) into ordered
+        # chunks of at most SLACK_MAX_MESSAGE_LENGTH characters; a single
+        # message longer than the limit is hard-sliced into pieces.
+        chunks = []
+        current = ""
+        for message in self.messages:
+            pieces = [
+                message[i : i + SLACK_MAX_MESSAGE_LENGTH]
+                for i in range(0, len(message), SLACK_MAX_MESSAGE_LENGTH)
+            ] or [message]
+            for piece in pieces:
+                candidate = f"{current}\n{piece}" if current else piece
+                if len(candidate) <= SLACK_MAX_MESSAGE_LENGTH:
+                    current = candidate
+                else:
+                    chunks.append(current)
+                    current = piece
+        if current:
+            chunks.append(current)
+        # One boundary around the whole loop, abort on first failure: after
+        # a network/auth error the remaining sends would fail identically,
+        # and a notification failure must never propagate into the scan run.
+        try:
+            for index, chunk in enumerate(chunks, start=1):
+                self.slack_client.chat_postMessage(
+                    channel="pad-notifications-cantemo",
+                    text=chunk,
+                )
+        except Exception:
+            self.logger.error(
+                f"Slack notification failed on chunk {index}/{len(chunks)}; "
+                f"remaining chunks abandoned",
+                exc_info=True,
+            )
 
 
 logger = None
@@ -323,7 +378,7 @@ class Command(BaseCommand):
         # command start instead of import time.
         cp = ConfigParser()
         cp.read("/etc/cantemo/portal/portal.conf")
-        SLACK_ACCESS_TOKEN = cp.get("slack", "ACCESS_TOKEN")
+        SLACK_ACCESS_TOKEN = cp.get("slack", "ACCESS_TOKEN", fallback=None)
         logger = CustomLogger()
 
         storage = args.storage

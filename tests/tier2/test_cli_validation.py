@@ -99,17 +99,6 @@ class _CapturingLogger:
         pass
 
 
-class _AbsentConfigParser:
-    """Stands in for ConfigParser: /etc/cantemo/portal/portal.conf does not
-    exist on dev machines, so the real cp.get would raise NoSectionError."""
-
-    def read(self, path):
-        return []
-
-    def get(self, section, option):
-        return "portal-conf-absent-stub-token"
-
-
 @pytest.mark.parametrize("command", COMMANDS)
 def test_since_window_reaches_scan_only_filter(command, migrated_db, monkeypatch):
     """End-to-end wiring: the computed window must reach the scan's `only`.
@@ -117,11 +106,12 @@ def test_since_window_reaches_scan_only_filter(command, migrated_db, monkeypatch
     Guards the aliasing contract — `only = only + date_window` instead of
     `only += date_window` would silently disable the cron's --since filter
     while every pure-helper test stayed green. The command module's OWN
-    `scan_tapeless_dir`, `ConfigParser`, and `CustomLogger` attributes are
-    minimally monkeypatched (our module, sanctioned — not portal mocking;
-    story 1.5 makes absent config graceful, at which point the config
-    workaround can shrink), and the storage cache is pre-seeded so
-    Folder.storage never calls the no-op stub StorageHelper.
+    `scan_tapeless_dir` and `CustomLogger` attributes are minimally
+    monkeypatched (our module, sanctioned — not portal mocking; since story
+    1.5 the real config read tolerates an absent portal.conf via
+    fallback=None, so no ConfigParser stub is needed), and the storage
+    cache is pre-seeded so Folder.storage never calls the no-op stub
+    StorageHelper.
     """
     module = importlib.import_module(
         f"portal.plugins.TapelessIngest.management.commands.{command}"
@@ -133,7 +123,6 @@ def test_since_window_reaches_scan_only_filter(command, migrated_db, monkeypatch
         return 0
 
     monkeypatch.setattr(module, "scan_tapeless_dir", fake_scan)
-    monkeypatch.setattr(module, "ConfigParser", _AbsentConfigParser)
     monkeypatch.setattr(module, "CustomLogger", _CapturingLogger)
     cache.set("storage:VX-41", "VX-41", 300)
 
