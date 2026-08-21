@@ -133,11 +133,12 @@ def test_ingest_dry_run_key_superset(
     rel = "2026/AH_20260101_ingestkeys"
     (tmp_path / rel).mkdir(parents=True)
     (tmp_path / rel / "CLIPKEYS.fake").write_bytes(b"clip data")
-    # An already-ingested clip in the fixture makes the zeros below
+    # An already-ingested clip in the fixture makes the tuple below
     # DISCRIMINATING: it is exactly the clip the 2.5 ladder buckets
-    # `skipped` on a real run, so a dry run leaking ladder-skip counting
-    # would report skipped=1 here. Dry-run counters stay at today's
-    # baseline until story 2.7 redefines them as would-be counters.
+    # `skipped`, while CLIPKEYS is the one it selects. Story 2.7
+    # re-baselined this pin from the 2.5 baseline zeros to the WOULD-BE
+    # counters — a dry run that stopped counting the ladder would report
+    # (0, 0, 0, 0) again and fail here.
     (tmp_path / rel / "CLIPSEEN.fake").write_bytes(b"clip data")
     Clip(umid=f"{rel}/CLIPSEEN", item_id="VX-200").save()
 
@@ -156,12 +157,16 @@ def test_ingest_dry_run_key_superset(
 
     # ingest adds exactly ingested/skipped/failed/replaced to the scan keys.
     assert set(response.keys()) == INGEST_KEYS
+    # Story 2.7: `ingested`/`skipped` are the ladder's WOULD-BE verdict
+    # (CLIPKEYS would be submitted, CLIPSEEN would be skipped);
+    # `failed`/`replaced` stay 0 STRUCTURALLY — they are decided inside
+    # `Clip.import_file`, and no submission occurs under dry-run.
     assert (
         response["ingested"],
         response["skipped"],
         response["failed"],
         response["replaced"],
-    ) == (0, 0, 0, 0)
+    ) == (1, 1, 0, 0)
     assert response["processed"] == 2
     assert response["already_ingested"] == 1
     assert response["errors"] == []

@@ -514,7 +514,13 @@ class Command(BaseCommand):
                 context=context,
                 date_window=date_window,
             )
-            logger.log(f"{count} folders scanned")
+            # Story 2.7: a dry run rehearses every phase and reports the
+            # would-be counters, so the end-of-run summary must say which
+            # kind of run produced them — the same line reaches Slack.
+            if args.dryrun:
+                logger.log(f"DRY-RUN: {count} folders scanned — no changes were made")
+            else:
+                logger.log(f"{count} folders scanned")
         except Exception as e:
             logger.log(f"Error scanning {folder.path}: {e}")
         logger.send_messages_to_slack()

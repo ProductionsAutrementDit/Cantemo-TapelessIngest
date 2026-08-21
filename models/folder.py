@@ -906,22 +906,37 @@ class Folder(models.Model):
         # counters are added ON TOP of the scan keys, none is replaced.
         for key in ["ingested", "skipped", "failed", "replaced"]:
             response[key] = 0
-        if not dry_run:
-            # The ladder (AD-15): decide who is worth a Vidispine call
-            # BEFORE spending any. `has_hash` comes from the scan-cached
-            # file only — Clip.file would buy one getFileById per clip.
-            to_ingest, skipped_reasons = select_clips_to_ingest(
-                (_ingest_state(clip) for clip in response["clips"]),
-                providers=providers,
-                replace=replace,
-            )
-            for clip, reason in skipped_reasons:
-                # An item_id-bearing clip counted `skipped` before too —
-                # import_file's early return did it, several HTTP calls
-                # later. The hash-less one is new (NFR-1): no exception,
-                # no legacy match, no ingest, retried next run.
-                response["skipped"] += 1
-                log.info(f"Skipping clip {clip}: {_skip_reason_message(clip, reason)}")
+        # The ladder (AD-15): decide who is worth a Vidispine call
+        # BEFORE spending any. `has_hash` comes from the scan-cached
+        # file only — Clip.file would buy one getFileById per clip.
+        #
+        # Story 2.7: the ladder is PURE, so it runs in both modes and its
+        # verdict is counted in both. A dry run is a rehearsal that
+        # reports what a real run would do, not a mute one.
+        to_ingest, skipped_reasons = select_clips_to_ingest(
+            (_ingest_state(clip) for clip in response["clips"]),
+            providers=providers,
+            replace=replace,
+        )
+        for clip, reason in skipped_reasons:
+            # An item_id-bearing clip counted `skipped` before too —
+            # import_file's early return did it, several HTTP calls
+            # later. The hash-less one is new (NFR-1): no exception,
+            # no legacy match, no ingest, retried next run.
+            response["skipped"] += 1
+            log.info(f"Skipping clip {clip}: {_skip_reason_message(clip, reason)}")
+        if dry_run:
+            # WOULD-BE ingests. Every ladder-selected clip is one this run
+            # would have submitted — replacements included, because under
+            # dry-run there is no replacement OUTCOME to report: nothing
+            # was replaced. `failed`/`replaced` and the share of `skipped`
+            # that `Clip.import_file` decides on its own stay 0 for the
+            # same structural reason — no submission occurred. So dry-run
+            # `ingested` is an UPPER bound on a real run's and dry-run
+            # `skipped` a LOWER bound; they coincide exactly when every
+            # submission succeeds.
+            response["ingested"] += len(to_ingest)
+        else:
             if to_ingest:
                 # Collection resolution (a VS search/create per path level)
                 # is worth its calls only once a clip will actually ingest.

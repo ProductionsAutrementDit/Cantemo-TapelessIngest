@@ -91,13 +91,21 @@ def test_tree_run_resolves_each_storage_once(
         response_b["created"],
         response_b["errors"],
     ) == (1, 1, 1, [])
-    # ctx dry_run=True is authoritative for ingest: nothing is ingested.
+    # ctx dry_run=True is authoritative for ingest: nothing is SUBMITTED.
+    # Story 2.7 re-baselined what that looks like in the counters — the
+    # same superseded 2.5 clause as `test_ingest_dry_run_key_superset`,
+    # in a second place the 2.7 spec's Code Map did not enumerate. CLIPB
+    # is brand-new and hashed, so the ladder selects it and the dry run
+    # reports the WOULD-BE ingest; `failed`/`replaced` stay 0
+    # structurally, because no submission occurred. That nothing was
+    # really submitted is pinned in
+    # tests/tier2/test_dry_run_purity.py::test_ctx_authoritative_dry_run_is_pure.
     assert (
         response_b["ingested"],
         response_b["skipped"],
         response_b["failed"],
         response_b["replaced"],
-    ) == (0, 0, 0, 0)
+    ) == (1, 0, 0, 0)
 
     # Memo seeding: ingest-time clip.root_path reads the ctx-resolved root
     # with zero further storage calls (xdcam's clip.root_path consumer).
