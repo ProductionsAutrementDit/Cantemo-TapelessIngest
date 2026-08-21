@@ -49,13 +49,15 @@ import os
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, fields, replace
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from heapq import heappop, heappush
+from typing import Any, Callable, Dict, FrozenSet, List, Optional, Tuple
 
 from .verification import FolderListings
 
 __all__ = [
     "AD13_COUNTER_KEYS",
     "AD13_KEYS",
+    "MAX_IDLE_ROUNDS",
     "TIMING_PHASES",
     "TREE_ONLY_OPTIONS",
     "FolderOutcome",
@@ -107,10 +109,20 @@ TIMING_PHASES = (
     "ingest",
 )
 
-# Options that only tree mode may carry. Ships EMPTY: Epic 3 adds
-# `workers`, Epic 4 adds `discovery`. The constant exists now so the seam
-# — and its test — ship with the story that freezes the contract.
-TREE_ONLY_OPTIONS = ()
+# Options that only tree mode may carry. The four folder filters are
+# genuinely meaningless in paged mode — a paged call scans ONE folder and
+# never walks, so a `--skip`/`--only`/`--startWith`/date-window narrowing
+# could only mislead a caller into thinking it had been applied. Epic 3
+# adds `workers` and Epic 4 adds `discovery` to this tuple.
+TREE_ONLY_OPTIONS = ("skip", "only", "startwith", "date_window")
+
+# Safety valve for the fan-out seam (E29). A `gather()` that never reports
+# a dispatched item would otherwise spin forever with the stack empty and
+# work outstanding — a hung nightly run with no output. The sequential
+# dispatcher never idles at all, and Epic 3's blocking `as_completed`
+# gather will not either; only a BROKEN dispatcher reaches this, and it
+# fails loudly instead of hanging.
+MAX_IDLE_ROUNDS = 100_000
 
 
 # ---------------------------------------------------------------------------
@@ -217,12 +229,28 @@ class FolderOutcome:
     ``consumed_subdirs`` is 2.6's three-state descent authorization: a
     ``frozenset`` (descend into every child except these), or ``None``
     (DOUBT — descent is not authorized for this folder at all). The two
-    are NEVER interchangeable.
+    are NEVER interchangeable — which is exactly why the annotation is
+    ``Optional[FrozenSet[str]]`` and not ``Any``: the three states are the
+    contract, and a reader meets them here first.
+
+    ``merge_key`` travels WITH the outcome so the ordering guarantee is a
+    property of the data rather than of ``walk_tree`` happening to be the
+    only caller of ``merge_results``. ``()`` is the root container's key
+    and sorts first.
+
+    ``listings`` is the worker's own ``FolderListings`` handed back so the
+    walk can reuse it for this folder's subdirectory discovery instead of
+    paying a second ``os.scandir`` on the same directory (and reporting
+    the same failure twice). The walk drops it the moment it has expanded
+    the children — it must never be retained for the run, and Epic 3 must
+    not serialize it across a process boundary.
     """
 
     result: WorkerResult
-    consumed_subdirs: Any = None
+    consumed_subdirs: Optional[FrozenSet[str]] = None
     failed: bool = False
+    merge_key: Tuple[int, ...] = ()
+    listings: Any = None
 
 
 @dataclass(frozen=True)
@@ -314,16 +342,29 @@ def fold_timings(ctx, timings: FolderTimings):
 
 
 def merge_results(outcomes) -> RunResult:
-    """Fold outcomes into one ``RunResult``, in the order given.
+    """Fold outcomes into one ``RunResult``, in MERGE-KEY order.
 
-    ``walk_tree`` already returns its outcomes in merge-key order, so this
-    concatenates rather than re-sorts: counters and timings sum field-wise,
-    ``errors``/``log_lines`` concatenate in that order.
+    The sort happens HERE, not only in ``walk_tree``: the ordering
+    guarantee has to be a property of the outcomes themselves, or it holds
+    only for as long as ``walk_tree`` is the sole caller. Python's sort is
+    stable, so a caller handing over outcomes that all carry the default
+    ``()`` key gets its own order back untouched.
+
+    Counters and timings sum field-wise; ``errors``/``log_lines``
+    concatenate in merge-key order.
 
     Merged ``hits`` is the SUM of the per-folder ``counters.hits`` — never
     a query-level total. Epic 4's bucketed discovery matches that rule
     already: its ``regexp`` parent filter is anchored, so per-folder
     buckets are disjoint.
+
+    INHERITED DEFECT, named rather than hidden: each per-folder ``hits``
+    is the LAST PAGE's ``total``, not the folder's true match count — see
+    ``tests/pinned-bugs.md`` ("hits reflects only the last page's total"),
+    pinned by ``tests/tier1/test_scan_pagination.py``. Summing an
+    already-wrong number does not make it right; the sum is exactly as
+    accurate as the legacy per-folder figure the cron has always printed.
+    Epic 4's `search_after` discovery is where that gets fixed.
     """
     counters = WorkerCounters()
     timings = FolderTimings()
@@ -331,7 +372,7 @@ def merge_results(outcomes) -> RunResult:
     log_lines: List[str] = []
     folders_scanned = 0
     folders_failed = 0
-    for outcome in outcomes:
+    for outcome in sorted(outcomes, key=lambda outcome: outcome.merge_key):
         result = outcome.result
         counters = counters + result.counters
         timings = timings + result.timings
@@ -395,13 +436,30 @@ def build_ingest_response(outcome: FolderOutcome) -> Dict[str, Any]:
 def summary_lines(run_result: RunResult, ctx, elapsed: float) -> List[str]:
     """The end-of-run summary (supersedes 2.7's single-count string).
 
-    The window line deliberately does NOT start with ``"Scanning folders
-    from "``: that prefix belongs to the commands' ``format_window_log``,
-    which is emitted once at the start of the run and pinned as the only
-    line carrying it.
+    Three lines at most, in this order:
+
+    1. folders and time — including an ``other`` term, so the phases
+       RECONCILE with the printed wall clock instead of visibly failing
+       to. Three real per-folder costs sit outside the five timed phases
+       by design (the pass-2 bulk umid lookup, hash recovery's HTTP calls,
+       and the ``consumed_subdirs`` computation), and so does the walk's
+       own directory listing; ``other`` is all of it plus whatever else
+       the run spent. It is clamped at zero because under Epic 3 the phase
+       sums are worker-time and the elapsed is wall-clock, so the
+       difference legitimately goes negative once work overlaps — at which
+       point ``other`` stops being meaningful and says so by reading 0.0s.
+    2. the COUNTERS. `RunResult` knows all eight and the errors; a summary
+       that reported only folder counts made the operator open the log to
+       learn whether anything was ingested.
+    3. the window, when one is set. It deliberately does NOT start with
+       ``"Scanning folders from "``: that prefix belongs to the commands'
+       ``format_window_log``, emitted once at the start of the run and
+       pinned as the only line carrying it.
     """
     timings = run_result.timings
+    counters = run_result.counters
     prefix = "DRY-RUN: " if ctx.options.dry_run else ""
+    other = max(0.0, elapsed - sum(timings.as_dict().values()))
     lines = [
         f"{prefix}{run_result.folders_scanned} folders scanned, "
         f"{run_result.folders_failed} failed in {elapsed:.1f}s — "
@@ -409,7 +467,17 @@ def summary_lines(run_result: RunResult, ctx, elapsed: float) -> List[str]:
         f"verification {timings.verification:.1f}s, "
         f"extraction {timings.extraction:.1f}s, "
         f"persistence {timings.persistence:.1f}s, "
-        f"ingest {timings.ingest:.1f}s"
+        f"ingest {timings.ingest:.1f}s, "
+        f"other {other:.1f}s",
+        f"{prefix}{counters.hits} clips found, "
+        f"{counters.created} created, "
+        f"{counters.already_ingested} already ingested, "
+        f"{counters.processed} processed, "
+        f"{counters.ingested} ingested, "
+        f"{counters.skipped} skipped, "
+        f"{counters.failed} failed, "
+        f"{counters.replaced} replaced, "
+        f"{len(run_result.errors)} errors",
     ]
     date_window = getattr(ctx.options, "date_window", ()) or ()
     if date_window:
@@ -514,17 +582,41 @@ class SequentialDispatcher:
         return done
 
 
-def _child_items(ctx, storage_id, path, depth, merge_key, consumed, options):
+def _child_items(
+    ctx,
+    storage_id,
+    path,
+    depth,
+    merge_key,
+    consumed,
+    options,
+    *,
+    listings=None,
+    seen_real_paths=None,
+):
     """The eligible children of one folder, plus the lines to surface.
 
-    2.6's rules, relocated verbatim: one ``FolderListings`` per walk
-    level, ``sorted(listing.dirs)`` (symlinked directories excluded —
-    FR-24's cycle guard), the ``consumed`` skip, and scandir failures
-    surfaced instead of degrading to a silently empty directory (FR-22).
+    2.6's rules, relocated verbatim: ``sorted(listing.dirs)`` (symlinked
+    directories excluded — FR-24's cycle guard), the ``consumed`` skip,
+    and scandir failures surfaced instead of degrading to a silently empty
+    directory (FR-22).
 
     The ordinal is the child's index in the FULL ``sorted(listing.dirs)``,
     assigned before the filters run: the merge key must be a property of
     the tree, not of which filters a particular run was given.
+
+    ``listings`` is the worker's own cache when there is one. Reusing it
+    saves the second ``os.scandir`` of a directory the worker has already
+    listed for verification — and, because only listing errors this call
+    NEWLY discovered are reported, it also stops the same
+    ``Error listing directory`` string being appended twice.
+
+    ``seen_real_paths`` is the run-wide realpath set (NFR-1). A bind mount
+    or a hardlinked directory gives one physical tree two distinct paths;
+    walking both means two scans racing to ingest the same clips before
+    either has written a row, which the umid primary key cannot save us
+    from because both passes read "absent" first. FR-24's symlink guard
+    does not cover this: these are real directories.
     """
     lines = []
     absolute_path = ctx.absolute_path_for(storage_id, path)
@@ -532,13 +624,18 @@ def _child_items(ctx, storage_id, path, depth, merge_key, consumed, options):
         # FR-28: an unresolvable storage is reported and this branch stops
         # here, instead of os.scandir(False) raising out of the run.
         lines.append(f"Cannot get full path from storage {storage_id}, path {path}")
-        return (), lines
-    listings = FolderListings()
+        return (), lines, True
+    if listings is None:
+        listings = FolderListings()
+    known_errors = set(listings.errors())
     listing = listings.get(absolute_path)
     for listing_path, listing_error in sorted(listings.errors().items()):
+        if listing_path in known_errors:
+            # The worker already reported it into this folder's errors.
+            continue
         lines.append(f"Error listing directory {listing_path}: {listing_error}")
     if listing.error is not None:
-        return (), lines
+        return (), lines, True
     # Depth-1 filters are simply not passed below depth 1 (FR-20); the
     # operator's own two apply at every depth.
     startwith = getattr(options, "startwith", ()) if depth == 1 else ()
@@ -557,6 +654,15 @@ def _child_items(ctx, storage_id, path, depth, merge_key, consumed, options):
             date_window=date_window,
         ):
             continue
+        if seen_real_paths is not None:
+            real_path = os.path.realpath(os.path.join(absolute_path, name))
+            if real_path in seen_real_paths:
+                lines.append(
+                    f"Already walked {os.path.join(path, name)} "
+                    f"through another path ({real_path}); not scanning it twice"
+                )
+                continue
+            seen_real_paths.add(real_path)
         items.append(
             WorkItem(
                 storage_id=storage_id,
@@ -565,7 +671,11 @@ def _child_items(ctx, storage_id, path, depth, merge_key, consumed, options):
                 merge_key=merge_key + (ordinal,),
             )
         )
-    return tuple(items), lines
+    # Third value: whether the EXPANSION ITSELF failed. `lines` alone
+    # cannot say — a realpath-dedupe note is an anomaly worth reporting on
+    # a folder that expanded perfectly well, and treating it as a failure
+    # would invent a failed root out of a bind mount.
+    return tuple(items), lines, False
 
 
 def _with_extra_lines(outcome: FolderOutcome, lines) -> FolderOutcome:
@@ -589,6 +699,43 @@ def _with_extra_lines(outcome: FolderOutcome, lines) -> FolderOutcome:
     )
 
 
+def _walk_failure(path, merge_key, lines) -> FolderOutcome:
+    """A folder-shaped failure the WALK produced, not the worker.
+
+    Used for the root container and for a ``dispatch()`` that raised. It
+    is ``failed=True`` and its lines land in both ``errors`` and
+    ``log_lines``, so the run reports it exactly like a worker-side
+    folder-boundary failure — a root path that has gone missing must not
+    read as "0 folders scanned, 0 failed", which is indistinguishable from
+    an empty tree.
+    """
+    return FolderOutcome(
+        result=WorkerResult(
+            folder_path=path,
+            errors=tuple(lines),
+            log_lines=tuple(lines),
+        ),
+        consumed_subdirs=None,
+        failed=True,
+        merge_key=merge_key,
+    )
+
+
+def _drop_clips(outcome: FolderOutcome) -> FolderOutcome:
+    """Strip the live ``Clip`` objects from an outcome the walk will keep.
+
+    Prod holds 188,082 clips across 8,133 folders. ``RunResult`` was given
+    no ``clips`` field for exactly that reason — but the walk accumulates
+    every ``FolderOutcome`` until it returns, so dropping them only at
+    merge time retained the whole corpus anyway. Tree mode never hands an
+    outcome to a façade, so the clips are dead the moment the worker's
+    own ``consumed_subdirs`` computation is done with them.
+    """
+    if not outcome.result.clips:
+        return outcome
+    return replace(outcome, result=replace(outcome.result, clips=()))
+
+
 def walk_tree(
     root_storage_id,
     root_path,
@@ -597,29 +744,67 @@ def walk_tree(
     process_folder,
     dispatch,
     gather,
+    emit: Callable[[str], None],
     depth: int = 1,
-    emit: Optional[Callable[[str], None]] = None,
 ) -> List[FolderOutcome]:
     """Walk the tree under ``root_path``, returning outcomes in merge order.
 
     ``depth`` is the depth assigned to the ROOT's enqueued children, not
     the root's own: the root folder is a container, never handed to
-    ``process_folder`` and never counted, so the default ``1`` gives its
-    children depth 1 and the depth-1 filters apply to them exactly as they
-    did before this story.
+    ``process_folder`` and never counted as scanned, so the default ``1``
+    gives its children depth 1 and the depth-1 filters apply to them
+    exactly as they did before this story. (A root that cannot be LISTED
+    is a different matter — that is a run failure and is counted as one.)
 
     Fan-out is an explicit work queue. Children are enqueued by the
     COORDINATOR when a parent's outcome authorizes descent — a worker
     never submits work, which is what lets ``dispatch``/``gather`` become
     a real pool in Epic 3 without touching anything else.
 
-    ``emit`` is used for exactly one thing: surfacing the ROOT container's
-    own listing failure, which has no ``FolderOutcome`` to ride on (the
-    root is never processed) and by construction happens before any folder
-    line. Every other line rides in a ``WorkerResult``.
+    ``emit`` is REQUIRED, and lines are drained INCREMENTALLY: a folder's
+    log lines go out as soon as every folder that sorts before it has
+    completed. An 8,000-folder run that printed nothing until the walk
+    returned gave the operator no way to tell a slow run from a hung one.
+    The emission order is still exactly merge-key order, so a sequential
+    run and a pooled one produce byte-identical output — the incremental
+    release is a lower bound computed from what is still outstanding, not
+    a guess.
     """
     options = ctx.options
-    completed: List[Tuple[Tuple[int, ...], FolderOutcome]] = []
+    released: List[FolderOutcome] = []
+    # merge_key -> outcome, for keys completed but not yet releasable.
+    completed: Dict[Tuple[int, ...], FolderOutcome] = {}
+    # Min-heaps over merge keys. `pending` is every key enqueued or in
+    # flight; `ready` is every key completed and awaiting release. A key
+    # may be released once it is smaller than every pending key, because
+    # any key discovered LATER is a descendant of something pending and a
+    # descendant always sorts after its ancestor.
+    pending_heap: List[Tuple[int, ...]] = []
+    pending_keys = set()
+    ready: List[Tuple[int, ...]] = []
+    # NFR-1: one physical directory is walked once, whichever path reached
+    # it. Seeded with the root so a child that loops back cannot re-enter.
+    seen_real_paths = set()
+
+    def enqueue(items):
+        for item in items:
+            pending_keys.add(item.merge_key)
+            heappush(pending_heap, item.merge_key)
+
+    def record(outcome: FolderOutcome):
+        pending_keys.discard(outcome.merge_key)
+        completed[outcome.merge_key] = _drop_clips(replace(outcome, listings=None))
+        heappush(ready, outcome.merge_key)
+
+    def release():
+        while pending_heap and pending_heap[0] not in pending_keys:
+            heappop(pending_heap)  # lazily purge keys already completed
+        floor = pending_heap[0] if pending_heap else None
+        while ready and (floor is None or ready[0] < floor):
+            outcome = completed.pop(heappop(ready))
+            for line in outcome.result.log_lines:
+                emit(line)
+            released.append(outcome)
 
     def run(item: WorkItem) -> FolderOutcome:
         # Tree mode's calling convention: one complete pass over the whole
@@ -637,7 +822,10 @@ def walk_tree(
             ingest=True,
         )
 
-    root_items, root_lines = _child_items(
+    root_absolute = ctx.absolute_path_for(root_storage_id, root_path)
+    if root_absolute:
+        seen_real_paths.add(os.path.realpath(root_absolute))
+    root_items, root_lines, root_failed = _child_items(
         ctx,
         root_storage_id,
         root_path,
@@ -645,8 +833,17 @@ def walk_tree(
         (),
         frozenset(),
         options,
+        seen_real_paths=seen_real_paths,
     )
-    if emit is not None:
+    if root_failed:
+        # The root has no worker outcome to ride on, so its failure gets
+        # one of its own — counted, not merely printed. A run over a root
+        # that has gone missing must not read as "0 scanned, 0 failed".
+        record(_walk_failure(root_path, (), root_lines))
+    elif root_lines:
+        # Notes, not a failure (a realpath-deduped child). They belong to
+        # the container, which has no outcome, so they go out directly —
+        # before any folder line, deterministically.
         for line in root_lines:
             emit(line)
     # LIFO, children pushed reversed: the sequential run's DISPATCH order
@@ -654,19 +851,48 @@ def walk_tree(
     # on it (that is the merge key's job), but a cron log that reads the
     # same as yesterday's is worth the two characters.
     stack: List[WorkItem] = list(reversed(root_items))
-    pending = 0
-    while stack or pending:
+    enqueue(root_items)
+    release()
+    idle_rounds = 0
+    while stack or pending_keys:
         if stack:
-            dispatch(run, stack.pop())
-            pending += 1
-        for done_item, outcome in gather():
-            pending -= 1
+            item = stack.pop()
+            try:
+                dispatch(run, item)
+            except Exception as e:
+                # A raising dispatcher must not take the run's completed
+                # work with it. `process_folder` never raises, so this is
+                # the POOL failing (a rejected submission, a dead worker),
+                # and the honest report is one failed folder plus a run
+                # that keeps going.
+                record(
+                    _walk_failure(
+                        item.path,
+                        item.merge_key,
+                        [f"Error scanning {item.path}: {e}"],
+                    )
+                )
+                release()
+                continue
+        batch = list(gather())
+        if batch:
+            idle_rounds = 0
+        elif not stack:
+            idle_rounds += 1
+            if idle_rounds > MAX_IDLE_ROUNDS:
+                raise RuntimeError(
+                    f"walk_tree made no progress in {MAX_IDLE_ROUNDS} rounds "
+                    f"with {len(pending_keys)} folder(s) still outstanding: "
+                    f"gather() is not reporting dispatched work"
+                )
+        for done_item, outcome in batch:
+            outcome = replace(outcome, merge_key=done_item.merge_key)
             if outcome.consumed_subdirs is None:
                 # DOUBT: descent is not authorized for this folder. The
                 # reason is already in its errors (2.6).
-                completed.append((done_item.merge_key, outcome))
+                record(outcome)
                 continue
-            children, lines = _child_items(
+            children, lines, _failed = _child_items(
                 ctx,
                 done_item.storage_id,
                 done_item.path,
@@ -674,11 +900,15 @@ def walk_tree(
                 done_item.merge_key,
                 outcome.consumed_subdirs,
                 options,
+                listings=outcome.listings,
+                seen_real_paths=seen_real_paths,
             )
-            completed.append((done_item.merge_key, _with_extra_lines(outcome, lines)))
+            enqueue(children)
+            record(_with_extra_lines(outcome, lines))
             stack.extend(reversed(children))
-    completed.sort(key=lambda pair: pair[0])
-    return [outcome for _, outcome in completed]
+        release()
+    release()
+    return released
 
 
 # ---------------------------------------------------------------------------

@@ -278,6 +278,10 @@ def _folder_worker(folder, ctx, *, first, number, cursor, count_only, ingest):
         # Per-file errors never fail a FOLDER — today's `count += 1` counted
         # a zero-hit folder with two unreadable files as scanned.
         failed=False,
+        # The worker's own directory cache, so the walk does not scandir
+        # this folder a second time to find its children. The coordinator
+        # drops it as soon as it has expanded them.
+        listings=response.get("_listings"),
     )
 
 
@@ -781,16 +785,32 @@ class Folder(models.Model):
         ``timer`` is this folder's own accumulator — never the run's shared
         ``ctx.timings``, which has exactly one writer.
         """
-        providers = scan_context.options.providers
+        requested_providers = scan_context.options.providers
         legacy_storages = scan_context.options.legacy_storages
         # The context carries the registry and its extension map. When the
         # registry could not be built (an unresolvable provider name), this
         # fallback is where that name raises, as it always has.
         provider_list = providers_for_worker(scan_context)
         if provider_list is None:
-            provider_list = Clip._get_provider_list(providers)
+            provider_list = Clip._get_provider_list(requested_providers)
         extension_map = scan_context.extension_map
-        providers = []
+        # Two DIFFERENT things, and before this round they shared the name
+        # `providers`: the run's requested provider FILTER (above) and the
+        # provider NAMES this pass actually saw claim a clip (below, the
+        # `Folder.providers` column and the log line). One name for two
+        # opposite meanings is how a reader mistakes the second for the
+        # first — which is exactly the confusion that let layer (b) be fed
+        # from a last-writer-wins name.
+        matched_provider_names = []
+        # The provider INSTANCES that contributed to any clip in this
+        # folder, registry-ordered and deduplicated by identity. This is
+        # what consumed_subdirs' layer (b) needs: a file can legitimately
+        # be claimed by SEVERAL providers (AD-7/FR-14 — xdcam plus exif is
+        # the standing example), and `metadatas["provider"]` records only
+        # the last one to write it, so deriving the matched set from that
+        # name silently dropped every co-matching provider's sub-paths and
+        # left their directories open to descent.
+        matched_providers = []
         response = {
             "clips": [],
             "hits": 0,
@@ -810,7 +830,15 @@ class Folder(models.Model):
         # paged call has seen one page out of an unknown number (or starts
         # part-way in), so neither can say what was consumed — both stay
         # DOUBT. Captured here because the page loop mutates `first`.
-        complete_pass = not count_only and number == 0 and first == 0
+        #
+        # Loop EXIT is not the same thing as completeness, which is what
+        # this used to rely on: the page loop also ends when a page comes
+        # back SHORT, which is what a truncated or shifting index looks
+        # like. That left an incomplete consumed set authorizing descent —
+        # under-consumption, the duplicate direction. `seen_hits` below
+        # counts what was actually consumed and the check moves to the end.
+        may_be_complete = not count_only and number == 0 and first == 0
+        seen_hits = 0
         root_path = scan_context.root_path_for(self.storage_id)
         if not root_path:
             # Context miss / falsy root falls back to today's property
@@ -863,6 +891,7 @@ class Folder(models.Model):
                 hits = search_result["hits"]["hits"]
                 response["hits"] = search_result["hits"]["total"]["value"]
                 self.clips_total = response["hits"]
+                seen_hits += len(hits)
                 if number == 0 and len(hits) == result_number:
                     has_next = True
                     first += result_number
@@ -911,14 +940,20 @@ class Folder(models.Model):
                                 file_providers = applicable_providers(
                                     file.getFileName(), extension_map
                                 )
+                            # `matched` is an out-parameter: every provider
+                            # that CONTRIBUTED to this file, not just the
+                            # last one to write `metadatas["provider"]`.
+                            matched = []
                             with timer("extraction"):
                                 metadatas = Clip.extract_file_metadatas(
                                     file,
                                     file_providers,
                                     provider_context,
+                                    matched=matched,
                                 )
                             record["file"] = file
                             record["metadatas"] = metadatas
+                            record["matched"] = matched
                         except Exception as e:
                             traceback.print_exc()
                             record["error"] = (
@@ -981,8 +1016,20 @@ class Folder(models.Model):
                             # read after recovery.
                             if clip.item_id:
                                 response["already_ingested"] += 1
-                            if clip.metadatas["provider"] not in providers:
-                                providers.append(clip.metadatas["provider"])
+                            if clip.metadatas["provider"] not in matched_provider_names:
+                                matched_provider_names.append(
+                                    clip.metadatas["provider"]
+                                )
+                            # Layer (b)'s real input: the union of every
+                            # provider that contributed to any clip here,
+                            # by IDENTITY (two instances of one class must
+                            # rank separately, as ExtensionMap already
+                            # assumes).
+                            for provider in record["matched"]:
+                                if not any(
+                                    known is provider for known in matched_providers
+                                ):
+                                    matched_providers.append(provider)
                             response["clips"].append(clip)
                             provider_context["clips"].append(clip)
                             candidates.append(
@@ -999,11 +1046,18 @@ class Folder(models.Model):
                                 f"Error scanning file "
                                 f"{record['result']['_source']['path']}: {e}"
                             )
-                    self.provider_names = ",".join(providers)
+                    self.provider_names = ",".join(matched_provider_names)
                     self.scanned_on = timezone.now()
+            # The listings cache is handed back to the coordinator so the
+            # walk can reuse it for subdirectory discovery instead of
+            # scanning this directory a second time (and reporting the same
+            # failure twice). Private key: the façades never see it —
+            # `build_scan_response` rebuilds from the WorkerResult.
+            response["_listings"] = listings
             # The one write unit for this folder (AD-6): every page's
             # clips, one transaction, a bounded number of statements —
             # and the Folder row written at most once per invocation.
+            persistence_failed = False
             try:
                 with timer("persistence"):
                     persist_scan_results(
@@ -1014,7 +1068,7 @@ class Folder(models.Model):
                                 field_name: getattr(self, field_name)
                                 for field_name in FOLDER_SCAN_FIELDS
                             },
-                            provider_hits=len(providers),
+                            provider_hits=len(matched_provider_names),
                             recovered_item_ids=recovered_item_ids,
                         ),
                         dry_run=scan_context.options.dry_run,
@@ -1026,6 +1080,7 @@ class Folder(models.Model):
                 # remaining work for it) down silently, with the scan's
                 # own counters already claiming success.
                 traceback.print_exc()
+                persistence_failed = True
                 response["errors"].append(
                     f"Error persisting scan results for {self.path}: {e}"
                 )
@@ -1036,26 +1091,45 @@ class Folder(models.Model):
                 response["errors"].append(
                     f"Error listing directory {listing_path}: {listing_error}"
                 )
-            if complete_pass:
-                # `providers` holds the matched provider NAMES this pass
-                # accumulated; layer (b) needs the instances behind them.
-                matched_names = set(providers)
-                matched_providers = [
-                    provider
-                    for provider in provider_list
-                    if getattr(provider, "machine_name", None) in matched_names
-                ]
+            if persistence_failed:
+                # NFR-1. A rolled-back write unit means this folder has NO
+                # rows — so:
+                #  * the clips must not travel on. `_ingest_pass` would
+                #    otherwise submit them, and `Clip.ingest`'s
+                #    `persist_ingest_state` would fall back to a full
+                #    `save()` — writing rows through the path AD-6 exists
+                #    to avoid, and, far worse, creating a Vidispine item
+                #    whose `item_id` no row records. The next run would
+                #    then ingest the same clip again;
+                #  * and descent is NOT authorized. A folder that did not
+                #    record what it found cannot vouch for what it
+                #    consumed, and descending on that would be the
+                #    under-consuming direction.
+                response["clips"] = []
+                response["consumed_subdirs"] = None
+                response["errors"].append(
+                    f"Not descending into {self.path}: its scan results were "
+                    f"not written, so what its clips consumed is unknown"
+                )
+            elif may_be_complete and seen_hits >= response["hits"]:
+                # Loop exit alone is not completeness (a SHORT page ends the
+                # loop too); this folder authorized descent only after
+                # actually consuming every hit the index reported.
                 reasons = []
                 try:
-                    consumed = consumed_subdirs(
-                        response["clips"],
-                        matched_providers,
-                        # STORAGE-ROOT-RELATIVE, never absolute_path: the
-                        # same coordinate system as Clip.path and
-                        # VSFile.getPath(). See consumed_subdirs.
-                        self.path,
-                        reasons=reasons,
-                    )
+                    with timer("extraction"):
+                        consumed = consumed_subdirs(
+                            response["clips"],
+                            # The per-clip matched provider INSTANCES, not
+                            # the last-writer-wins names: several providers
+                            # legitimately claim one file (AD-7/FR-14).
+                            matched_providers,
+                            # STORAGE-ROOT-RELATIVE, never absolute_path: the
+                            # same coordinate system as Clip.path and
+                            # VSFile.getPath(). See consumed_subdirs.
+                            self.path,
+                            reasons=reasons,
+                        )
                 except Exception as e:
                     # NFR-1 tie-break: anything unexpected here is DOUBT —
                     # never a partial set, and never a crashed folder.
@@ -1068,6 +1142,13 @@ class Folder(models.Model):
                         f"Cannot compute consumed subdirs for {self.path}: {reason}"
                     )
                 response["consumed_subdirs"] = consumed
+            elif may_be_complete:
+                # The pages stopped short of the reported total.
+                response["errors"].append(
+                    f"Not descending into {self.path}: the index reported "
+                    f"{response['hits']} files but only {seen_hits} were "
+                    f"returned, so what its clips consumed is unknown"
+                )
         else:
             self.error = (
                 f"Cannot get full path from storage {self.storage_id}, path {self.path}"
@@ -1222,11 +1303,13 @@ class Folder(models.Model):
         """Tree mode's entry point — and the coordinator's (AD-12/AD-14).
 
         This IS the coordinator: it brackets the run with
-        ``time.monotonic()``, runs the walk, drains every folder's log
-        lines through ``emit`` in merge-key order, folds the merged
-        timings into ``ctx.timings`` (the only writer of that slot) and
-        emits the summary. ``handle()`` does none of it — it calls this
-        and then makes its single Slack call.
+        ``time.monotonic()``, runs the walk — which drains every folder's
+        log lines through ``emit`` in merge-key order AS THEY BECOME
+        RELEASABLE, so an 8,000-folder run reports as it goes instead of
+        printing nothing for hours — folds the merged timings into
+        ``ctx.timings`` (the only writer of that slot) and emits the
+        summary. ``handle()`` does none of it — it calls this and then
+        makes its single Slack call.
 
         ``emit`` is keyword-only and deliberately NOT a field on
         ``ScanContext``: workers receive ``ctx``, so keeping the sink off
@@ -1244,6 +1327,21 @@ class Folder(models.Model):
             assert_mode_options(ctx.options, "tree")
         except ValueError as e:
             raise TapelessIngestException(str(e)) from e
+        if ctx.options.user is None:
+            # The pre-2.8 walk logged "User has to be provided" and carried
+            # on, so a real run reaching the pipeline with no user failed
+            # per clip, deep inside `Clip.ingest`, with no explanation. A
+            # run that will WRITE fails fast instead: `getCollection(user)`
+            # and every `clip.ingest(user=...)` need one. A dry run
+            # genuinely does not — it submits nothing — so it keeps the
+            # warning and rehearses.
+            if ctx.options.dry_run:
+                emit("User has to be provided (dry run: nothing would be submitted)")
+            else:
+                raise TapelessIngestException(
+                    "User has to be provided: an ingesting run cannot resolve "
+                    "a collection or submit a clip without one"
+                )
         started = time.monotonic()
         # The sequential fan-out. Epic 3 substitutes executor.submit /
         # as_completed for these two bound methods and changes nothing
@@ -1259,9 +1357,11 @@ class Folder(models.Model):
             gather=dispatcher.gather,
             emit=emit,
         )
+        # `walk_tree` already emitted every folder line, incrementally and
+        # in merge-key order; `run_result.log_lines` is the same sequence
+        # kept for callers that want it as data. Emitting it here too would
+        # print the whole run twice.
         run_result = merge_results(outcomes)
-        for line in run_result.log_lines:
-            emit(line)
         fold_timings(ctx, run_result.timings)
         for line in summary_lines(run_result, ctx, time.monotonic() - started):
             emit(line)

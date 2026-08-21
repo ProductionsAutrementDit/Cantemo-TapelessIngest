@@ -27,6 +27,8 @@ from portal.plugins.TapelessIngest.models.folder import Folder
 from portal.plugins.TapelessIngest.providers import PROVIDER_NAMES
 from portal.plugins.TapelessIngest.scan import adapters
 
+log = logging.getLogger(__name__)
+
 SLACK_ACCESS_TOKEN = None
 
 # FR-37: the ONE source difference between this command and its read-only
@@ -220,13 +222,16 @@ class Command(BaseCommand):
             "--skip",
             nargs="+",
             default=[],
-            help="Skip folders containing these values",
+            help="Skip folders containing these values (substring match, "
+            "applied at EVERY depth)",
         )
         parser.add_argument(
             "--only",
             nargs="+",
             default=[],
-            help="Only scan folders containing these values",
+            help="Only scan folders containing these values (substring match, "
+            "applied at EVERY depth — a shoot folder's card subdirectories "
+            "must match too, or the walk stops at the shoot folder)",
         )
         # Only scan folders from this date
         parser.add_argument(
@@ -341,15 +346,39 @@ class Command(BaseCommand):
         # has one, else the raw storage id.
         storage_info = context.storages.get(storage)
         storage_label = storage_info.storage if storage_info is not None else storage
+        # The date window is named here too: since story 2.6 it is a filter
+        # of its own rather than being folded into --only, so a banner that
+        # listed only `only` understated what the run would actually scan.
+        window_label = f"{date_window[0]}..{date_window[-1]}" if date_window else None
         logger.log(
-            f"Scanning folder {folder.path} on storage {storage_label}, with user {user}, starting with {' or '.join(args.startWith)} using only {only}, skipping {args.skip}",
+            f"Scanning folder {folder.path} on storage {storage_label}, with user {user}, starting with {' or '.join(args.startWith)} using only {only}, skipping {args.skip}, date window {window_label}",
         )
+        run_result = None
+        walk_raised = False
         try:
             # Story 2.8: the walk, the per-folder emission, the timing fold
             # and the end-of-run summary all live in the coordinator now.
-            # This command owns exactly two things: building the context
-            # and flushing Slack once.
-            folder.scan_tree(context, emit=logger.log)
+            # This command owns exactly three things: building the context,
+            # flushing Slack once, and setting the exit status.
+            run_result = folder.scan_tree(context, emit=logger.log)
         except Exception as e:
+            # exc_info: the operator-visible line says WHAT failed, the
+            # traceback in portal.log says where. Before this round only
+            # the first existed, so a run that died in the walk left no way
+            # to find out why.
+            walk_raised = True
+            log.error(f"Error scanning {folder.path}: {e}", exc_info=True)
             logger.log(f"Error scanning {folder.path}: {e}")
         logger.send_messages_to_slack()
+        # Cron reads the exit status, and nothing else. A run in which every
+        # folder failed used to exit 0, indistinguishable from a clean one —
+        # and so did a run the walk died in. Slack is flushed FIRST: the
+        # report is the only thing that says what actually happened.
+        if walk_raised:
+            raise CommandError(f"Scan of {folder.path} did not complete")
+        if run_result is not None and run_result.folders_failed:
+            raise CommandError(
+                f"{run_result.folders_failed} of "
+                f"{run_result.folders_scanned + run_result.folders_failed} "
+                f"folder(s) failed; see the run report above"
+            )

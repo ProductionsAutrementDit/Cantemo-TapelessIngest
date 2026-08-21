@@ -214,6 +214,15 @@ def _captured_sql():
     the wrapper sits under the cursor, so it sees ``bulk_create`` and
     ``queryset.update`` whatever the DEBUG setting and whatever the
     query-log truncation does.
+
+    THREAD-LOCAL, and that matters for Epic 3. ``django.db.connection`` is
+    a per-thread proxy, so this watches only the statements the CALLING
+    thread issues. The moment the coordinator runs `process_folder` on a
+    worker pool, every write those workers make happens on a different
+    connection and this wrapper sees NOTHING — the purity assertions would
+    keep passing while proving nothing at all. When that lands, this has
+    to move to a ``connection_created`` signal handler that installs the
+    wrapper on each new connection as it appears.
     """
     statements = []
 
@@ -587,7 +596,7 @@ PER_FOLDER_TIMINGS = FolderTimings(
 SUMMARY_TAIL = (
     r"7 folders scanned, 0 failed in \d+\.\ds — "
     r"discovery 3\.5s, verification 7\.0s, extraction 1\.4s, "
-    r"persistence 0\.0s, ingest 14\.0s$"
+    r"persistence 0\.0s, ingest 14\.0s, other \d+\.\ds$"
 )
 
 
@@ -622,6 +631,12 @@ def test_summary_line_is_labelled_under_dryrun(
     ``merge_results``, real ``fold_timings``, real ``summary_lines``, real
     ``CustomLogger.log``, real ``handle()``. The only thing the double
     decides is how many folders the walk found.
+
+    The final review round added an ``other`` term to the phase line (the
+    phases must reconcile with the printed wall clock) and a second,
+    equally labelled counters line. Both are matched here: the tail regex
+    is ``$``-anchored, so the counters line does not satisfy it and the
+    "exactly one summary" assertion still means what it says.
     """
     import importlib
 

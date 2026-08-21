@@ -223,17 +223,44 @@ def applicable_providers(filename, extension_map):
     return tuple(matched)
 
 
-def extract_metadatas(media_file, providers, metadatas, context):
+def _contributed(before, metadatas, result):
+    """Did this provider's call put anything into ``metadatas``?
+
+    Deliberately BROAD — any change to the merged dict counts, not just a
+    provider naming itself in ``metadatas["provider"]``. The answer feeds
+    ``consumed_subdirs``' layer (b), where over-approximating the matched
+    set consumes more directories, and NFR-1's tie-break says that is the
+    safe direction. A value whose ``__eq__`` misbehaves is likewise read
+    as "contributed" rather than allowed to take the file down.
+    """
+    if result and result is not metadatas:
+        return True
+    try:
+        return metadatas != before
+    except Exception:
+        return True
+
+
+def extract_metadatas(media_file, providers, metadatas, context, matched=None):
     """Run every applicable provider and merge its contribution.
 
     ``context`` stays an argument and stays provider-mutable in place
     (xdcam's ``mediapro_xml`` cache relies on it); providers return the
     metadatas only.
+
+    ``matched`` is an optional out-list. Every provider that CONTRIBUTED
+    to this file is appended to it, in registry order. That is the
+    multi-provider contract made observable (AD-7/FR-14): a file can be
+    claimed by several providers at once — xdcam plus exif is the standing
+    example — and ``metadatas["provider"]`` keeps only the last writer's
+    name, so it is not a sound basis for deciding which providers'
+    sub-path layouts this folder's clips consumed.
     """
     owners = {}
     for provider in providers:
         label = _provider_label(provider)
         before = {key: metadatas[key] for key in IDENTITY_KEYS if key in metadatas}
+        snapshot = dict(metadatas) if matched is not None else None
         result = provider.getMetadatasFromFile(media_file, metadatas, context)
         if result is not None and not isinstance(result, Mapping):
             raise TypeError(
@@ -241,6 +268,8 @@ def extract_metadatas(media_file, providers, metadatas, context):
                 f"getMetadatasFromFile; expected a mapping of metadatas "
                 f"(context is mutated in place, not returned)"
             )
+        if matched is not None and _contributed(snapshot, metadatas, result):
+            matched.append(provider)
         if result and result is not metadatas:
             metadatas.update(result)
         for key, previous in before.items():
@@ -293,6 +322,24 @@ class ConsumedSubdirs(frozenset):
         """The compiled sub-path patterns widening membership (layer (b))."""
         return self._patterns
 
+    def __reduce__(self):
+        """Keep layer (b) across a pickle or a copy.
+
+        ``frozenset`` supplies its own ``__reduce__``, which knows nothing
+        about ``_patterns`` — so pickling (Epic 3's process pool),
+        ``copy.copy`` or ``copy.deepcopy`` would hand back a plain-looking
+        ``ConsumedSubdirs`` with its sub-path widening silently GONE, and
+        no error anywhere. Losing layer (b) is the under-consuming
+        direction, which is the one that duplicates (NFR-1).
+
+        Compiled patterns do not pickle on every Python build, so the
+        SOURCE strings travel and are recompiled on the far side.
+        """
+        return (
+            _rebuild_consumed_subdirs,
+            (frozenset(self), tuple(pattern.pattern for pattern in self._patterns)),
+        )
+
     def __contains__(self, name):
         if super().__contains__(name):
             return True
@@ -305,6 +352,13 @@ class ConsumedSubdirs(frozenset):
             f"ConsumedSubdirs({sorted(self)!r}, "
             f"patterns={[p.pattern for p in self._patterns]!r})"
         )
+
+
+def _rebuild_consumed_subdirs(names, pattern_sources):
+    """Module-level un-pickler for ``ConsumedSubdirs`` (see ``__reduce__``)."""
+    return ConsumedSubdirs(
+        names, tuple(re.compile(source) for source in pattern_sources)
+    )
 
 
 def subpath_prefix_patterns(pattern):
@@ -450,11 +504,30 @@ def consumed_subdirs(found_clips, provider_matches, folder_path, *, reasons=None
             f"(Folder.path), got the absolute path {folder_path!r}"
         )
     names = set()
+    clip_count = 0
+    directory_count = 0
     for clip in found_clips or ():
+        clip_count += 1
         for directory in _clip_directories(clip):
+            directory_count += 1
             child = _consumed_child(directory, folder_path)
             if child:
                 names.add(child)
+    if clip_count and not directory_count:
+        # This folder produced clips, and not one of them could say where
+        # it lives — no `path` on the row, no scan-attached file. An empty
+        # consumed set here does NOT mean "nothing was consumed"; it means
+        # the question could not be asked, and answering "descend into
+        # everything" is the under-consuming direction (NFR-1). Note this
+        # is NOT the ordinary case of clips sitting in the folder itself:
+        # those DO yield a directory, which `_consumed_child` then reports
+        # as `None` because there is no child to skip.
+        if reasons is not None:
+            reasons.append(
+                f"{clip_count} clip(s) found but none carries a path or a "
+                f"scanned file, so what they consumed cannot be determined"
+            )
+        return None
     patterns = []
     for provider in provider_matches or ():
         for subpath in provider.getSubPaths() or ():

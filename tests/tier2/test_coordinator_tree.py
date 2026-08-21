@@ -26,6 +26,7 @@ import os
 import re
 
 import pytest
+from django.contrib.auth.models import User
 
 from portal.plugins.TapelessIngest.helpers import TapelessIngestException
 from portal.plugins.TapelessIngest.models.clip import Clip
@@ -110,6 +111,14 @@ def _install_router(es_fake, indexed, ghosts=(), raises=()):
         }
 
     es_fake.route(respond)
+
+
+@pytest.fixture
+def django_user(migrated_db):
+    """A real User row: an INGESTING run now fails fast without one."""
+    user = User.objects.create(pk=4246, username="story28-tree")
+    yield user
+    user.delete()  # keep the auth table empty for the unknown-user tests
 
 
 @pytest.fixture
@@ -203,7 +212,11 @@ def test_log_lines_are_emitted_in_merge_key_order(
     """Tree order, not completion order — sorted(listing.dirs), depth-first."""
     _run_result, emitted = _run(_context(fake_provider))
 
-    folder_lines = [line for line in emitted if not line.startswith("DRY-RUN:")]
+    folder_lines = [
+        line
+        for line in emitted
+        if not line.startswith("DRY-RUN:") and not line.startswith("User has to be")
+    ]
     assert len(folder_lines) == 4
     # `sorted(listing.dirs)`, so the four shoot folders report in name
     # order: …01_one, …02_two, …03_zero, …04_boom. That the folder that
@@ -273,29 +286,45 @@ def test_all_eight_counters_appear_on_every_folder_line(
 # --------------------------------------------------------------------------
 
 
-def test_the_summary_is_the_last_line_and_reports_both_counts(
+def test_the_summary_closes_the_run_with_folders_and_counters(
     migrated_db, tree, fake_provider, es_fake
 ):
-    _run_result, emitted = _run(_context(fake_provider))
+    run_result, emitted = _run(_context(fake_provider))
 
-    summary = emitted[-1]
-    assert summary.startswith("DRY-RUN: 3 folders scanned, 1 failed in ")
+    folders, counters = emitted[-2], emitted[-1]
+    assert folders.startswith("DRY-RUN: 3 folders scanned, 1 failed in ")
     for phase in TIMING_PHASES:
-        assert f"{phase} " in summary
+        assert f"{phase} " in folders
+    assert "other " in folders
+    # The counters the whole story exists to own reach the operator, not
+    # just the folder count and the phase timings.
+    assert counters == (
+        f"DRY-RUN: {run_result.counters.hits} clips found, "
+        f"{run_result.counters.created} created, "
+        f"{run_result.counters.already_ingested} already ingested, "
+        f"{run_result.counters.processed} processed, "
+        f"{run_result.counters.ingested} ingested, "
+        f"{run_result.counters.skipped} skipped, "
+        f"{run_result.counters.failed} failed, "
+        f"{run_result.counters.replaced} replaced, "
+        f"{len(run_result.errors)} errors"
+    )
 
 
 def test_a_real_run_summary_is_not_dry_run_labelled(
-    migrated_db, tree, fake_provider, es_fake, monkeypatch
+    migrated_db, tree, fake_provider, es_fake, monkeypatch, django_user
 ):
     # getCollection needs a Settings row and a live search backend and says
     # nothing about the summary; the same double test_dry_run_purity uses.
     monkeypatch.setattr(
         Folder, "getCollection", lambda self, user, dryrun=False: "VX-COLLECTION"
     )
-    _run_result, emitted = _run(_context(fake_provider, dry_run=False))
+    _run_result, emitted = _run(
+        _context(fake_provider, dry_run=False, user=django_user)
+    )
 
     assert not any("DRY-RUN" in line for line in emitted)
-    assert emitted[-1].startswith("3 folders scanned, 1 failed in ")
+    assert emitted[-2].startswith("3 folders scanned, 1 failed in ")
 
 
 def test_ctx_timings_equals_the_merged_fold(migrated_db, tree, fake_provider, es_fake):

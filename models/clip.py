@@ -284,6 +284,7 @@ class Clip(models.Model):
         file: Any,
         provider_list: Optional[List[Any]] = None,
         context: Optional[Dict[str, Any]] = None,
+        matched: Optional[List[Any]] = None,
     ) -> Dict[str, Any]:
         """Pass 1 of the scan's two-pass lookup: everything before the DB.
 
@@ -297,6 +298,11 @@ class Clip(models.Model):
             provider_list: Optional list of provider instances. If None, uses all providers
             context: Optional context dictionary shared across provider calls; it is
                 mutated in place by the providers, never replaced
+            matched: Optional out-list. Every provider that CONTRIBUTED to
+                this file is appended to it — the multi-provider contract
+                (AD-7/FR-14) made observable, so a caller deciding what a
+                clip consumed does not have to read it back off
+                ``metadatas["provider"]``, which is last-writer-wins.
 
         Returns:
             The merged metadatas dict
@@ -310,7 +316,7 @@ class Clip(models.Model):
             context = {}
         # `provider_list` is already pre-filtered to the applicable
         # providers by the caller; every one of them runs and merges.
-        metadatas = extract_metadatas(file, provider_list, {}, context)
+        metadatas = extract_metadatas(file, provider_list, {}, context, matched=matched)
         if "umid" not in metadatas.keys():
             raise TapelessIngestException("No UMID found in file %s" % file.getPath())
         return metadatas
@@ -1406,7 +1412,13 @@ class Clip(models.Model):
     # column `import_file` mutates is here: item_id (create_item's
     # placeholder), job_id (the import job), status, user — plus file_id,
     # which the scan attached and the deleted full save() also persisted.
-    INGEST_STATE_FIELDS = ("item_id", "job_id", "status", "file_id", "user")
+    #
+    # `user_id`, not `user`: reading `self.user` on a row whose FK is not
+    # already loaded issues a SELECT to fetch the User object, once per
+    # clip, inside the submission loop the whole AD-6 effort exists to
+    # keep query-free — and the UPDATE only ever needed the id. The two
+    # write the same column.
+    INGEST_STATE_FIELDS = ("item_id", "job_id", "status", "file_id", "user_id")
 
     def ingest(
         self,

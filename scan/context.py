@@ -54,6 +54,13 @@ class RunOptions:
     "frozen" dataclass is a mutable field with a promise on it — and they
     default to ``()`` so every pre-2.8 construction site still compiles.
 
+    ``providers`` and ``legacy_storages`` are tuples for the same reason,
+    and stopped being lists in the Epic 2 final review round: two mutable
+    fields on a frozen dataclass whose four newest fields were tuples
+    precisely to avoid that. ``None`` is preserved and is NOT ``()`` —
+    for ``providers`` it means "the canonical registry", which is a
+    different instruction from "no providers".
+
     The LEVEL at which each applies is not expressed here: a run-scoped
     object cannot say "depth 1 only". ``scan.coordinator.walk_tree`` owns
     that, through its explicit ``depth`` parameter — ``skip``/``only``
@@ -61,8 +68,8 @@ class RunOptions:
     """
 
     dry_run: bool = False
-    providers: Optional[List[str]] = None
-    legacy_storages: Optional[List[str]] = None
+    providers: Optional[Tuple[str, ...]] = None
+    legacy_storages: Optional[Tuple[str, ...]] = None
     replace: bool = False
     user: Any = None
     skip: Tuple[str, ...] = ()

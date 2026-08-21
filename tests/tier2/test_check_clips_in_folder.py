@@ -161,8 +161,8 @@ def test_check_clips_in_folder_completes_a_run_and_writes_nothing(
 
     messages = module.logger.messages
     # It got all the way to the summary — the thing it had never done.
-    summary = messages[-1]
-    assert summary.startswith("DRY-RUN: 1 folders scanned, 0 failed in ")
+    assert messages[-2].startswith("DRY-RUN: 1 folders scanned, 0 failed in ")
+    assert messages[-1].startswith("DRY-RUN: 2 clips found, 2 created, ")
 
     # And it wrote nothing, by construction rather than by flag.
     offending = [sql for sql in statements if not READ_ONLY_SQL.match(sql.lstrip())]

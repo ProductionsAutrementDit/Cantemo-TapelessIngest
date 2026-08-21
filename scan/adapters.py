@@ -106,6 +106,20 @@ def _build_registry_and_map(providers: Optional[List[str]]):
     return registry, build_extension_map(registry)
 
 
+def _as_tuple(values: Optional[Iterable[str]]) -> Optional[tuple]:
+    """Freeze a caller's list, PRESERVING ``None``.
+
+    ``RunOptions`` is frozen, so a list field is a mutable value with a
+    promise on it — the aliasing bug story 2.6 removed from the date
+    window, waiting to happen again. ``None`` is not ``()`` and must
+    survive: for ``providers`` it means "the canonical registry", which is
+    a different instruction from "no providers at all".
+    """
+    if values is None:
+        return None
+    return tuple(values)
+
+
 def build_context(
     storage_ids: Iterable[str],
     *,
@@ -135,8 +149,8 @@ def build_context(
         storages=resolve_storages(storage_ids),
         options=RunOptions(
             dry_run=dry_run,
-            providers=providers,
-            legacy_storages=legacy_storages,
+            providers=_as_tuple(providers),
+            legacy_storages=_as_tuple(legacy_storages),
             replace=replace,
             user=user,
             skip=tuple(skip or ()),
@@ -182,8 +196,8 @@ def build_default_context(
         },
         options=RunOptions(
             dry_run=dry_run,
-            providers=providers,
-            legacy_storages=legacy_storages,
+            providers=_as_tuple(providers),
+            legacy_storages=_as_tuple(legacy_storages),
             replace=replace,
             user=user,
         ),

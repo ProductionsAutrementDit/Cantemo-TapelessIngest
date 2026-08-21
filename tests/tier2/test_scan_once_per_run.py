@@ -194,5 +194,9 @@ def test_paged_ingest_default_ctx_carries_actual_options(
     assert seen is not None
     assert seen.options.dry_run is True
     assert seen.options.replace is True
-    assert seen.options.providers == [fake_provider.machine_name]
+    # A tuple since the Epic 2 final review round (E31) — the paged
+    # default context freezes its lists too, so both entry modes carry the
+    # same type. What this test pins is unchanged: the provider dict's
+    # scan_context reports ingest's ACTUAL options, not scan's defaults.
+    assert seen.options.providers == (fake_provider.machine_name,)
     assert seen.root_path_for(STORAGE_ID) == str(tmp_path)

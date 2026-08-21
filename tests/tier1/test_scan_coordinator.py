@@ -16,8 +16,14 @@ dispatch order.
 """
 
 import dataclasses
+import itertools
+import os
+import pickle
+import random
+import re
 import subprocess
 import sys
+import typing
 from pathlib import Path
 
 import pytest
@@ -28,6 +34,7 @@ from portal.plugins.TapelessIngest.scan.context import (
     ScanContext,
     StorageInfo,
 )
+from portal.plugins.TapelessIngest.scan.verification import FolderListings
 from portal.plugins.TapelessIngest.scan.coordinator import (
     AD13_COUNTER_KEYS,
     AD13_KEYS,
@@ -162,18 +169,32 @@ def test_folder_timings_are_frozen_and_add():
         total.discovery = 0.0
 
 
-def test_folder_outcome_carries_exactly_the_three_wrapper_fields():
+def test_folder_outcome_carries_the_wrapper_fields():
     """The wrapper, not the frozen result, is where `failed` lives.
 
     ``failed`` cannot be a ``WorkerResult`` field: AD-13 is exact at six.
     And it must not be inferred from ``errors`` — a zero-hit folder with
     two unreadable files was SCANNED.
+
+    ``merge_key`` rides here so the ordering guarantee is a property of
+    the data rather than of ``walk_tree`` being ``merge_results``' only
+    caller; ``listings`` is the worker's directory cache, handed back so
+    the walk need not scandir the folder a second time and dropped the
+    moment the children are expanded.
     """
     assert tuple(f.name for f in dataclasses.fields(FolderOutcome)) == (
         "result",
         "consumed_subdirs",
         "failed",
+        "merge_key",
+        "listings",
     )
+
+
+def test_consumed_subdirs_is_typed_as_the_three_state_contract():
+    """`Any` documented nothing; the three states ARE the contract."""
+    hints = typing.get_type_hints(FolderOutcome)
+    assert hints["consumed_subdirs"] == typing.Optional[typing.FrozenSet[str]]
 
 
 def test_run_result_carries_no_clips():
@@ -390,28 +411,84 @@ def test_summary_reports_both_folder_counts_and_the_five_phases():
             ingest=4.0,
         ),
     )
-    [line] = summary_lines(run_result, _ctx("/root"), 61.44)
-    assert line == (
+    folders, _counters = summary_lines(run_result, _ctx("/root"), 61.44)
+    assert folders == (
         "12 folders scanned, 2 failed in 61.4s — discovery 1.2s, "
-        "verification 2.0s, extraction 3.5s, persistence 0.5s, ingest 4.0s"
+        "verification 2.0s, extraction 3.5s, persistence 0.5s, ingest 4.0s, "
+        "other 50.2s"
+    )
+
+
+def test_the_phases_and_other_reconcile_with_the_elapsed_time():
+    """A summary whose numbers visibly do not add up teaches distrust.
+
+    Three real per-folder costs are outside the five phases by design (the
+    pass-2 bulk umid lookup, hash recovery's HTTP calls, the
+    `consumed_subdirs` computation), and so is the walk's own listing.
+    `other` is all of it, so the line adds up.
+    """
+    timings = FolderTimings(
+        discovery=1.0, verification=2.0, extraction=3.0, persistence=4.0, ingest=5.0
+    )
+    [folders, _counters] = summary_lines(
+        _run_result(timings=timings), _ctx("/root"), 20.0
+    )
+    assert "other 5.0s" in folders
+    reported = [float(part) for part in re.findall(r"(\d+\.\d)s", folders)]
+    # elapsed, then the five phases, then other.
+    assert reported[0] == 20.0
+    assert sum(reported[1:]) == pytest.approx(reported[0])
+
+
+def test_other_is_clamped_at_zero_when_worker_time_exceeds_wall_clock():
+    """Epic 3 overlaps work, so the difference legitimately goes negative."""
+    timings = FolderTimings(discovery=100.0)
+    [folders, _counters] = summary_lines(
+        _run_result(timings=timings), _ctx("/root"), 10.0
+    )
+    assert "other 0.0s" in folders
+
+
+def test_the_summary_reports_the_counters_the_run_result_knows():
+    """Folder counts and phase timings alone said nothing about clips."""
+    run_result = _run_result(
+        counters=WorkerCounters(
+            hits=9,
+            created=4,
+            already_ingested=3,
+            processed=9,
+            ingested=2,
+            skipped=5,
+            failed=1,
+            replaced=1,
+        ),
+        errors=("boom", "bang"),
+    )
+    _folders, counters = summary_lines(run_result, _ctx("/root"), 1.0)
+    assert counters == (
+        "9 clips found, 4 created, 3 already ingested, 9 processed, "
+        "2 ingested, 5 skipped, 1 failed, 1 replaced, 2 errors"
     )
 
 
 def test_summary_is_labelled_under_dry_run():
-    [line] = summary_lines(_run_result(), _ctx("/root", dry_run=True), 1.0)
-    assert line.startswith("DRY-RUN: 0 folders scanned, 0 failed in 1.0s — ")
+    folders, counters = summary_lines(_run_result(), _ctx("/root", dry_run=True), 1.0)
+    assert folders.startswith("DRY-RUN: 0 folders scanned, 0 failed in 1.0s — ")
+    # BOTH lines carry the label: they reach Slack as separate messages and
+    # a counters line quoted on its own must not read as a real run.
+    assert counters.startswith("DRY-RUN: 0 clips found, ")
 
 
 def test_window_line_does_not_collide_with_the_command_window_log():
     """`format_window_log`'s prefix is pinned as unique in test_cli_validation."""
     ctx = _ctx("/root", date_window=("20260101", "20260102", "20260103"))
     lines = summary_lines(_run_result(), ctx, 1.0)
-    assert lines[1] == "Window: 20260101 to 20260103 (3 day folders)"
-    assert not lines[1].startswith("Scanning folders from ")
+    assert lines[-1] == "Window: 20260101 to 20260103 (3 day folders)"
+    assert not lines[-1].startswith("Scanning folders from ")
 
 
 def test_no_window_line_without_a_window():
-    assert len(summary_lines(_run_result(), _ctx("/root"), 1.0)) == 1
+    assert len(summary_lines(_run_result(), _ctx("/root"), 1.0)) == 2
 
 
 # --------------------------------------------------------------------------
@@ -419,14 +496,27 @@ def test_no_window_line_without_a_window():
 # --------------------------------------------------------------------------
 
 
-def test_tree_only_options_ships_empty():
-    """Epic 3 adds `workers`, Epic 4 adds `discovery` — not this story."""
-    assert TREE_ONLY_OPTIONS == ()
+def test_tree_only_options_names_the_four_folder_filters():
+    """They are genuinely meaningless in paged mode, so they are policed.
+
+    A paged call scans ONE folder and never walks, so a `--skip`/`--only`/
+    `--startWith`/date-window narrowing could only mislead a caller into
+    believing it had been applied. Epic 3 adds `workers` and Epic 4 adds
+    `discovery` to the same tuple.
+    """
+    assert TREE_ONLY_OPTIONS == ("skip", "only", "startwith", "date_window")
 
 
 def test_assert_mode_options_passes_for_a_real_run_options():
     assert_mode_options(RunOptions(), "paged")
     assert_mode_options(RunOptions(), "tree")
+
+
+def test_a_walk_filter_is_rejected_in_paged_mode():
+    with pytest.raises(ValueError, match="startwith"):
+        assert_mode_options(RunOptions(startwith=("AH_",)), "paged")
+    # ...and is exactly what tree mode is for.
+    assert_mode_options(RunOptions(startwith=("AH_",)), "tree")
 
 
 def test_an_injected_tree_only_option_is_rejected_in_paged_mode(monkeypatch):
@@ -520,7 +610,7 @@ class _Worker:
         )
 
 
-def _walk(tmp_path, root_path, worker, ctx=None, **dispatch):
+def _walk(tmp_path, root_path, worker, ctx=None, emit=None, **dispatch):
     ctx = ctx or _ctx(str(tmp_path))
     dispatcher = dispatch.pop("dispatcher", None) or SequentialDispatcher()
     return walk_tree(
@@ -530,6 +620,7 @@ def _walk(tmp_path, root_path, worker, ctx=None, **dispatch):
         process_folder=worker,
         dispatch=dispatcher.dispatch,
         gather=dispatcher.gather,
+        emit=(lambda line: None) if emit is None else emit,
         **dispatch,
     )
 
@@ -580,57 +671,141 @@ def test_outcomes_come_back_in_depth_first_pre_order(tmp_path):
     ]
 
 
-class _ReverseDispatcher:
-    """Hands results back in REVERSE dispatch order.
+class _BufferingDispatcher:
+    """A pool whose workers really do finish out of dispatch order.
 
-    The cheapest possible model of a pool whose workers finish out of
-    order. Everything the coordinator does with an outcome — enqueueing
-    children included — therefore happens in an order the tree does not
-    predict.
+    The predecessor of this class reversed whatever ``gather()`` was about
+    to return — which proved nothing, because ``walk_tree`` dispatches ONE
+    item and then gathers, so the batch was never longer than one and
+    reversing it was the identity. Deleting the merge-key sort left the
+    whole suite green.
+
+    This one BUFFERS. Nothing executes until ``batch`` items are pending
+    (or the walk runs out of work to feed it), and then the whole batch
+    runs and comes back in an order the tree does not predict. Children
+    are therefore enqueued out of order too, so the walk's own dispatch
+    order is scrambled for the rest of the run — which is the property a
+    real pool has and the old fixture did not.
+
+    Termination: when the stack empties, ``walk_tree`` calls ``gather()``
+    with nothing new to dispatch. The buffer notices it saw the same
+    pending count twice in a row and flushes what it has.
     """
 
-    def __init__(self):
-        self._done = []
+    def __init__(self, batch=3, order=None):
+        self._batch = batch
+        self._order = order or (lambda pairs: list(reversed(pairs)))
+        self._buffer = []
+        self._last_seen = None
 
     def dispatch(self, fn, item):
-        self._done.append((item, fn(item)))
+        self._buffer.append((fn, item))
 
     def gather(self):
-        done, self._done = self._done, []
-        return list(reversed(done))
+        if not self._buffer:
+            return []
+        if len(self._buffer) < self._batch and len(self._buffer) != self._last_seen:
+            # Give the walk a chance to feed us more before we commit.
+            self._last_seen = len(self._buffer)
+            return []
+        self._last_seen = None
+        batch, self._buffer = self._buffer, []
+        return self._order([(item, fn(item)) for fn, item in batch])
 
 
-def test_out_of_order_completion_produces_byte_identical_output(tmp_path):
-    """≥2 levels, ≥2 branches — a flat fixture cannot tell the schemes apart."""
-    _tree(
-        tmp_path,
-        "2026/A/A1",
-        "2026/A/A2",
-        "2026/B/B1",
-        "2026/B/B2/B21",
-    )
-    hits = {"2026/A": 1, "2026/A/A2": 2, "2026/B/B2": 3}
+TREE_FIXTURE = (
+    "2026/A/A1",
+    "2026/A/A2",
+    "2026/B/B1",
+    "2026/B/B2/B21",
+)
+TREE_HITS = {"2026/A": 1, "2026/A/A2": 2, "2026/B/B2": 3}
+TREE_ORDER = (
+    "2026/A",
+    "2026/A/A1",
+    "2026/A/A2",
+    "2026/B",
+    "2026/B/B1",
+    "2026/B/B2",
+    "2026/B/B2/B21",
+)
 
-    in_order = merge_results(_walk(tmp_path, "2026", _Worker(hits=hits)))
-    reversed_order = merge_results(
+
+def test_the_sequential_walk_is_depth_first_pre_order(tmp_path):
+    _tree(tmp_path, *TREE_FIXTURE)
+    emitted = []
+    outcomes = _walk(tmp_path, "2026", _Worker(hits=TREE_HITS), emit=emitted.append)
+    assert tuple(o.result.folder_path for o in outcomes) == TREE_ORDER
+    assert tuple(emitted) == tuple(f"visited {path}" for path in TREE_ORDER)
+
+
+@pytest.mark.parametrize("batch", [2, 3, 4, 7])
+@pytest.mark.parametrize("seed", range(6))
+def test_out_of_order_completion_produces_byte_identical_output(tmp_path, batch, seed):
+    """≥2 levels, ≥2 branches — a flat fixture cannot tell the schemes apart.
+
+    24 orderings (4 batch sizes x 6 shuffles). Each one really does execute
+    the folders in a different order and enqueue their children in a
+    different order; every one of them must produce the same `RunResult`
+    AND the same emission sequence as the sequential run.
+    """
+    _tree(tmp_path, *TREE_FIXTURE)
+    rng = random.Random(seed)
+
+    def shuffle(pairs):
+        pairs = list(pairs)
+        rng.shuffle(pairs)
+        return pairs
+
+    in_order_emitted = []
+    in_order = merge_results(
         _walk(
             tmp_path,
             "2026",
-            _Worker(hits=hits),
-            dispatcher=_ReverseDispatcher(),
+            _Worker(hits=TREE_HITS),
+            emit=in_order_emitted.append,
         )
     )
 
-    assert reversed_order == in_order
-    assert in_order.log_lines == (
-        "visited 2026/A",
-        "visited 2026/A/A1",
-        "visited 2026/A/A2",
-        "visited 2026/B",
-        "visited 2026/B/B1",
-        "visited 2026/B/B2",
-        "visited 2026/B/B2/B21",
+    scrambled_emitted = []
+    scrambled_worker = _Worker(hits=TREE_HITS)
+    scrambled = merge_results(
+        _walk(
+            tmp_path,
+            "2026",
+            scrambled_worker,
+            emit=scrambled_emitted.append,
+            dispatcher=_BufferingDispatcher(batch=batch, order=shuffle),
+        )
     )
+
+    assert scrambled == in_order
+    assert scrambled_emitted == in_order_emitted
+    assert in_order.log_lines == tuple(f"visited {path}" for path in TREE_ORDER)
+    # ...and the fixture really did scramble the EXECUTION order, or the
+    # equality above would be the identity all over again.
+    executed = tuple(path for _, path in scrambled_worker.seen)
+    assert sorted(executed) == sorted(TREE_ORDER)
+
+
+def test_the_merge_key_sort_is_what_makes_that_true(tmp_path):
+    """Guards the guard: without the ordering, the fixture disagrees.
+
+    The reviewer's mutation — delete the merge-key ordering — must break
+    the test above. Here it is, injected deliberately: outcomes handed to
+    `merge_results` in completion order rather than merge-key order
+    produce a DIFFERENT report, which is exactly why the sort exists.
+    """
+    _tree(tmp_path, *TREE_FIXTURE)
+    outcomes = _walk(tmp_path, "2026", _Worker(hits=TREE_HITS))
+    stripped = [dataclasses.replace(o, merge_key=()) for o in reversed(outcomes)]
+
+    assert merge_results(outcomes).log_lines != merge_results(stripped).log_lines
+    # And with the keys intact, the shuffled input still merges correctly —
+    # `merge_results` does not lean on `walk_tree` having sorted first.
+    shuffled = list(outcomes)
+    random.Random(0).shuffle(shuffled)
+    assert merge_results(shuffled) == merge_results(outcomes)
 
 
 def test_the_coordinator_enqueues_children_never_the_worker(tmp_path):
@@ -780,11 +955,14 @@ def test_an_unlistable_child_directory_surfaces_on_that_folders_outcome(tmp_path
     assert locked.failed is False
 
 
-def test_an_unresolvable_root_is_emitted_not_swallowed(tmp_path):
-    """The root container has no outcome to ride on, so it goes to `emit`.
+def test_an_unresolvable_root_is_counted_as_a_failure_not_just_printed(tmp_path):
+    """FR-28, and the run has to be able to SAY it failed.
 
-    FR-28: the walk stops instead of handing `False` to os.scandir, and
-    the operator is told why.
+    The root container is never processed, so its own failure had no
+    outcome to ride on: it was printed and then vanished, and the run
+    reported "0 folders scanned, 0 failed" — indistinguishable from an
+    empty tree, which is what a cron job silently succeeding looks like.
+    It gets an outcome of its own now: emitted, counted, and in `errors`.
     """
     emitted = []
     ctx = ScanContext(
@@ -794,21 +972,275 @@ def test_an_unresolvable_root_is_emitted_not_swallowed(tmp_path):
     worker = _Worker()
     outcomes = _walk(tmp_path, "2026", worker, ctx=ctx, emit=emitted.append)
 
-    assert outcomes == []
     assert worker.seen == []
     assert emitted == ["Cannot get full path from storage VX-41, path 2026"]
+    merged = merge_results(outcomes)
+    assert (merged.folders_scanned, merged.folders_failed) == (0, 1)
+    assert merged.errors == ("Cannot get full path from storage VX-41, path 2026",)
 
 
-def test_a_missing_root_directory_stops_the_walk_with_a_listing_error(tmp_path):
+def test_a_missing_root_directory_is_counted_as_a_failure(tmp_path):
     emitted = []
     outcomes = _walk(tmp_path, "nope", _Worker(), emit=emitted.append)
 
-    assert outcomes == []
     assert len(emitted) == 1
     assert emitted[0].startswith("Error listing directory ")
+    merged = merge_results(outcomes)
+    assert (merged.folders_scanned, merged.folders_failed) == (0, 1)
+    assert len(merged.errors) == 1
 
 
-def test_the_walk_runs_without_an_emit_sink(tmp_path):
-    """`emit` is optional: a unit test may call the walk with no sink."""
+def test_an_empty_tree_is_distinguishable_from_a_broken_root(tmp_path):
+    """The whole point of the two tests above, stated as the contrast."""
+    _tree(tmp_path, "2026")
+    merged = merge_results(_walk(tmp_path, "2026", _Worker()))
+    assert (merged.folders_scanned, merged.folders_failed) == (0, 0)
+    assert merged.errors == ()
+
+
+def test_emit_is_required(tmp_path):
+    """The run's only output channel must not be silently discardable."""
+    parameters = typing.get_type_hints(walk_tree) and None
+    import inspect
+
+    emit = inspect.signature(walk_tree).parameters["emit"]
+    assert emit.kind is inspect.Parameter.KEYWORD_ONLY
+    assert emit.default is inspect.Parameter.empty
+
+
+# --------------------------------------------------------------------------
+# Incremental draining, and what the walk does NOT retain
+# --------------------------------------------------------------------------
+
+
+def test_lines_are_drained_as_prefixes_complete_not_at_the_end(tmp_path):
+    """An 8,000-folder run must report as it goes.
+
+    The emission is still exactly merge-key order — the release rule is a
+    lower bound computed from what is still outstanding, not a guess — but
+    a folder's line goes out as soon as everything before it is done,
+    rather than after the whole tree.
+    """
+    _tree(tmp_path, "2026/A/A1", "2026/B")
+    emitted_when_seen = []
+
+    class _Recorder(_Worker):
+        def __call__(self, storage_id, path, ctx, **kwargs):
+            emitted_when_seen.append((path, list(emitted)))
+            return _Worker.__call__(self, storage_id, path, ctx, **kwargs)
+
+    emitted = []
+    _walk(tmp_path, "2026", _Recorder(), emit=emitted.append)
+
+    seen = dict(emitted_when_seen)
+    # By the time B is executed, A and A1 have already been reported.
+    assert seen["2026/B"] == ["visited 2026/A", "visited 2026/A/A1"]
+    # ...and nothing had been reported before the first folder ran.
+    assert seen["2026/A"] == []
+
+
+def test_the_walk_does_not_retain_clips(tmp_path):
+    """`RunResult` drops clips — one line too late, until this round.
+
+    `walk_tree` accumulates every outcome until it returns, so dropping
+    them only at merge time retained the whole 188k-clip corpus anyway.
+    Tree mode never hands an outcome to a façade, so they go immediately.
+    """
+    _tree(tmp_path, "2026/A", "2026/B")
+
+    class _ClipfulWorker(_Worker):
+        def __call__(self, storage_id, path, ctx, **kwargs):
+            outcome = _Worker.__call__(self, storage_id, path, ctx, **kwargs)
+            return dataclasses.replace(
+                outcome,
+                result=dataclasses.replace(outcome.result, clips=(object(), object())),
+            )
+
+    outcomes = _walk(tmp_path, "2026", _ClipfulWorker())
+
+    assert outcomes
+    assert all(outcome.result.clips == () for outcome in outcomes)
+
+
+def test_the_walk_does_not_retain_the_workers_listings(tmp_path):
+    """It is used to expand the children, then dropped."""
+    _tree(tmp_path, "2026/A/A1")
+
+    class _ListingWorker(_Worker):
+        def __call__(self, storage_id, path, ctx, **kwargs):
+            outcome = _Worker.__call__(self, storage_id, path, ctx, **kwargs)
+            listings = FolderListings()
+            listings.get(ctx.absolute_path_for(storage_id, path))
+            return dataclasses.replace(outcome, listings=listings)
+
+    worker = _ListingWorker()
+    outcomes = _walk(tmp_path, "2026", worker)
+
+    assert [path for _, path in worker.seen] == ["2026/A", "2026/A/A1"]
+    assert all(outcome.listings is None for outcome in outcomes)
+
+
+# --------------------------------------------------------------------------
+# NFR-1: one physical directory, one walk
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def collapsing_realpath(monkeypatch):
+    """Make two REAL directories resolve to one physical path.
+
+    A bind mount is what actually produces this, and it needs root;
+    ``os.link`` on a directory is not portable either. FR-24's symlink
+    guard deliberately does NOT cover the case — these are real
+    directories to the filesystem, and a fixture built out of symlinks
+    would be answered by that guard instead of by the realpath set, i.e.
+    it would pass whether or not the dedupe existed. So the collapse is
+    injected at the one function the walk asks.
+    """
+    aliases = {}
+    real_realpath = os.path.realpath
+
+    def collapsing(path):
+        resolved = real_realpath(path)
+        return aliases.get(os.path.basename(resolved), resolved)
+
+    monkeypatch.setattr(os.path, "realpath", collapsing)
+    return aliases
+
+
+def test_a_directory_reachable_by_two_paths_is_walked_once(
+    tmp_path, collapsing_realpath
+):
+    """A bind mount or a hardlinked directory gives one tree two paths.
+
+    Both passes would read "clip absent", both would ingest, and neither
+    would have written a row yet — the umid primary key cannot save us
+    from a race it never sees.
+    """
+    _tree(tmp_path, "2026/alpha/inner", "2026/beta", "2026/gamma")
+    # alpha and beta are the same physical directory.
+    collapsing_realpath["beta"] = str(tmp_path / "2026" / "alpha")
+
+    emitted = []
+    worker = _Worker()
+    _walk(tmp_path, "2026", worker, emit=emitted.append)
+
+    paths = [path for _, path in worker.seen]
+    assert "2026/beta" not in paths
+    assert sorted(paths) == ["2026/alpha", "2026/alpha/inner", "2026/gamma"]
+    # ...and the skip is REPORTED, not silent: an operator seeing half a
+    # tree unscanned needs to know a duplicate path is why. `beta` is a
+    # child of the ROOT container, which has no outcome to carry the note,
+    # so it goes out directly — see `walk_tree`.
+    assert any("Already walked 2026/beta" in line for line in emitted)
+
+
+def test_the_root_realpath_is_seeded_so_a_child_cannot_loop_back(
+    tmp_path, collapsing_realpath
+):
+    _tree(tmp_path, "2026/again")
+    collapsing_realpath["again"] = str(tmp_path / "2026")
+
+    worker = _Worker()
+    _walk(tmp_path, "2026", worker)
+
+    assert worker.seen == []
+
+
+def test_symlinked_directories_are_still_excluded_by_fr_24(tmp_path):
+    """The realpath set GENERALISES the cycle guard, it does not replace it."""
+    _tree(tmp_path, "2026/real")
+    (tmp_path / "2026" / "alias").symlink_to(tmp_path / "2026" / "real")
+
+    worker = _Worker()
+    _walk(tmp_path, "2026", worker)
+
+    assert [path for _, path in worker.seen] == ["2026/real"]
+
+
+# --------------------------------------------------------------------------
+# The fan-out seam's failure modes (E28/E29)
+# --------------------------------------------------------------------------
+
+
+class _RaisingDispatcher(SequentialDispatcher):
+    def __init__(self, fail_on):
+        SequentialDispatcher.__init__(self)
+        self._fail_on = fail_on
+
+    def dispatch(self, fn, item):
+        if item.path == self._fail_on:
+            raise RuntimeError("pool rejected the submission")
+        SequentialDispatcher.dispatch(self, fn, item)
+
+
+def test_a_raising_dispatch_does_not_discard_the_completed_work(tmp_path):
+    """`process_folder` never raises, so a raising dispatch IS the pool.
+
+    Letting it escape threw away every outcome the run had already
+    produced, and every log line with them.
+    """
+    _tree(tmp_path, "2026/A", "2026/B", "2026/C")
+    emitted = []
+
+    outcomes = _walk(
+        tmp_path,
+        "2026",
+        _Worker(),
+        emit=emitted.append,
+        dispatcher=_RaisingDispatcher(fail_on="2026/B"),
+    )
+
+    merged = merge_results(outcomes)
+    assert (merged.folders_scanned, merged.folders_failed) == (2, 1)
+    assert "Error scanning 2026/B: pool rejected the submission" in merged.errors
+    assert emitted == [
+        "visited 2026/A",
+        "Error scanning 2026/B: pool rejected the submission",
+        "visited 2026/C",
+    ]
+
+
+class _BlackHoleDispatcher:
+    """Accepts work and never reports it — a wedged pool."""
+
+    def dispatch(self, fn, item):
+        pass
+
+    def gather(self):
+        return []
+
+
+def test_a_gather_that_never_reports_fails_loudly_instead_of_hanging(
+    tmp_path, monkeypatch
+):
     _tree(tmp_path, "2026/A")
-    assert len(_walk(tmp_path, "2026", _Worker())) == 1
+    monkeypatch.setattr(coordinator, "MAX_IDLE_ROUNDS", 5)
+
+    with pytest.raises(RuntimeError, match="no progress"):
+        _walk(tmp_path, "2026", _Worker(), dispatcher=_BlackHoleDispatcher())
+
+
+def test_a_deduped_root_child_is_a_note_not_a_root_failure(
+    tmp_path, collapsing_realpath
+):
+    """`lines` alone cannot say whether the expansion FAILED.
+
+    A realpath-deduped child is an anomaly worth reporting on a root that
+    expanded perfectly well; reading it as a failure would invent a failed
+    folder out of a bind mount and give the cron a non-zero exit for it.
+    """
+    _tree(tmp_path, "2026/alpha", "2026/beta")
+    collapsing_realpath["beta"] = str(tmp_path / "2026" / "alpha")
+
+    emitted = []
+    worker = _Worker()
+    outcomes = _walk(tmp_path, "2026", worker, emit=emitted.append)
+
+    merged = merge_results(outcomes)
+    # The real child was scanned and nothing failed...
+    assert [path for _, path in worker.seen] == ["2026/alpha"]
+    assert (merged.folders_scanned, merged.folders_failed) == (1, 0)
+    # ...and the root produced no error of its own, only the note.
+    assert merged.errors == ()
+    assert any("Already walked 2026/beta" in line for line in emitted)

@@ -89,11 +89,40 @@ def test_build_context_wires_storages_and_options(storage_fake):
     assert ctx.root_path_for("VX-BC-1") == "/mnt/bc"
     assert ctx.options.user is user
     assert ctx.options.dry_run is True
-    assert ctx.options.providers == ["faketest"]
-    assert ctx.options.legacy_storages == ["VX-2"]
+    # TUPLES since the Epic 2 final review round (E31): `RunOptions` is
+    # frozen, and a list field on it is a mutable value with a promise on
+    # it — the aliasing bug story 2.6 removed from the date window,
+    # waiting to happen again. The caller still passes lists; the context
+    # freezes them at construction, exactly as it already did for
+    # skip/only/startwith/date_window.
+    assert ctx.options.providers == ("faketest",)
+    assert ctx.options.legacy_storages == ("VX-2",)
     assert ctx.options.replace is True
     with pytest.raises(TypeError):
         ctx.storages["VX-BC-2"] = None
+
+
+def test_none_providers_survive_the_freeze_as_none(storage_fake):
+    """`None` is not `()`, and the difference is a whole scan.
+
+    `build_provider_registry` reads `None` as "the canonical
+    PROVIDER_NAMES tuple"; an empty tuple is an EMPTY registry, i.e. a
+    run that matches nothing at all and reports every folder as zero-hit.
+    A `tuple(values or ())` conversion would have collapsed the two.
+    """
+    storage_fake.set_root("VX-BC-3", "/mnt/bc3")
+
+    ctx = build_context(
+        ["VX-BC-3"],
+        user=None,
+        dry_run=True,
+        providers=None,
+        legacy_storages=None,
+        replace=False,
+    )
+
+    assert ctx.options.providers is None
+    assert ctx.options.legacy_storages is None
 
 
 def test_build_default_context_prefers_memo_without_storage_deref(storage_fake):
