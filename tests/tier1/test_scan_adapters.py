@@ -117,20 +117,24 @@ def test_build_default_context_falls_back_to_property_chain(storage_fake):
     assert storage_fake.get_storage_calls == {"VX-DC-PROP": 1}
 
 
-def test_build_default_context_preserves_pin5_attributeerror(storage_fake):
-    # storage=None, no memo: the property chain raises exactly as today
-    # (pin #5, tests/pinned-bugs.md — fixed in 2.6, not here).
+def test_build_default_context_yields_a_rootless_info(storage_fake):
+    # storage=None, no memo. Pin #5 FIXED by story 2.6 (FR-28): the
+    # property chain returns None instead of raising AttributeError, so
+    # the context is built and simply carries no root.
     folder = Folder(storage_id=None, path=PATH)
 
-    with pytest.raises(AttributeError, match="_root_path"):
-        build_default_context(folder, **_options())
+    ctx = build_default_context(folder, **_options())
+
+    assert ctx.root_path_for(None) is None
 
 
 def test_scan_with_ctx_miss_falls_back_to_property_chain(
     es_fake, storage_fake, fake_provider
 ):
     # Unresolvable storage in the ctx (root None) -> property-chain
-    # fallback -> today's AttributeError; the index is never queried.
+    # fallback -> None since 2.6 (FR-28), so the folder records the
+    # "Cannot get full path" entry instead of raising AttributeError out
+    # of the whole run; the index is still never queried.
     storage_fake.set_no_browse("VX-CTX-UNRES")
     ctx = build_context(
         ["VX-CTX-UNRES"],
@@ -142,9 +146,12 @@ def test_scan_with_ctx_miss_falls_back_to_property_chain(
     )
     folder = Folder(storage_id="VX-CTX-UNRES", path=PATH)
 
-    with pytest.raises(AttributeError, match="_root_path"):
-        folder.scan(number=0, count_only=True, context=ctx)
+    response = folder.scan(number=0, count_only=True, context=ctx)
 
+    assert response["errors"] == [
+        f"Cannot get full path from storage VX-CTX-UNRES, path {PATH}"
+    ]
+    assert response["consumed_subdirs"] is None
     assert es_fake.calls == []
 
 

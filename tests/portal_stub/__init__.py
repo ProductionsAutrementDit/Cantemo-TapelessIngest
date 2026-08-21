@@ -44,6 +44,13 @@ class QueryElasticFake:
     fully consumed and clears everything after every test so unconsumed
     responses never leak into a later test.
 
+    `route()` installs a RESPONDER instead of the FIFO script (story 2.6):
+    the fake then answers each call from the search doc it was handed, the
+    way the real index does, so a tree run's results depend on WHICH
+    folders the recursion chose to query rather than on the order it
+    queried them in. The queue stays empty, so the autouse unconsumed-page
+    guard is satisfied by construction rather than by counting.
+
     `first`/`number` are deliberately required keyword arguments: Folder.scan
     always passes both explicitly, so the fake must never paper over a caller
     relying on defaults of the real query_elastic.
@@ -53,6 +60,7 @@ class QueryElasticFake:
         self.queue = []
         self.calls = []
         self.call_docs = []
+        self.responder = None
 
     @property
     def last_search_doc(self):
@@ -62,14 +70,26 @@ class QueryElasticFake:
         """Queue one raw search result dict to be returned by the next call."""
         self.queue.append(response)
 
+    def route(self, responder):
+        """Answer from the search doc instead of from the FIFO queue.
+
+        ``responder(search_doc, first=..., number=...)`` returns the raw
+        result dict. Mutually exclusive with ``push`` in practice: the
+        responder wins.
+        """
+        self.responder = responder
+
     def reset(self):
         self.queue.clear()
         self.calls.clear()
         self.call_docs.clear()
+        self.responder = None
 
     def __call__(self, search_doc, doc_type=None, *, first, number, **kwargs):
         self.calls.append((first, number))
         self.call_docs.append((search_doc, doc_type))
+        if self.responder is not None:
+            return self.responder(search_doc, first=first, number=number)
         if not self.queue:
             raise AssertionError(
                 "query_elastic fake called with an empty response queue "

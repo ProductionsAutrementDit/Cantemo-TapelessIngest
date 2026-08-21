@@ -37,6 +37,9 @@ def test_count_multi_page_call_sequence(es_fake, es_page, fake_provider):
 
     # number=0 → page size 100, loops while a page is full, incrementing first.
     assert es_fake.calls == [(0, 100), (100, 100)]
+    # `consumed_subdirs` is story 2.6's additive key (NFR-5-compatible,
+    # sanctioned pin edit). A count_only pass assembles no clip, so it can
+    # say nothing about consumption: None — DOUBT, "descent not authorized".
     assert response == {
         "clips": [],
         "hits": 140,
@@ -44,6 +47,7 @@ def test_count_multi_page_call_sequence(es_fake, es_page, fake_provider):
         "created": 0,
         "already_ingested": 0,
         "processed": 0,
+        "consumed_subdirs": None,
     }
     # Golden-doc wiring: scan must send exactly build_search_doc's output for
     # the provider list it resolved (same interpreter → same set ordering, so
@@ -102,19 +106,34 @@ def test_no_resolvable_root(es_fake, fake_provider):
         "created": 0,
         "already_ingested": 0,
         "processed": 0,
+        # No absolute path -> nothing was scanned -> DOUBT, never an empty
+        # frozenset (which would authorize descending everywhere).
+        "consumed_subdirs": None,
     }
 
 
-def test_storage_none_raises_attributeerror(es_fake, fake_provider):
-    # Ledger bug pinned as-is (do not fix, tests/pinned-bugs.md): with
-    # storage=None and no preset _root_path, root_path raises AttributeError
-    # instead of filling errors. match= pins the root_path bug specifically,
-    # not just any AttributeError from a stub.
+def test_storage_none_reports_cannot_get_full_path(es_fake, fake_provider):
+    # Ledger row #5 FIXED by story 2.6 (FR-28; deleted from
+    # tests/pinned-bugs.md, declared in tests/fr4-waivers.md). Pre-2.6 an
+    # unresolvable storage left `_root_path` unassigned and the property
+    # raised AttributeError out of the whole run; it now returns None, so
+    # the folder reports the same "Cannot get full path" entry a falsy
+    # root has always produced, and the run continues.
     folder = Folder(storage_id=None, path=PATH)
 
-    with pytest.raises(AttributeError, match="_root_path"):
-        folder.scan(number=0, count_only=True, providers=[fake_provider.machine_name])
+    response = folder.scan(
+        number=0, count_only=True, providers=[fake_provider.machine_name]
+    )
 
+    assert response == {
+        "clips": [],
+        "hits": 0,
+        "errors": [f"Cannot get full path from storage None, path {PATH}"],
+        "created": 0,
+        "already_ingested": 0,
+        "processed": 0,
+        "consumed_subdirs": None,
+    }
     assert es_fake.calls == []
 
 

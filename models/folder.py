@@ -29,7 +29,10 @@ from portal.plugins.TapelessIngest.scan.adapters import (
     build_provider_registry,
 )
 from portal.plugins.TapelessIngest.scan.context import browse_root_path
-from portal.plugins.TapelessIngest.scan.extraction import applicable_providers
+from portal.plugins.TapelessIngest.scan.extraction import (
+    applicable_providers,
+    consumed_subdirs,
+)
 from portal.plugins.TapelessIngest.scan.ingestion import (
     SKIP_NO_HASH,
     select_clips_to_ingest,
@@ -203,11 +206,15 @@ class Folder(models.Model):
     @property
     def root_path(self):
         if not hasattr(self, "_root_path"):
-            # Canonical block (scan/context.py). Pin #5 preserved: with no
-            # resolvable root, _root_path stays unassigned -> AttributeError.
+            # Canonical block (scan/context.py). FR-28 (story 2.6): an
+            # unresolvable storage returns None instead of letting an
+            # unassigned _root_path raise AttributeError (retired pin #5).
+            # None is NOT memoized — a storage that resolves on a later
+            # call still gets its root.
             root_path = browse_root_path(self.storage)
-            if root_path is not None:
-                self._root_path = root_path
+            if root_path is None:
+                return None
+            self._root_path = root_path
         return self._root_path
 
     def _absolute_path_from_root(self, root_path):
@@ -484,7 +491,19 @@ class Folder(models.Model):
             "created": 0,
             "already_ingested": 0,
             "processed": 0,
+            # Story 2.6 / FR-19, additive (NFR-5): the immediate child
+            # names this folder's clips consumed, which the recursion must
+            # not scan again. `None` is DOUBT — "descent is not authorized
+            # for this folder" — and is the value every non-complete pass
+            # keeps: count_only, paged (number != 0), no absolute path.
+            "consumed_subdirs": None,
         }
+        # FR-19: only a COMPLETE pass over the folder may authorize the
+        # recursion to descend. count_only never assembles a clip, and a
+        # paged call has seen one page out of an unknown number (or starts
+        # part-way in), so neither can say what was consumed — both stay
+        # DOUBT. Captured here because the page loop mutates `first`.
+        complete_pass = not count_only and number == 0 and first == 0
         root_path = scan_context.root_path_for(self.storage_id)
         if not root_path:
             # Context miss / falsy root falls back to today's property
@@ -674,6 +693,45 @@ class Folder(models.Model):
                 ),
                 dry_run=scan_context.options.dry_run,
             )
+            # FR-22: story 2.2 recorded every failed scandir on the
+            # listings cache and left them unsurfaced. They join this
+            # folder's errors, path-sorted so a cron log is deterministic.
+            for listing_path, listing_error in sorted(listings.errors().items()):
+                response["errors"].append(
+                    f"Error listing directory {listing_path}: {listing_error}"
+                )
+            if complete_pass:
+                # `providers` holds the matched provider NAMES this pass
+                # accumulated; layer (b) needs the instances behind them.
+                matched_names = set(providers)
+                matched_providers = [
+                    provider
+                    for provider in provider_list
+                    if getattr(provider, "machine_name", None) in matched_names
+                ]
+                reasons = []
+                try:
+                    consumed = consumed_subdirs(
+                        response["clips"],
+                        matched_providers,
+                        # STORAGE-ROOT-RELATIVE, never absolute_path: the
+                        # same coordinate system as Clip.path and
+                        # VSFile.getPath(). See consumed_subdirs.
+                        self.path,
+                        reasons=reasons,
+                    )
+                except Exception as e:
+                    # NFR-1 tie-break: anything unexpected here is DOUBT —
+                    # never a partial set, and never a crashed folder.
+                    traceback.print_exc()
+                    consumed = None
+                    reasons.append(str(e))
+                if consumed is None:
+                    reason = reasons[0] if reasons else "unknown reason"
+                    response["errors"].append(
+                        f"Cannot compute consumed subdirs for {self.path}: {reason}"
+                    )
+                response["consumed_subdirs"] = consumed
         else:
             self.error = (
                 f"Cannot get full path from storage {self.storage_id}, path {self.path}"
@@ -725,6 +783,9 @@ class Folder(models.Model):
             legacy_storages=legacy_storages,
             context=context,
         )
+        # scan()'s own dict is returned, so `consumed_subdirs` (story 2.6)
+        # reaches the recursion through ingest() unchanged — the ingest
+        # counters are added ON TOP of the scan keys, none is replaced.
         for key in ["ingested", "skipped", "failed", "replaced"]:
             response[key] = 0
         if not dry_run:

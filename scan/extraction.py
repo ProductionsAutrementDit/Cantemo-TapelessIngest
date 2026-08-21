@@ -45,19 +45,38 @@ place: a provider returning a fresh dict contributes too. Later
 providers' keys win, EXCEPT that overwriting ``umid`` or ``provider`` —
 the two keys that decide the clip's identity — is logged as an error.
 Provider exceptions propagate to ``models/folder.py``'s per-file wrapper.
+
+Consumption rule (story 2.6, FR-19/NFR-1)
+-----------------------------------------
+``consumed_subdirs`` answers ONE question for the recursion: which of a
+folder's immediate children were already covered by the clips this
+folder's scan produced, and must therefore never be scanned again as
+folders of their own — the duplicate-ingest path.
+
+**The governing tie-break is NFR-1: when in doubt, a subdirectory is
+CONSUMED.** Over-consuming skips a scan the next cron run redoes;
+under-consuming risks an unrecoverable duplicate ingest. That is why
+doubt is expressed as ``None`` ("descent is not authorized for this
+folder") and NEVER as an empty frozenset, which means the opposite:
+"nothing was consumed, descend into everything".
 """
 
 import logging
+import os
+import re
 from collections.abc import Mapping
 
 log = logging.getLogger(__name__)
 
 __all__ = [
     "IDENTITY_KEYS",
+    "ConsumedSubdirs",
     "ExtensionMap",
     "applicable_providers",
     "build_extension_map",
+    "consumed_subdirs",
     "extract_metadatas",
+    "subpath_prefix_patterns",
 ]
 
 # The keys that decide a clip's primary key and its metadata-mapping
@@ -237,3 +256,217 @@ def extract_metadatas(media_file, providers, metadatas, context):
             if key in metadatas and key not in owners:
                 owners[key] = label
     return metadatas
+
+
+class ConsumedSubdirs(frozenset):
+    """The immediate child names a folder's scan consumed.
+
+    A real ``frozenset`` of names (layer (a), the file-path layer — the
+    actual duplicate barrier), widened at membership time by the provider
+    sub-path patterns (layer (b), conservative belt-and-braces).
+
+    Layer (b) cannot contribute NAMES: a ``getSubPaths()`` entry is an ES
+    ``regexp``, and this module never lists a directory, so the only place
+    a pattern can meet a real child name is the ``name in consumed`` test
+    the recursion performs. Hence the widened ``__contains__``.
+
+    Consequences, both deliberate under NFR-1's tie-break:
+
+    * membership is BROADER than equality — ``"CONTENTS" in consumed`` can
+      be true while ``consumed == frozenset()``. Only ever in the
+      over-consuming direction, which is the safe one;
+    * a pattern whose FIRST segment were ``.*`` would match every child
+      name and silently kill descent for that folder. No shipped provider
+      does this (see ``subpath_prefix_patterns``), and it is safe under
+      the tie-break, but it is worth knowing about.
+    """
+
+    __slots__ = ("_patterns",)
+
+    def __new__(cls, names=(), patterns=()):
+        consumed = super().__new__(cls, names)
+        consumed._patterns = tuple(patterns)
+        return consumed
+
+    @property
+    def patterns(self):
+        """The compiled sub-path patterns widening membership (layer (b))."""
+        return self._patterns
+
+    def __contains__(self, name):
+        if super().__contains__(name):
+            return True
+        if not isinstance(name, str):
+            return False
+        return any(pattern.fullmatch(name) for pattern in self._patterns)
+
+    def __repr__(self):
+        return (
+            f"ConsumedSubdirs({sorted(self)!r}, "
+            f"patterns={[p.pattern for p in self._patterns]!r})"
+        )
+
+
+def subpath_prefix_patterns(pattern):
+    """``pattern`` plus one truncation at each literal ``/`` outside a class.
+
+    ``getSubPaths()`` entries are ES ``regexp`` patterns matched against
+    the FULL folder-relative directory path, and several span more than
+    one segment (``CONTENTS/VIDEO``, ``DCIM/([0-9]{3})(GOPRO|…)``). The
+    recursion only ever decides about IMMEDIATE children, so an ancestor
+    segment has to be able to match on its own: one truncated pattern per
+    literal ``/``, with every group left open by the cut closed again.
+
+    ``/`` inside a character class is not a separator (atomos ships
+    ``[^/]*_S[0-9]{3}…``), and neither is an escaped ``\\/``. A cut that
+    lands inside an alternation spanning a separator (xdcam's
+    ``(M4ROOT/|XDROOT/)``) leaves the other branch carrying a ``/``; such
+    a branch simply never matches a bare child name, which is harmless.
+
+    Consuming a whole first-level segment (all of ``DCIM/``, not just the
+    ``DCIM/001GOPRO`` that actually held clips) is deliberate
+    over-consumption under NFR-1's tie-break.
+
+    Returns the original first, then the truncations, deduplicated,
+    order-stable. Nothing is compiled here — the caller owns the compile
+    so that a compile failure can become DOUBT rather than an exception.
+    """
+    candidates = [pattern]
+    depth = 0
+    in_class = False
+    escaped = False
+    for index, char in enumerate(pattern):
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if in_class:
+            if char == "]":
+                in_class = False
+            continue
+        if char == "[":
+            in_class = True
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            # max(): an unbalanced ')' is the pattern's own problem, and
+            # it will surface as a compile failure (i.e. as DOUBT).
+            depth = max(depth - 1, 0)
+        elif char == "/":
+            candidates.append(pattern[:index] + ")" * depth)
+    return tuple(dict.fromkeys(candidates))
+
+
+def _instance_attribute(obj, name):
+    """``obj``'s INSTANCE attribute ``name``, never a class descriptor.
+
+    ``Clip.file`` is a lazy property that buys a Vidispine round trip on a
+    miss; this module is pure by contract and must never trigger it. The
+    scan-attached file lives in ``__dict__`` as ``_file`` (set by
+    ``attach_file_metadatas``), and a duck-typed double may expose a plain
+    ``file`` attribute instead — both are read here, neither can fire a
+    property.
+    """
+    try:
+        return vars(obj).get(name)
+    except TypeError:
+        return None
+
+
+def _clip_directories(clip):
+    """The directories one clip claims, storage-root-relative.
+
+    Two, unioned: ``clip.path`` — the dir recorded on the row, which for a
+    DB-resident clip is a CREATE-time default and may be stale — and the
+    dir of the file THIS scan matched. When they disagree both are
+    consumed (over-consumption, safe).
+    """
+    directories = []
+    path = getattr(clip, "path", None)
+    if path:
+        directories.append(path)
+    file = _instance_attribute(clip, "_file") or _instance_attribute(clip, "file")
+    if file is not None:
+        file_path = file.getPath()
+        if file_path:
+            directories.append(os.path.dirname(file_path))
+    return directories
+
+
+def _consumed_child(directory, folder_path):
+    """The immediate child of ``folder_path`` that contains ``directory``.
+
+    ``None`` when there is no child to skip: the file sits in the folder
+    itself (``relpath`` is ``os.curdir``) or outside it entirely
+    (``os.pardir``, or a ``../`` prefix). The predicate is exact rather
+    than a ``startswith(os.pardir)``, so a dot-named child (``..hidden``,
+    ``.cache``) is consumed like any other.
+    """
+    if not directory:
+        return None
+    relative = os.path.relpath(directory, folder_path or os.curdir)
+    if relative == os.curdir or relative == os.pardir:
+        return None
+    if relative.startswith(os.pardir + os.sep):
+        return None
+    return relative.split(os.sep)[0]
+
+
+def consumed_subdirs(found_clips, provider_matches, folder_path, *, reasons=None):
+    """Immediate children of ``folder_path`` consumed by its own clips.
+
+    Args:
+        found_clips: the clips this folder's scan produced. Duck-typed:
+            ``.path`` (storage-root-relative dir) and, when the scan
+            attached one, a file exposing ``getPath()``.
+        provider_matches: the providers that matched in this folder.
+            Duck-typed on ``getSubPaths()``. This is the FOLDER-level
+            matched set, which is last-writer-wins per clip and therefore
+            does not strictly dominate the true per-clip multi-provider
+            match set — layer (b) is a supplement to layer (a), never a
+            substitute for it.
+        folder_path: **``Folder.path`` — STORAGE-ROOT-RELATIVE**, the same
+            coordinate system as ``Clip.path`` and ``VSFile.getPath()``.
+            An absolute path would make every ``relpath`` start with
+            ``..``, empty the consumed set and send the recursion into
+            every child of every folder: duplicates at scale. Guarded.
+        reasons: optional list; a doubt reason is appended to it, naming
+            the offending pattern, for the caller's ``response["errors"]``.
+
+    Returns:
+        A ``ConsumedSubdirs`` (a ``frozenset`` of names, widened by the
+        sub-path patterns), or ``None`` for DOUBT — "descent is not
+        authorized for this folder". Doubt is NEVER an empty frozenset:
+        that is the under-consuming direction, the one that duplicates.
+
+    Raises:
+        ValueError: ``folder_path`` is absolute (see above).
+    """
+    if os.path.isabs(folder_path or ""):
+        raise ValueError(
+            f"consumed_subdirs needs a storage-root-relative folder_path "
+            f"(Folder.path), got the absolute path {folder_path!r}"
+        )
+    names = set()
+    for clip in found_clips or ():
+        for directory in _clip_directories(clip):
+            child = _consumed_child(directory, folder_path)
+            if child:
+                names.add(child)
+    patterns = []
+    for provider in provider_matches or ():
+        for subpath in provider.getSubPaths() or ():
+            for candidate in subpath_prefix_patterns(subpath):
+                try:
+                    patterns.append(re.compile(candidate))
+                except re.error as error:
+                    # NFR-1: an unparsable sub-path on an otherwise
+                    # complete pass is DOUBT, never a partial set — the
+                    # provider's whole sub-tree would be left unconsumed
+                    # and the recursion would re-ingest it.
+                    if reasons is not None:
+                        reasons.append(f"{subpath!r} does not compile ({error})")
+                    return None
+    return ConsumedSubdirs(names, patterns)

@@ -22,21 +22,26 @@ Covered here:
   ``== ".R3D"`` guard beats the real ``file`` provider's guard.
 """
 
+import re
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
+from portal.plugins.TapelessIngest.models.clip import Clip
 from portal.plugins.TapelessIngest.providers import PROVIDER_NAMES
 from portal.plugins.TapelessIngest.scan.adapters import (
     build_context,
     build_provider_registry,
 )
 from portal.plugins.TapelessIngest.scan.extraction import (
+    ConsumedSubdirs,
     applicable_providers,
     build_extension_map,
+    consumed_subdirs,
     extract_metadatas,
+    subpath_prefix_patterns,
 )
 from tests.portal_stub import VSFile
 
@@ -557,3 +562,276 @@ def test_a_broken_getextensions_propagates_instead_of_degrading(storage_fake):
             )
     finally:
         Clip._PROVIDER_CACHE.pop("brokenext", None)
+
+
+# ---------------------------------------------------------------------------
+# Story 2.6 — consumption (FR-19 / NFR-1)
+# ---------------------------------------------------------------------------
+
+FOLDER = "2026/AH_20260101_shoot"
+
+
+class StubClip:
+    """Duck-typed clip: a recorded dir, optionally a scan-attached file."""
+
+    def __init__(self, path, file_path=None):
+        self.path = path
+        if file_path is not None:
+            self.file = StubFile(file_path)
+
+
+class StubFile:
+    def __init__(self, path):
+        self._path = path
+
+    def getPath(self):
+        return self._path
+
+
+class StubSubpathProvider:
+    def __init__(self, machine_name, subpaths):
+        self.machine_name = machine_name
+        self._subpaths = list(subpaths)
+
+    def getSubPaths(self):
+        return self._subpaths
+
+
+def test_consumed_by_file_path_takes_the_first_component():
+    clips = [
+        StubClip(f"{FOLDER}/PRIVATE/M4ROOT/Clip"),
+        StubClip(f"{FOLDER}/PRIVATE/M4ROOT/Clip"),
+    ]
+
+    consumed = consumed_subdirs(clips, [], FOLDER)
+
+    # The immediate child, not the deep dir: the recursion only ever
+    # decides about children.
+    assert consumed == frozenset({"PRIVATE"})
+
+
+def test_consumed_unions_a_stale_recorded_dir_with_this_scans_file_dir():
+    # A DB-resident clip's `path` is a CREATE-time default and may name a
+    # different dir from the file this scan matched. Both are consumed —
+    # over-consumption, safe under NFR-1's tie-break.
+    clip = StubClip(f"{FOLDER}/OLDCARD/CLIP", file_path=f"{FOLDER}/NEWCARD/CLIP/A.MP4")
+
+    assert consumed_subdirs([clip], [], FOLDER) == frozenset({"OLDCARD", "NEWCARD"})
+
+
+def test_file_directly_in_the_folder_contributes_nothing():
+    # relpath == os.curdir: there is no child to skip.
+    clip = StubClip(FOLDER, file_path=f"{FOLDER}/A.MP4")
+
+    assert consumed_subdirs([clip], [], FOLDER) == frozenset()
+
+
+def test_a_clip_outside_the_folder_contributes_nothing():
+    # os.pardir and a '../'-prefixed relpath both mean "not below us".
+    outside = StubClip("2026", file_path="2026/OTHER/A.MP4")
+
+    assert consumed_subdirs([outside], [], FOLDER) == frozenset()
+
+
+def test_dot_named_children_are_consumed_like_any_other():
+    # The predicate is an EXACT os.curdir/os.pardir test, never a
+    # startswith('.') or startswith(os.pardir), so '.cache' and '..hidden'
+    # are ordinary children.
+    clips = [
+        StubClip(f"{FOLDER}/.cache/CLIP"),
+        StubClip(f"{FOLDER}/..hidden/CLIP"),
+    ]
+
+    assert consumed_subdirs(clips, [], FOLDER) == frozenset({".cache", "..hidden"})
+
+
+def test_consumed_subdirs_refuses_an_absolute_folder_path():
+    """The storage-root-relative contract, pinned.
+
+    `folder_path` is `Folder.path` — the same coordinate system as
+    `Clip.path` and `VSFile.getPath()`. Handing it `folder.absolute_path`
+    instead would make every relpath start with '..', empty the consumed
+    set and send the recursion into every child of every folder:
+    duplicates at scale, silently. It is refused outright.
+    """
+    clip = StubClip(f"{FOLDER}/PRIVATE/M4ROOT/Clip")
+
+    with pytest.raises(ValueError, match="storage-root-relative"):
+        consumed_subdirs([clip], [], f"/mnt/PAD_Storage/{FOLDER}")
+
+
+def test_no_clips_and_no_providers_is_an_empty_set_never_doubt():
+    # frozenset() means "nothing consumed, descend into everything" — the
+    # OPPOSITE of None. A folder that found nothing must be descended into.
+    consumed = consumed_subdirs([], [], FOLDER)
+
+    assert consumed is not None
+    assert consumed == frozenset()
+
+
+def test_provider_subpath_consumes_an_ancestor_segment_holding_no_clip():
+    # panasonicP2's row: CONTENTS/ holds no clip file itself, but it is the
+    # ancestor of CONTENTS/VIDEO and CONTENTS/AVCLIP, so scanning it as a
+    # folder of its own would re-find (and re-ingest) the same files.
+    provider = StubSubpathProvider("panasonicP2", ["CONTENTS/VIDEO", "CONTENTS/AVCLIP"])
+
+    consumed = consumed_subdirs([], [provider], FOLDER)
+
+    assert "CONTENTS" in consumed
+    # Layer (b) contributes no NAMES: it cannot know which children exist.
+    # Membership is deliberately broader than equality (see ConsumedSubdirs).
+    assert consumed == frozenset()
+    assert isinstance(consumed, ConsumedSubdirs)
+
+
+def test_deeper_only_segments_are_not_consumed_on_their_own():
+    # VIDEO / STREAM only ever appear BELOW a mandatory first segment, so
+    # they are not immediate children of the scanned folder and must not be
+    # matched by the derived prefixes. Their PARENT is what gets consumed.
+    providers = [
+        StubSubpathProvider("panasonicP2", ["CONTENTS/VIDEO"]),
+        StubSubpathProvider("avchd", ["((PRIVATE/)?AVCHD/)?BDMV/STREAM"]),
+    ]
+
+    consumed = consumed_subdirs([], providers, FOLDER)
+
+    assert "VIDEO" not in consumed
+    assert "STREAM" not in consumed
+    assert "CONTENTS" in consumed
+    assert "BDMV" in consumed
+
+
+SHIPPED_SUBPATH_PROVIDERS = list(PROVIDER_NAMES) + ["ikegami"]
+
+# Every name a shipped sub-path can put DIRECTLY under a scanned folder.
+CONSUMED_CHILD_NAMES = [
+    "CONTENTS",
+    "DCIM",
+    "FOLDER01",
+    "PRIVATE",
+    "M4ROOT",
+    "XDROOT",
+    "BPAV",
+    "CLPR",
+    "128_0001L_01",
+    "AVCHD",
+    "BDMV",
+    "Clip",
+    "CLIP",
+    "A001_S001_S001_T001",
+    "BIN001",
+]
+
+# Names that only ever appear one level DOWN, reachable only through a
+# parent that is itself consumed — so they are never immediate children.
+DEEPER_ONLY_NAMES = ["VIDEO", "STREAM", "AVCLIP", "001GOPRO", "ZOOM0001"]
+
+
+def _all_shipped_providers():
+    # ikegami ships a getSubPaths() but is NOT in PROVIDER_NAMES, so it can
+    # never reach consumed_subdirs through the canonical registry; it is
+    # exercised here for derivation coverage only.
+    return [Clip.get_provider_by_name(name) for name in SHIPPED_SUBPATH_PROVIDERS]
+
+
+@pytest.mark.parametrize("name", CONSUMED_CHILD_NAMES)
+def test_shipped_subpaths_consume_every_first_level_child_name(name):
+    consumed = consumed_subdirs([], _all_shipped_providers(), FOLDER)
+
+    assert name in consumed
+
+
+@pytest.mark.parametrize("name", DEEPER_ONLY_NAMES)
+def test_shipped_subpaths_do_not_consume_deeper_only_names(name):
+    consumed = consumed_subdirs([], _all_shipped_providers(), FOLDER)
+
+    assert name not in consumed
+
+
+@pytest.mark.parametrize("name", DEEPER_ONLY_NAMES)
+def test_deeper_only_names_are_still_reachable_through_their_parent(name):
+    # Their segment IS load-bearing — it just lives inside a full sub-path,
+    # not at the top of one. The full path matches an original pattern, and
+    # the parent that leads to it is what consumed_subdirs skips.
+    full_paths = {
+        "VIDEO": "CONTENTS/VIDEO",
+        "AVCLIP": "CONTENTS/AVCLIP",
+        "STREAM": "PRIVATE/AVCHD/BDMV/STREAM",
+        "001GOPRO": "DCIM/001GOPRO",
+        "ZOOM0001": "FOLDER01/ZOOM0001",
+    }
+    patterns = []
+    for provider in _all_shipped_providers():
+        for subpath in provider.getSubPaths():
+            patterns += list(subpath_prefix_patterns(subpath))
+
+    assert any(re.fullmatch(pattern, full_paths[name]) for pattern in patterns)
+    assert full_paths[name].split("/")[0] in consumed_subdirs(
+        [], _all_shipped_providers(), FOLDER
+    )
+
+
+def test_prefix_derivation_keeps_the_original_and_ignores_class_slashes():
+    # atomos is the only shipped '/'-inside-a-character-class case: it has
+    # no separator at all, so it derives nothing beyond itself.
+    assert subpath_prefix_patterns("[^/]*_S[0-9]{3}_S[0-9]{3}_T[0-9]{3}") == (
+        "[^/]*_S[0-9]{3}_S[0-9]{3}_T[0-9]{3}",
+    )
+    # An escaped separator is not a separator either.
+    assert subpath_prefix_patterns(r"a\/b") == (r"a\/b",)
+    # Alternation spanning a separator: every cut closes its open groups.
+    assert subpath_prefix_patterns("((PRIVATE/)?(M4ROOT/|XDROOT/))?(Clip|CLIP)") == (
+        "((PRIVATE/)?(M4ROOT/|XDROOT/))?(Clip|CLIP)",
+        "((PRIVATE))",
+        "((PRIVATE/)?(M4ROOT))",
+        "((PRIVATE/)?(M4ROOT/|XDROOT))",
+    )
+
+
+def test_every_shipped_derived_pattern_compiles():
+    for provider in _all_shipped_providers():
+        for subpath in provider.getSubPaths():
+            for candidate in subpath_prefix_patterns(subpath):
+                re.compile(candidate)
+
+
+@pytest.mark.parametrize("broken", ["A)B/C", "[A/B"])
+def test_an_uncompilable_original_subpath_is_doubt(broken):
+    # The ORIGINAL pattern's compile is wrapped too, not only the derived
+    # ones — otherwise these two never reach the doubt path at all.
+    reasons = []
+    provider = StubSubpathProvider("broken", [broken])
+    clip = StubClip(f"{FOLDER}/PRIVATE/M4ROOT/Clip")
+
+    consumed = consumed_subdirs([clip], [provider], FOLDER, reasons=reasons)
+
+    # NFR-1: None, never frozenset() and never the partial layer-(a) set —
+    # a partial set would leave the provider's subtree unconsumed and the
+    # recursion would re-ingest it.
+    assert consumed is None
+    assert consumed is not frozenset()
+    assert reasons and broken in reasons[0]
+
+
+def test_an_uncompilable_derived_subpath_is_doubt():
+    # Synthetic: a comment group swallowing an unbalanced '(' compiles as
+    # written but not once truncated and re-closed. No shipped provider
+    # does this (test_every_shipped_derived_pattern_compiles), but the
+    # doubt path must not depend on that staying true.
+    reasons = []
+    provider = StubSubpathProvider("broken", ["x(?#a(b)/y"])
+
+    assert re.compile("x(?#a(b)/y")
+
+    consumed = consumed_subdirs([], [provider], FOLDER, reasons=reasons)
+
+    assert consumed is None
+    assert reasons
+
+
+def test_doubt_needs_no_reasons_list():
+    # `reasons` is optional: a caller that does not want the text still
+    # gets the decision.
+    provider = StubSubpathProvider("broken", ["A)B/C"])
+
+    assert consumed_subdirs([], [provider], FOLDER) is None

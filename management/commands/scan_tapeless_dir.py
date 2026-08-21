@@ -28,6 +28,7 @@ from portal.plugins.TapelessIngest.models.folder import Folder
 from portal.plugins.TapelessIngest.helpers import TapelessIngestException
 from portal.plugins.TapelessIngest.providers import PROVIDER_NAMES
 from portal.plugins.TapelessIngest.scan import adapters
+from portal.plugins.TapelessIngest.scan.verification import FolderListings
 
 SLACK_ACCESS_TOKEN = None
 
@@ -184,6 +185,64 @@ def format_window_log(date_window):
     )
 
 
+def should_scan_entry(name, skip=None, only=None, startwith=None, date_window=None):
+    """Do this subdirectory's filters allow it to be scanned?
+
+    The legacy substring semantics verbatim (``str.find(...) != -1``, not
+    ``in``) in the legacy order, extracted so the two commands cannot
+    drift apart (FR-37; pinned by tests/tier1/test_commands_in_sync.py).
+
+    Two deltas from the pre-2.6 inline block:
+
+    * the byte-identical DUPLICATE ``skip`` check that followed
+      ``startwith`` is gone — it could never change the outcome;
+    * ``--skip``/``--only`` are the OPERATOR's filters and are evaluated
+      at EVERY depth (FR-20 — the pre-2.6 recursive call forwarded
+      neither), while ``startwith`` and ``date_window`` select shoot
+      folders at depth 1 only and are simply not passed further down.
+
+    ``date_window`` is its own parameter since story 2.6. Story 1.4
+    synthesized it into ``only`` with an in-place ``+=`` that aliased
+    ``args.only``, which made the two indistinguishable; they
+    are independent now, so a run given both must satisfy both.
+    """
+    if skip:
+        # search in skip if name contains one of the values
+        for skip_entry in skip:
+            if name.find(skip_entry) != -1:
+                return False
+    if only:
+        # search in only if name contains one of the values
+        if not any(name.find(only_entry) != -1 for only_entry in only):
+            return False
+    if startwith:
+        # search in startwith if name begins with one of the values
+        if not any(name.startswith(prefix) for prefix in startwith):
+            return False
+    if date_window:
+        # one YYYYMMDD value per window day, same substring semantics
+        if not any(name.find(day) != -1 for day in date_window):
+            return False
+    return True
+
+
+def consumed_subdirs_from_results(results):
+    """The descent authorization carried by a scan/ingest response.
+
+    Three states, three representations (story 2.6, NFR-1):
+
+    * a ``frozenset`` — descend into every child EXCEPT these names;
+    * ``None`` — DOUBT: descent is not authorized for this folder at all,
+      and the recursion skips it entirely;
+    * no key — treated as ``None``, because a response that cannot say
+      what it consumed must never be trusted to authorize a descent.
+
+    ``None`` and ``frozenset()`` are NEVER interchangeable: the empty set
+    is "nothing consumed, descend into everything", the opposite call.
+    """
+    return results.get("consumed_subdirs")
+
+
 def scan_tapeless_dir(
     parent_folder,
     storage=None,
@@ -199,99 +258,113 @@ def scan_tapeless_dir(
     replace=True,
     *,
     context=None,
+    date_window=None,
+    consumed=frozenset(),
 ):
+    """Scan every subdirectory of ``parent_folder``, depth-first.
+
+    ``consumed`` holds the immediate child names ``parent_folder``'s own
+    clips already covered; they are skipped. The default is
+    ``frozenset()`` — "nothing consumed" — so the root call from
+    ``handle()`` descends into every child. Doubt is NEVER expressed here
+    (that is what ``response["consumed_subdirs"] is None`` is for): an
+    empty set means descend, and under-consuming is the one direction
+    that produces an unrecoverable duplicate ingest (NFR-1).
+    """
     if user is None:
         logger.log("User has to be provided")
-    with os.scandir(parent_folder.absolute_path) as it:
-        for entry in it:
-            if entry.is_dir():
-                if skip:
-                    # search in skip if entry.name contains one of the values
-                    found = False
-                    for skip_entry in skip:
-                        if entry.name.find(skip_entry) != -1:
-                            found = True
-                            continue
-                    if found:
-                        continue
-                if only:
-                    # search in only if entry.name contains one of the values
-                    found = False
-                    for only_entry in only:
-                        if entry.name.find(only_entry) != -1:
-                            found = True
-                            continue
-                    if not found:
-                        continue
-                if startwith:
-                    # search in startwith if entry.name contains one of the values
-                    found = False
-                    for startwith_entry in startwith:
-                        if entry.name.startswith(startwith_entry):
-                            found = True
-                            continue
-                    if not found:
-                        continue
-                if skip:
-                    found = False
-                    for skip_entry in skip:
-                        if entry.name.find(skip_entry) != -1:
-                            found = True
-                            continue
-                    if found:
-                        continue
-                folder_path = os.path.join(parent_folder.path, entry.name)
-                try:
-                    folder, is_new = Folder.get_or_new(
-                        storage_id=storage, path=folder_path
-                    )
-                    if context is not None:
-                        # Seed the memoized root from the run context BEFORE
-                        # any property access, so neither this folder's scan
-                        # nor the recursion's os.scandir(absolute_path)
-                        # re-resolves the storage (real once-per-run, FR-7).
-                        child_root = context.root_path_for(storage)
-                        if child_root:
-                            folder._root_path = child_root
-                    # print(f"Scanning {folder.path}...")
-                    ingest_message = ""
-                    results = folder.ingest(
-                        first=first,
-                        number=number,
-                        cursor=None,
-                        user=user,
-                        providers=providers,
-                        legacy_storages=LEGACY_STORAGES,
-                        dry_run=not ingest,
-                        replace=replace,
-                        context=context,
-                    )
-                    if results["hits"] == 0:
-                        count = scan_tapeless_dir(
-                            parent_folder=folder,
-                            storage=storage,
-                            ingest=ingest,
-                            user=user,
-                            count=count,
-                            providers=providers,
-                            replace=replace,
-                            context=context,
-                        )
-                    count += 1
-                    error_message = ""
-                    if len(results["errors"]):
-                        error_string = "\n".join(results["errors"])
-                        error_message += f": {error_string}"
-                    if results["hits"] > 0:
-                        logger.log(
-                            f"found {results['hits']} clips in {folder.path}, {results['already_ingested']} already ingested, {results['created']} created, providers are {folder.provider_names}, {results['ingested']} ingested, {results['skipped']} skipped, {results['replaced']} replaced, {len(results['errors'])} errors encountered{error_message}",
-                        )
-                except FileNotFoundError:
-                    logger.log(f"Path doesn't exists anymore: {folder.path}")
-                except TapelessIngestException as e:
-                    logger.log(f"Error ingesting {folder_path}: {e}")
-                except Exception as e:
-                    logger.log(f"Error scanning {folder_path}: {e}")
+    absolute_path = parent_folder.absolute_path
+    if not absolute_path:
+        # FR-28: an unresolvable storage is reported and the walk stops
+        # here, instead of os.scandir(False) raising out of the run.
+        logger.log(
+            f"Cannot get full path from storage {parent_folder.storage_id}, "
+            f"path {parent_folder.path}"
+        )
+        return count
+    # Its own FolderListings (story 2.2's class-level reuse ruling): one
+    # extra scandir per folder directory, consolidated by story 2.8.
+    listings = FolderListings()
+    listing = listings.get(absolute_path)
+    # FR-22: a scandir failure is surfaced, never silently empty.
+    for listing_path, listing_error in sorted(listings.errors().items()):
+        logger.log(f"Error listing directory {listing_path}: {listing_error}")
+    if listing.error is not None:
+        return count
+    # sorted(): deterministic cron logs, no hash-seed flakiness. `dirs`
+    # excludes symlinked directories (FR-24's cycle guard, story 2.2).
+    for name in sorted(listing.dirs):
+        # NFR-1: a child this folder's own clips already covered is never
+        # scanned again as a folder of its own — that IS the duplicate.
+        if name in consumed:
+            continue
+        if not should_scan_entry(
+            name, skip=skip, only=only, startwith=startwith, date_window=date_window
+        ):
+            continue
+        folder_path = os.path.join(parent_folder.path, name)
+        try:
+            folder, is_new = Folder.get_or_new(storage_id=storage, path=folder_path)
+            if context is not None:
+                # Seed the memoized root from the run context BEFORE any
+                # property access, so neither this folder's scan nor the
+                # recursion's own listing re-resolves the storage (real
+                # once-per-run, FR-7).
+                child_root = context.root_path_for(storage)
+                if child_root:
+                    folder._root_path = child_root
+            # print(f"Scanning {folder.path}...")
+            ingest_message = ""
+            results = folder.ingest(
+                first=first,
+                number=number,
+                cursor=None,
+                user=user,
+                providers=providers,
+                legacy_storages=LEGACY_STORAGES,
+                dry_run=not ingest,
+                replace=replace,
+                context=context,
+            )
+            count += 1
+            error_message = ""
+            if len(results["errors"]):
+                error_string = "\n".join(results["errors"])
+                error_message += f": {error_string}"
+            # FR-22: log whenever there is anything to report. Before 2.6
+            # the whole line was gated on hits > 0, so a zero-hit folder's
+            # errors were swallowed together with it.
+            if results["hits"] > 0 or len(results["errors"]):
+                logger.log(
+                    f"found {results['hits']} clips in {folder.path}, {results['already_ingested']} already ingested, {results['created']} created, providers are {folder.provider_names}, {results['ingested']} ingested, {results['skipped']} skipped, {results['replaced']} replaced, {len(results['errors'])} errors encountered{error_message}",
+                )
+            child_consumed = consumed_subdirs_from_results(results)
+            if child_consumed is not None:
+                # FR-19/FR-20: descend into every NON-consumed child, at
+                # every depth, carrying the operator's filters down with
+                # it. `startwith` and the date window select depth-1 shoot
+                # folders and deliberately stop here.
+                count = scan_tapeless_dir(
+                    parent_folder=folder,
+                    storage=storage,
+                    ingest=ingest,
+                    user=user,
+                    count=count,
+                    skip=skip,
+                    only=only,
+                    startwith=None,
+                    providers=providers,
+                    replace=replace,
+                    context=context,
+                    date_window=None,
+                    consumed=child_consumed,
+                )
+        except FileNotFoundError:
+            logger.log(f"Path doesn't exists anymore: {folder.path}")
+        except TapelessIngestException as e:
+            logger.log(f"Error ingesting {folder_path}: {e}")
+        except Exception as e:
+            logger.log(f"Error scanning {folder_path}: {e}")
     return count
 
 
@@ -395,10 +468,12 @@ class Command(BaseCommand):
         only = args.only
 
         if date_window is not None:
+            # Story 2.6: the window is its OWN depth-1 filter, passed as
+            # date_window= below. It is no longer synthesized into `only`
+            # (the in-place append aliased args.only itself), because
+            # --only is an operator filter that applies at every depth
+            # while the window selects shoot folders at depth 1 only.
             logger.log(format_window_log(date_window))
-            # One YYYYMMDD filter value per window day, appended onto the
-            # same list object as args.only (the scan call reads args.only).
-            only += date_window
 
         # One context per run (story 2.1): the storage is resolved exactly
         # once here via the adapters, then threaded through the recursion as
@@ -437,6 +512,7 @@ class Command(BaseCommand):
                 skip=args.skip,
                 only=args.only,
                 context=context,
+                date_window=date_window,
             )
             logger.log(f"{count} folders scanned")
         except Exception as e:

@@ -15,7 +15,17 @@ from portal.plugins.TapelessIngest.scan.adapters import build_context
 STORAGE_ID = "VX-41"
 
 # Frozen NFR-5 key sets — never change without human sign-off.
-SCAN_KEYS = {"clips", "hits", "errors", "created", "already_ingested", "processed"}
+# `consumed_subdirs` was ADDED by story 2.6 (FR-19): purely additive, no key
+# lost or changed, sanctioned pin edit with its own tests/fr4-waivers.md row.
+SCAN_KEYS = {
+    "clips",
+    "hits",
+    "errors",
+    "created",
+    "already_ingested",
+    "processed",
+    "consumed_subdirs",
+}
 INGEST_KEYS = SCAN_KEYS | {"ingested", "skipped", "failed", "replaced"}
 
 

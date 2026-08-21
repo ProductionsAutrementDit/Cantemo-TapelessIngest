@@ -27,7 +27,16 @@ from portal.plugins.TapelessIngest.scan.verification import FolderListings
 
 STORAGE_ID = "VX-41"
 
-SCAN_KEYS = {"clips", "hits", "errors", "created", "already_ingested", "processed"}
+# `consumed_subdirs` added by story 2.6 (FR-19), sanctioned pin edit.
+SCAN_KEYS = {
+    "clips",
+    "hits",
+    "errors",
+    "created",
+    "already_ingested",
+    "processed",
+    "consumed_subdirs",
+}
 
 
 def _source(path, file_id):

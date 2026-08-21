@@ -22,6 +22,14 @@ SHARED_HELPERS = [
     "parse_from",
     "compute_date_window",
     "format_window_log",
+    # Story 2.6: the recursion's drift-prone halves. check_clips_in_folder's
+    # own recursion lands unexecuted and uncompared (the sync test compares
+    # helpers and handle(), never scan_tapeless_dir itself, and the command
+    # still carries its two fatal preserved defects), so the filter decision
+    # and the descent-authorization read are extracted into helpers this
+    # test DOES cover, until 2.8/FR-37 rebuilds the surrounding call site.
+    "should_scan_entry",
+    "consumed_subdirs_from_results",
 ]
 
 

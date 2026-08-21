@@ -148,8 +148,10 @@ def build_default_context(
 
     Exact read order: the memoized ``folder._root_path`` when present,
     WITHOUT dereferencing ``folder.storage``; only otherwise the
-    ``folder.root_path`` property (Redis chain — pin #5's AttributeError
-    propagates from here exactly as it does today).
+    ``folder.root_path`` property (Redis chain). Since story 2.6 (FR-28)
+    that property returns ``None`` for an unresolvable storage instead of
+    raising ``AttributeError``, so the rootless ``StorageInfo`` built here
+    is what makes the folder report "Cannot get full path …".
     """
     if hasattr(folder, "_root_path"):
         root_path = folder._root_path

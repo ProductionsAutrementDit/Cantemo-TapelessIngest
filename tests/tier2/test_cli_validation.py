@@ -101,14 +101,18 @@ class _CapturingLogger:
 
 
 @pytest.mark.parametrize("command", COMMANDS)
-def test_since_window_reaches_scan_only_filter(
+def test_since_window_reaches_scan_date_window_filter(
     command, migrated_db, monkeypatch, storage_fake
 ):
-    """End-to-end wiring: the computed window must reach the scan's `only`.
+    """End-to-end wiring: the computed window must reach the scan.
 
-    Guards the aliasing contract — `only = only + date_window` instead of
-    `only += date_window` would silently disable the cron's --since filter
-    while every pure-helper test stayed green. The command module's OWN
+    Same intent as the story-1.4 test this replaces (the window computed
+    in handle() must actually reach the recursion, or the cron's --since
+    filter is silently dead while every pure-helper test stays green).
+    Story 2.6 changed only the CHANNEL: the window is its own depth-1
+    `date_window=` parameter instead of being appended in place onto
+    `args.only`, which is an operator filter applying at every depth.
+    `only` must therefore now arrive UNTOUCHED. The command module's OWN
     `scan_tapeless_dir` and `CustomLogger` attributes are minimally
     monkeypatched (our module, sanctioned — not portal mocking; since story
     1.5 the real config read tolerates an absent portal.conf via
@@ -146,9 +150,11 @@ def test_since_window_reaches_scan_only_filter(
         [(now - timedelta(days=1)).strftime("%Y%m%d"), now.strftime("%Y%m%d")]
         for now in (now_before, now_after)
     ]
-    # args.only starts [] and handle() appends the window in place, so the
-    # very list object the scan received must carry the window values.
-    assert captured["only"] in candidates
+    # The window travels as its own depth-1 parameter...
+    assert captured["date_window"] in candidates
+    # ...and `only` is no longer mutated: --only was not given, so the
+    # recursion receives the empty operator filter it was handed.
+    assert captured["only"] == []
 
     # Story 2.1 wiring: handle() built one ScanContext carrying the
     # resolved root, threaded it into the recursion, and seeded the
@@ -166,8 +172,8 @@ def test_since_window_reaches_scan_only_filter(
         if m.startswith("Scanning folders from ")
     ]
     assert window_lines == [
-        f"Scanning folders from {captured['only'][0]} to {captured['only'][-1]} "
-        f"(2 day folders)"
+        f"Scanning folders from {captured['date_window'][0]} to "
+        f"{captured['date_window'][-1]} (2 day folders)"
     ]
     assert not any(
         m.startswith("Scanning from ") for m in _CapturingLogger.last.messages
