@@ -173,6 +173,14 @@ class Provider:
         probe, because a membership miss is confirmed against the real
         filesystem before answering False.
 
+        The probe is SPECULATIVE and says so (``probe=True``): a card
+        provider guarded on sidecar presence probes for the layout it
+        knows on every file it is offered, so the sibling directory it
+        looks in (``../CLIP``, ``../CLIPINF``) legitimately does not
+        exist on a card of any other type. That is an ANSWER — "not my
+        card" — and must not land in the folder's errors. A sibling
+        directory that exists but cannot be READ still does.
+
         ``FolderListings`` normalizes internally, so callers keep passing
         their un-normalized path (in xdcam it doubles as a cache key).
         Without listings this is exactly ``os.path.isfile``.
@@ -181,7 +189,7 @@ class Provider:
             listings = context.get("listings")
             if listings is not None:
                 if os.path.isabs(path):
-                    return listings.is_file(path)
+                    return listings.is_file(path, probe=True)
                 # The verification API refuses relative paths by contract
                 # (they would resolve against the process CWD). Surface
                 # the caller bug instead of silently answering from it.

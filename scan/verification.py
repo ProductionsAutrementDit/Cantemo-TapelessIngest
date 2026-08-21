@@ -37,18 +37,42 @@ Symlink semantics (the hybrid presence ruling):
 
 Scandir failure: an ``OSError`` from the ``os.scandir`` call or its
 iteration (missing dir, unreadable ``0o000``) yields an empty listing
-with ``error=str(e)`` recorded — unsurfaced until story 2.6 (FR-22),
-exposed to it via ``FolderListings.errors()``. An ``OSError`` from a
-single entry's type probes skips only that entry (it will miss-confirm
-at query time).
+with ``error=str(e)`` and ``errno`` recorded — surfaced by story 2.6
+(FR-22) via ``FolderListings.errors()``. An ``OSError`` from a single
+entry's type probes skips only that entry (it will miss-confirm at query
+time).
+
+Which failures are REPORTED — the two axes (production fix, Epic 2):
+- ORIGIN. A query may be SCAN-REQUIRED (the walk listing a folder, the
+  worker verifying an indexed file) or a speculative provider PROBE
+  (``probe=True``): a card provider guarded on sidecar presence probes
+  ``../CLIP/…``, ``../CLIPINF/…`` for every file it is offered, on cards
+  that are not its card type at all.
+- ERRNO. ``ENOENT``/``ENOTDIR`` mean the directory IS NOT THERE, which is
+  an ANSWER; every other ``OSError`` (``EACCES`` above all) means the
+  listing could not be TAKEN, which is a failure whoever asked.
+
+``errors()`` reports everything EXCEPT the one combination that is
+neither wrong nor interesting: a probe that found no directory. A probe
+into an unreadable directory is still reported — the provider silently
+did not match a card it may have had to match — and a scan-required
+listing is reported whatever the errno, ``ENOENT`` included (an indexed
+folder whose directory is gone is a real index/filesystem divergence).
+``probe_absences()`` keeps the suppressed set auditable.
 
 The API is deliberately wider than 2.2 needs: it is the reuse surface
 for 2.3 sidecar probes (FR-16, incl. parent-directory probes such as
 xdcam's ``../MEDIAPRO.XML``) and 2.6 subfolder discovery (FR-19).
 """
 
+import errno as errno_module
 import os
 from dataclasses import dataclass
+
+# The errnos that mean "there is no such directory". A listing that fails
+# with one of these ANSWERED the question — nothing is there — where any
+# other OSError means the answer is unknown. See the module docstring.
+ABSENT_ERRNOS = frozenset({errno_module.ENOENT, errno_module.ENOTDIR})
 
 
 def _normalize(path: str) -> str:
@@ -74,7 +98,9 @@ class DirectoryListing:
     with ``follow_symlinks=False`` (a symlinked dir is in ``names`` and
     ``symlinks`` but never in ``dirs`` — FR-24); ``symlinks`` holds every
     symlink dirent, valid or broken. ``error`` records a failed scandir
-    (``str`` of the ``OSError``; the listing is then empty).
+    (``str`` of the ``OSError``; the listing is then empty) and ``errno``
+    that same ``OSError``'s numeric code, which is what tells a directory
+    that ISN'T THERE from one that could not be READ.
     """
 
     path: str
@@ -83,6 +109,19 @@ class DirectoryListing:
     dirs: frozenset[str]
     symlinks: frozenset[str]
     error: str | None = None
+    errno: int | None = None
+
+    @property
+    def is_absent(self) -> bool:
+        """Whether this listing failed because the directory is not there.
+
+        ``True`` only for a FAILED listing whose errno says "no such
+        directory" (``ENOENT``, or ``ENOTDIR`` when a path component is a
+        file). An empty directory listed successfully is not absent, and
+        neither is an unreadable one — that one could not be read, which
+        is a different answer from "nothing is there".
+        """
+        return self.error is not None and self.errno in ABSENT_ERRNOS
 
 
 def list_directory(path: str) -> DirectoryListing:
@@ -97,6 +136,7 @@ def list_directory(path: str) -> DirectoryListing:
     normalized = _normalize(path)
     names, files, dirs, symlinks = set(), set(), set(), set()
     error = None
+    error_number = None
     try:
         with os.scandir(normalized) as entries:
             for entry in entries:
@@ -116,7 +156,10 @@ def list_directory(path: str) -> DirectoryListing:
                 elif entry_is_dir:
                     dirs.add(entry.name)
     except OSError as e:
+        # The message format is pinned (story 2.2's ruling: `str(e)`);
+        # the errno rides alongside it, never inside it.
         error = str(e)
+        error_number = e.errno
         names, files, dirs, symlinks = set(), set(), set(), set()
     return DirectoryListing(
         path=normalized,
@@ -125,6 +168,7 @@ def list_directory(path: str) -> DirectoryListing:
         dirs=frozenset(dirs),
         symlinks=frozenset(symlinks),
         error=error,
+        errno=error_number,
     )
 
 
@@ -139,10 +183,26 @@ class FolderListings:
 
     def __init__(self):
         self._listings: dict[str, DirectoryListing] = {}
+        # Every directory at least one SCAN-REQUIRED query asked for (see
+        # the module docstring's two axes). A directory only ever reached
+        # by speculative provider probes is absent from this set, and a
+        # "no such directory" failure for it is an answer, not an error.
+        # Membership is monotonic and independent of call ORDER: a
+        # directory first probed and later required joins the set then,
+        # and its already-cached failure surfaces from that point on.
+        self._required: set[str] = set()
 
-    def get(self, directory: str) -> DirectoryListing:
-        """The (cached) listing for ``directory`` — at most one scandir."""
+    def get(self, directory: str, *, probe: bool = False) -> DirectoryListing:
+        """The (cached) listing for ``directory`` — at most one scandir.
+
+        ``probe=True`` marks the query SPECULATIVE: a provider asking
+        whether its card layout is here, not the scan asking for a
+        directory it needs. It changes nothing about the answer — only
+        whether a "no such directory" failure is reported (``errors()``).
+        """
         key = _normalize(directory)
+        if not probe:
+            self._required.add(key)
         listing = self._listings.get(key)
         if listing is None:
             listing = list_directory(key)
@@ -150,18 +210,37 @@ class FolderListings:
         return listing
 
     def errors(self) -> dict[str, str]:
-        """``{path: error}`` for every cached listing whose scandir failed.
+        """``{path: error}`` for every REPORTABLE failed listing.
 
-        Story 2.6 consumes this to surface scandir failures (FR-22);
-        the format stays ``str(e)`` per its ruling.
+        Story 2.6 consumes this to surface scandir failures (FR-22); the
+        format stays ``str(e)`` per its ruling. Reportable is everything
+        except the one combination that is neither wrong nor interesting:
+        a directory that only ever got a speculative provider PROBE and
+        turned out not to exist. Absent-but-required is reported; a probe
+        that could not READ the directory (``EACCES``, …) is reported.
         """
         return {
             listing.path: listing.error
             for listing in self._listings.values()
             if listing.error is not None
+            and not (listing.is_absent and listing.path not in self._required)
         }
 
-    def exists(self, abs_path: str) -> bool:
+    def probe_absences(self) -> dict[str, str]:
+        """``{path: error}`` for the failures ``errors()`` deliberately drops.
+
+        The suppressed set, kept auditable rather than invisible: the
+        directories no scan-required query ever asked for, which a
+        provider probe found were not there. Log-only — a card layout not
+        being present is the normal case, thousands of times per cron run.
+        """
+        return {
+            listing.path: listing.error
+            for listing in self._listings.values()
+            if listing.is_absent and listing.path not in self._required
+        }
+
+    def exists(self, abs_path: str, *, probe: bool = False) -> bool:
         """Batched ``os.path.exists``: name-membership hit, symlinks and
         misses resolved through one real ``os.path.exists``."""
         normalized = _normalize(abs_path)
@@ -169,7 +248,7 @@ class FolderListings:
         if not name:
             # Degenerate path (filesystem root): real check.
             return os.path.exists(normalized)
-        listing = self.get(directory)
+        listing = self.get(directory, probe=probe)
         if name in listing.symlinks:
             # Hybrid ruling: a symlink dirent gets one real (following)
             # check — valid symlink seen-through, broken symlink absent.
@@ -179,28 +258,28 @@ class FolderListings:
         # Miss-confirm: one real check before answering False.
         return os.path.exists(normalized)
 
-    def is_file(self, abs_path: str) -> bool:
+    def is_file(self, abs_path: str, *, probe: bool = False) -> bool:
         """Batched ``os.path.isfile`` over the ``files`` set; symlinks
         and misses resolved through one real ``os.path.isfile``."""
         normalized = _normalize(abs_path)
         directory, name = os.path.split(normalized)
         if not name:
             return os.path.isfile(normalized)
-        listing = self.get(directory)
+        listing = self.get(directory, probe=probe)
         if name in listing.files:
             return True
         # Symlink dirent (hybrid ruling) or membership miss (confirm):
         # both resolve with one real, link-following check.
         return os.path.isfile(normalized)
 
-    def is_dir(self, abs_path: str) -> bool:
+    def is_dir(self, abs_path: str, *, probe: bool = False) -> bool:
         """Batched ``os.path.isdir`` over the ``dirs`` set; symlinks
         and misses resolved through one real ``os.path.isdir``."""
         normalized = _normalize(abs_path)
         directory, name = os.path.split(normalized)
         if not name:
             return os.path.isdir(normalized)
-        listing = self.get(directory)
+        listing = self.get(directory, probe=probe)
         if name in listing.dirs:
             return True
         return os.path.isdir(normalized)

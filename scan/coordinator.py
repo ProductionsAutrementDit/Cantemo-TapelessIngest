@@ -611,6 +611,12 @@ def _child_items(
     NEWLY discovered are reported, it also stops the same
     ``Error listing directory`` string being appended twice.
 
+    This ``get`` is SCAN-REQUIRED (the default): the walk needs this
+    directory, so its failure is reported whatever the errno — including
+    the ``ENOENT`` that is silenced for a provider's speculative sidecar
+    probe. A folder that vanished between the index and the walk is a
+    real divergence, not a card layout that is simply not there.
+
     ``seen_real_paths`` is the run-wide realpath set (NFR-1). A bind mount
     or a hardlinked directory gives one physical tree two distinct paths;
     walking both means two scans racing to ingest the same clips before

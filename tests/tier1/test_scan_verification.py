@@ -14,9 +14,14 @@ FR-24 symlinked-dir fixture, valid/broken symlinks under the hybrid
 ruling, through-link queries, FIFO dirents, ``..`` normalization,
 per-entry OSError skip, empty directories, and scandir OSError handling
 (missing dir + the tested ``0o000`` permission case).
+
+Also the reportability matrix (origin x errno) that the Epic 2
+production dry run forced: a speculative provider probe finding no
+directory is an answer, everything else is still a failure.
 """
 
 import dataclasses
+import errno
 import os
 import subprocess
 import sys
@@ -389,3 +394,102 @@ def test_unreadable_directory_answers_like_todays_real_checks(tmp_path):
     finally:
         # Restore: pytest's tmp_path GC of prior runs fails on 0o000 dirs.
         locked.chmod(0o755)
+
+
+# --------------------------------------------------------------------------
+# Probe-origin vs errno: which failed listings are REPORTABLE
+#
+# Production defect (Epic 2 dry run): a card provider guarded on sidecar
+# presence probes `../CLIP/…` on every file, so a DJI folder's missing
+# `DCIM/CLIP` sibling emitted a phantom `Error listing directory` line.
+# Absence answers a probe; unreadability never does, and the scan's own
+# paths are reported whatever the errno.
+# --------------------------------------------------------------------------
+
+
+def test_a_failed_listing_records_the_errno_alongside_the_message(tmp_path):
+    gone = list_directory(str(tmp_path / "never_created"))
+    assert gone.errno == errno.ENOENT
+    assert gone.is_absent is True
+
+    (tmp_path / "a_file").write_bytes(b"not a directory")
+    not_a_dir = list_directory(str(tmp_path / "a_file" / "CLIP"))
+    assert not_a_dir.errno == errno.ENOTDIR
+    assert not_a_dir.is_absent is True
+
+    # A successfully listed (even empty) directory is not "absent".
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    listed = list_directory(str(empty))
+    assert listed.errno is None
+    assert listed.is_absent is False
+
+
+def test_a_probe_into_a_missing_directory_is_not_reported(tmp_path):
+    listings = FolderListings()
+    absent_sidecar = tmp_path / "CLIP" / "DJI_0001.XML"
+    assert listings.is_file(str(absent_sidecar), probe=True) is False
+    # Not an error — but auditable rather than invisible.
+    assert listings.errors() == {}
+    assert listings.probe_absences() == {
+        str(tmp_path / "CLIP"): listings.get(str(tmp_path / "CLIP"), probe=True).error
+    }
+
+
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="root ignores 0o000 directory permissions",
+)
+def test_a_probe_into_an_unreadable_directory_is_still_reported(tmp_path):
+    locked = tmp_path / "CLIP"
+    locked.mkdir()
+    (locked / "DJI_0001.XML").write_bytes(b"<xml/>")
+    locked.chmod(0o000)
+    try:
+        listings = FolderListings()
+        # The probe answers False, exactly like os.path.isfile does...
+        assert listings.is_file(str(locked / "DJI_0001.XML"), probe=True) is False
+        # ...but the scan could not LOOK: that is a failure, not an answer.
+        assert listings.errors() == {
+            str(locked): listings.get(str(locked), probe=True).error
+        }
+        assert listings.probe_absences() == {}
+    finally:
+        locked.chmod(0o755)
+
+
+def test_a_scan_required_missing_directory_is_reported(tmp_path):
+    """ENOENT is silenced for probes only — never for the scan's own paths."""
+    gone = tmp_path / "never_created"
+    listings = FolderListings()
+    # The default origin is scan-required: the walk listing a folder, the
+    # worker verifying an indexed file.
+    assert listings.exists(str(gone / "clip.fake")) is False
+    assert listings.errors() == {str(gone): listings.get(str(gone)).error}
+    assert listings.probe_absences() == {}
+
+
+def test_a_probed_then_required_directory_becomes_reportable(tmp_path):
+    """Reportability is a property of the DIRECTORY, not of the first caller.
+
+    The cached listing is reused (no second scandir); only its
+    reportability changes when a scan-required query asks for it.
+    """
+    gone = tmp_path / "never_created"
+    listings = FolderListings()
+    assert listings.is_file(str(gone / "SIDE.XML"), probe=True) is False
+    assert listings.errors() == {}
+
+    first = listings.get(str(gone), probe=True)
+    assert listings.get(str(gone)) is first
+    assert listings.errors() == {str(gone): first.error}
+    assert listings.probe_absences() == {}
+
+
+def test_a_required_then_probed_directory_stays_reportable(tmp_path):
+    """The other order: a later probe never un-reports a required failure."""
+    gone = tmp_path / "never_created"
+    listings = FolderListings()
+    assert listings.exists(str(gone / "clip.fake")) is False
+    assert listings.is_file(str(gone / "SIDE.XML"), probe=True) is False
+    assert listings.errors() == {str(gone): listings.get(str(gone)).error}

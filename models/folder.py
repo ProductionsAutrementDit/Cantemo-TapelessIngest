@@ -1087,6 +1087,22 @@ class Folder(models.Model):
             # FR-22: story 2.2 recorded every failed scandir on the
             # listings cache and left them unsurfaced. They join this
             # folder's errors, path-sorted so a cron log is deterministic.
+            #
+            # `errors()` excludes the directories only a speculative
+            # provider probe ever asked for and that turned out not to
+            # exist — a card provider looking for a layout this card does
+            # not have. Reporting those made the error COUNT worthless
+            # (one phantom line per non-matching card folder, thousands a
+            # week); they stay visible at DEBUG. Everything else is
+            # reported, a probe into an unreadable directory included.
+            probe_absences = listings.probe_absences()
+            if probe_absences:
+                log.debug(
+                    "%s: %d sidecar probe(s) found no directory (not errors): %s",
+                    self.path,
+                    len(probe_absences),
+                    ", ".join(sorted(probe_absences)),
+                )
             for listing_path, listing_error in sorted(listings.errors().items()):
                 response["errors"].append(
                     f"Error listing directory {listing_path}: {listing_error}"
