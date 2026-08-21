@@ -12,11 +12,14 @@ No other Portal mocking is allowed anywhere in the test tree: no
 `monkeypatch` of `portal.*`.
 """
 
+import json
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 from types import ModuleType
+from urllib.parse import urlencode
 
 log = logging.getLogger(__name__)
 
@@ -299,6 +302,12 @@ class StorageHelperFake:
         cls.hash_errors.clear()
         cls.get_files_in_storage_calls.clear()
 
+    def removeFileItemRelationship(self, storage_id, file_id):
+        """Detach a file from its item (the replace path's first half)."""
+        VidispineFake.record(
+            "removeFileItemRelationship", storage_id=storage_id, file_id=file_id
+        )
+
     def getStorage(self, storage_id):
         cls = type(self)
         cls.get_storage_calls[storage_id] = cls.get_storage_calls.get(storage_id, 0) + 1
@@ -317,6 +326,358 @@ class StorageHelperFake:
             f"set_missing (silent success would hide unintended storage "
             f"traffic)"
         )
+
+
+class VidispineFake:
+    """Shared configuration and call log for the ingest-side helper doubles.
+
+    ``Clip.import_file`` is the plugin's riskiest function and was, until
+    now, unreachable off-server: it constructs six Portal helpers with
+    prod constructor keywords the placeholders refused. So a mutation
+    reverting FR-36's verdict ladder left the whole suite green.
+
+    AD-11 forbids Portal mocking OUTSIDE this package; INSIDE it, this is
+    the sanctioned place. What is modelled here is deliberately the
+    narrow surface ``import_file`` drives, with every ANSWER configured
+    per test — the fakes decide nothing, they only carry what a test
+    said Vidispine would reply and record what was asked.
+
+    Configure:
+    - ``set_import_response(response)`` — what the next
+      ``importFileToPlaceholder`` / ``doImportToPlaceholder`` returns
+      (queue; ``default_import_response`` once it is empty);
+    - ``set_original_shape(item_id, shape_id, files)`` — the "original"
+      shapes ``getItemShapesFromNames`` reports for an item, and the
+      files on each; an unconfigured item has none, i.e. a bare
+      placeholder;
+    - ``set_item(item_id, item)`` — an item ``getItem`` finds.
+
+    Read ``calls`` for what was asked, in order.
+    """
+
+    import_responses = []
+    default_import_response = {"jobId": "VX-JOB-DEFAULT"}
+    items = {}
+    item_shapes = {}
+    calls = []
+    _placeholder_counter = 0
+
+    @classmethod
+    def reset(cls):
+        cls.import_responses.clear()
+        cls.items.clear()
+        cls.item_shapes.clear()
+        cls.calls.clear()
+        cls._placeholder_counter = 0
+
+    @classmethod
+    def record(cls, name, **details):
+        cls.calls.append((name, details))
+
+    @classmethod
+    def call_names(cls):
+        return [name for name, _ in cls.calls]
+
+    @classmethod
+    def set_import_response(cls, response):
+        cls.import_responses.append(response)
+
+    @classmethod
+    def next_import_response(cls):
+        if cls.import_responses:
+            return cls.import_responses.pop(0)
+        return dict(cls.default_import_response)
+
+    @classmethod
+    def set_item(cls, item_id, item=None):
+        cls.items[item_id] = item if item is not None else FakeItem(item_id)
+        return cls.items[item_id]
+
+    @classmethod
+    def set_original_shape(cls, item_id, shape_id, files=()):
+        cls.item_shapes.setdefault(item_id, []).append(
+            {"id": shape_id, "files": list(files)}
+        )
+
+    @classmethod
+    def new_placeholder_id(cls):
+        cls._placeholder_counter += 1
+        return f"VX-PLACEHOLDER-{cls._placeholder_counter}"
+
+
+class FakeItem:
+    """VS item: only the two accessors the plugin calls."""
+
+    def __init__(self, item_id, metadata=None):
+        self._item_id = item_id
+        self._metadata = metadata if metadata is not None else [{}]
+
+    def getId(self):
+        return self._item_id
+
+    def getMetadata(self):
+        return self._metadata
+
+
+class FakeJob:
+    def __init__(self, job_id):
+        self._job_id = job_id
+
+    def getId(self):
+        return self._job_id
+
+
+class FakeIngestGroup:
+    def __init__(self, name="Ingest"):
+        self.name = name
+
+    def __str__(self):
+        return self.name
+
+
+class FakeShapeFile:
+    def __init__(self, file_id, storage):
+        self._file_id = file_id
+        self._storage = storage
+
+    def getId(self):
+        return self._file_id
+
+    def getStorage(self):
+        return self._storage
+
+
+class VSShapeFake:
+    """VidiRest.objects.shape.VSShape over a plain response dict."""
+
+    def __init__(self, response, replace_urls=None):
+        self._response = response or {}
+        self._replace_urls = replace_urls
+
+    def getId(self):
+        return self._response.get("id")
+
+    def getAllFiles(self):
+        return [
+            FakeShapeFile(entry.get("id"), entry.get("storage"))
+            for entry in self._response.get("files", [])
+        ]
+
+
+class VSAPIFake:
+    """What ItemAPI reads off the helper's ``_vsapi``."""
+
+    super_url = "http://vidispine.test/"
+    base64string = "dGVzdDp0ZXN0"
+
+
+class RestURLFake:
+    """RestAPIBase.resturl.RestURL — URL building, no I/O."""
+
+    def __init__(self, url):
+        self._url = url
+        self._query = {}
+
+    def addQuery(self, query):
+        self._query.update(query)
+
+    def geturl(self):
+        if not self._query:
+            return self._url
+        return f"{self._url}?{urlencode(self._query, doseq=True)}"
+
+
+class RestTransportFake:
+    """The RestAPIBase request pair, answering from VidispineFake.
+
+    ``ItemAPIEnhanced.getItemShapeIdsFromNames`` is real plugin code that
+    goes through these two functions, so they are what makes it runnable
+    off-server — and what pins the URL it builds.
+    """
+
+    calls = []
+
+    @classmethod
+    def reset(cls):
+        cls.calls.clear()
+
+    @classmethod
+    def prepare(cls, base64string, url, runasuser=None, return_format="json"):
+        return {"url": url, "runasuser": runasuser, "return_format": return_format}
+
+    @classmethod
+    def perform(cls, url=None, runasuser=None, return_format="json", **kwargs):
+        cls.calls.append(url)
+        match = re.search(r"/item/([^/?]+)/shape", url or "")
+        if match:
+            shapes = VidispineFake.item_shapes.get(match.group(1), [])
+            return json.dumps({"uri": [shape["id"] for shape in shapes]})
+        raise AssertionError(
+            f"RestTransportFake.perform called for an unmodelled URL {url!r} — "
+            f"silent success would hide unintended Vidispine traffic"
+        )
+
+
+class _HelperFake:
+    """Common constructor surface of the Portal Vidispine helpers.
+
+    Prod builds them per call site with ``runas=``/``user=``/``slug=``;
+    accepting those keywords is the whole reason this class exists.
+    """
+
+    def __init__(self, runas=None, user=None, slug=None):
+        self.runas = runas
+        self.user = user
+        self.slug = slug
+        self._vsapi = VSAPIFake()
+        provide = getattr(self, "provideItemAPI", None)
+        if callable(provide):
+            # Prod's helpers wire their API object at construction; the
+            # plugin's ItemHelperExtended / TapelessIngestHelper rely on it.
+            provide()
+
+
+class ItemAPIFake:
+    """VidiRest.itemapi.ItemAPI — the calls the plugin makes on it."""
+
+    def __init__(self, vsapi=None):
+        self.vsapi = vsapi or VSAPIFake()
+
+    def getItemShape(self, item_id=None, shape_id=None, runasuser=None):
+        for shape in VidispineFake.item_shapes.get(item_id, []):
+            if shape["id"] == shape_id:
+                return shape
+        return {"id": shape_id, "files": []}
+
+    def createPlaceholderShape(self, item_id, runasuser=None):
+        VidispineFake.record("createPlaceholderShape", item_id=item_id)
+        return f"{item_id}-SHAPE".encode("UTF-8")
+
+    def removeItemShape(self, item_id, shape_id, runasuser=None):
+        VidispineFake.record("removeItemShape", item_id=item_id, shape_id=shape_id)
+
+    def updatePlaceholderComponentCount(
+        self, item_id, shape_id, container=None, video=None, audio=None
+    ):
+        VidispineFake.record(
+            "updatePlaceholderComponentCount",
+            item_id=item_id,
+            shape_id=shape_id,
+            video=video,
+            audio=audio,
+        )
+
+    def doImportToPlaceholder(
+        self,
+        item_id,
+        query=None,
+        matrix=None,
+        component="container",
+        ingestprofile_groups=None,
+        ignore_sidecars=False,
+        runasuser=None,
+        return_format="json",
+    ):
+        VidispineFake.record(
+            "doImportToPlaceholder",
+            item_id=item_id,
+            component=component,
+            query=query,
+        )
+        return VidispineFake.next_import_response()
+
+
+class ItemHelperFake(_HelperFake):
+    """portal.vidispine.iitem.ItemHelper."""
+
+    def getItem(self, item_id):
+        VidispineFake.record("getItem", item_id=item_id)
+        item = VidispineFake.items.get(item_id)
+        if item is None:
+            raise NotFoundError(f"item {item_id} not found (unconfigured)")
+        return item
+
+    def createPlaceholder(self, metadata_document=None, settingsprofile_id=None):
+        item_id = VidispineFake.new_placeholder_id()
+        VidispineFake.record("createPlaceholder", item_id=item_id)
+        return VidispineFake.set_item(item_id)
+
+    def setItemMetadata(self, item_id, metadata_document=None):
+        VidispineFake.record("setItemMetadata", item_id=item_id)
+
+    def setItemMetadataFieldGroup(self, item_id, group_name):
+        VidispineFake.record(
+            "setItemMetadataFieldGroup", item_id=item_id, group=group_name
+        )
+
+
+class IngestHelperFake(_HelperFake):
+    """portal.vidispine.iitem.IngestHelper — the single-component import."""
+
+    def importFileToPlaceholder(
+        self,
+        item_id,
+        file_id=None,
+        ingestprofile_groups=None,
+        notification_id=None,
+        noTranscode=None,
+        ignore_sidecars=False,
+    ):
+        VidispineFake.record(
+            "importFileToPlaceholder", item_id=item_id, file_id=file_id
+        )
+        return VidispineFake.next_import_response()
+
+
+class JobHelperFake(_HelperFake):
+    def getJob(self, job_id):
+        VidispineFake.record("getJob", job_id=job_id)
+        return FakeJob(job_id)
+
+    def getAllJobsForItem(self, item_id):
+        VidispineFake.record("getAllJobsForItem", item_id=item_id)
+        return []
+
+
+class GroupHelperFake(_HelperFake):
+    def getUserIngestGroups(self):
+        group = FakeIngestGroup()
+        return [group], group
+
+
+class UserHelperFake(_HelperFake):
+    def getUserSettingsProfile(self, basegroup=None):
+        return "VX-6"
+
+
+class CollectionHelperFake(_HelperFake):
+    def getCollection(self, collection_id):
+        VidispineFake.record("getCollection", collection_id=collection_id)
+        return {"id": collection_id}
+
+    def createCollection(self, collection_name=None, settingsprofile_id=None):
+        VidispineFake.record("createCollection", name=collection_name)
+        return FakeItem(f"VX-COLLECTION-{collection_name}")
+
+    def addCollectionToCollection(self, parent_id, collection_id):
+        VidispineFake.record(
+            "addCollectionToCollection", parent=parent_id, child=collection_id
+        )
+
+    def addItemToCollection(self, collection_id, item_id):
+        VidispineFake.record(
+            "addItemToCollection", collection_id=collection_id, item_id=item_id
+        )
+
+
+def create_metadata_document_fake(metadata, groups=None):
+    """VidiRest.helpers.vidispine.createMetadataDocumentFromDict."""
+    return {"metadata": metadata, "groups": groups}
+
+
+def create_merged_metadata_document_fake(md, custom_metadata, mode):
+    """VidiRest.helpers.vidispine.createMergedBatchItemMetadataDocument."""
+    return {"merged": md, "onto": custom_metadata, "mode": mode}
 
 
 class SignalFake:
@@ -397,6 +758,16 @@ _MODULES = {
         "IPluginBlock": _stub_class("IPluginBlock"),
         "IAppRegister": _stub_class("IAppRegister"),
     },
+    # views.py's Portal base classes and permission decorator. Import-time
+    # surface only: the sweep proves the module loads, it does not serve
+    # requests.
+    "portal.generic.baseviews": {
+        "CView": _stub_class("CView"),
+        "ClassView": _stub_class("ClassView"),
+    },
+    "portal.generic.decorators": {
+        "isAdminPermission": _stub_class("isAdminPermission"),
+    },
     "portal.search": {},
     "portal.search.elastic": {"query_elastic": query_elastic_fake},
     "portal.api": {},
@@ -415,17 +786,15 @@ _MODULES = {
         "vidispine_pre_ingest": vidispine_pre_ingest,
         "vidispine_post_ingest": vidispine_post_ingest,
     },
-    "portal.vidispine.ijob": {"JobHelper": _stub_class("JobHelper")},
+    "portal.vidispine.ijob": {"JobHelper": JobHelperFake},
     "portal.vidispine.iitem": {
-        "ItemHelper": _stub_class("ItemHelper"),
-        "IngestHelper": _stub_class("IngestHelper"),
+        "ItemHelper": ItemHelperFake,
+        "IngestHelper": IngestHelperFake,
     },
-    "portal.vidispine.icollection": {
-        "CollectionHelper": _stub_class("CollectionHelper")
-    },
-    "portal.vidispine.igroup": {"GroupHelper": _stub_class("GroupHelper")},
+    "portal.vidispine.icollection": {"CollectionHelper": CollectionHelperFake},
+    "portal.vidispine.igroup": {"GroupHelper": GroupHelperFake},
     "portal.vidispine.istorage": {"StorageHelper": StorageHelperFake},
-    "portal.vidispine.iuser": {"UserHelper": _stub_class("UserHelper")},
+    "portal.vidispine.iuser": {"UserHelper": UserHelperFake},
     "portal.vidispine.iexception": {
         "handleRestAPIError": _stub_callable(
             "portal.vidispine.iexception.handleRestAPIError"
@@ -453,24 +822,20 @@ _MODULES = {
     },
     "portal.plugins": {},
     "VidiRest": {},
-    "VidiRest.itemapi": {"ItemAPI": _stub_class("ItemAPI")},
+    "VidiRest.itemapi": {"ItemAPI": ItemAPIFake},
     "VidiRest.objects": {},
     "VidiRest.objects.storage": {"VSFile": VSFile},
-    "VidiRest.objects.shape": {"VSShape": _stub_class("VSShape")},
+    "VidiRest.objects.shape": {"VSShape": VSShapeFake},
     "VidiRest.helpers": {},
     "VidiRest.helpers.vidispine": {
-        "createMetadataDocumentFromDict": _stub_callable(
-            "VidiRest.helpers.vidispine.createMetadataDocumentFromDict"
-        ),
-        "createMergedBatchItemMetadataDocument": _stub_callable(
-            "VidiRest.helpers.vidispine.createMergedBatchItemMetadataDocument"
-        ),
+        "createMetadataDocumentFromDict": create_metadata_document_fake,
+        "createMergedBatchItemMetadataDocument": create_merged_metadata_document_fake,
     },
     "RestAPIBase": {},
-    "RestAPIBase.resturl": {"RestURL": _stub_class("RestURL")},
+    "RestAPIBase.resturl": {"RestURL": RestURLFake},
     "RestAPIBase.utility": {
-        "perform_request": _stub_callable("RestAPIBase.utility.perform_request"),
-        "prepare_request": _stub_callable("RestAPIBase.utility.prepare_request"),
+        "perform_request": RestTransportFake.perform,
+        "prepare_request": RestTransportFake.prepare,
         "RestAPIBaseComError": RestAPIBaseComError,
     },
     "pyxb": {},

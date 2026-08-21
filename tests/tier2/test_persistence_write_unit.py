@@ -28,7 +28,7 @@ filesystem verification is real-FS and deliberate.
 import os
 
 import pytest
-from django.db import connection
+from django.db import DatabaseError, connection, transaction
 from django.test.utils import CaptureQueriesContext
 
 from portal.plugins.TapelessIngest.models.clip import Clip, ClipMetadata
@@ -133,6 +133,53 @@ def bad_sidecar_provider():
     Clip._PROVIDER_CACHE[BAD_SIDECAR_NAME] = provider
     yield provider
     Clip._PROVIDER_CACHE.pop(BAD_SIDECAR_NAME, None)
+
+
+ABSOLUTE_SIDECAR_NAME = "fakeabsolutesidecar"
+
+
+class AbsoluteSidecarProvider(BaseProvider):
+    """Declares an ABSOLUTE ``clip_xml_file`` in a sibling directory.
+
+    Not a synthetic shape: panasonicP2 and ikegami both resolve their
+    sidecars to absolute paths outside the media file's own directory
+    (``../CLIP/…``, ``../CLIPINF/…``). Without
+    ``Clip._sidecar_absolute_path``'s ``isabs`` branch, FR-12 silently
+    stops delivering for every clip of those two card formats — the rows
+    are written, ``clip_xml`` stays empty forever, and the only trace is
+    one swallowed ERROR per clip.
+    """
+
+    machine_name = ABSOLUTE_SIDECAR_NAME
+
+    def __init__(self, sidecar_path=None):
+        BaseProvider.__init__(self)
+        self.name = "Fake Absolute Sidecar Provider"
+        self.machine_name = ABSOLUTE_SIDECAR_NAME
+        self.sidecar_path = sidecar_path
+
+    def getExtensions(self):
+        return [".abs"]
+
+    def getSubPaths(self):
+        return []
+
+    def getFilters(self, escaped_path):
+        return []
+
+    def getMetadatasFromFile(self, media_file, metadatas, context):
+        metadatas["provider"] = self.machine_name
+        metadatas["umid"] = os.path.splitext(media_file.getPath())[0]
+        metadatas["clip_xml_file"] = self.sidecar_path
+        return metadatas
+
+
+@pytest.fixture
+def absolute_sidecar_provider():
+    provider = AbsoluteSidecarProvider()
+    Clip._PROVIDER_CACHE[ABSOLUTE_SIDECAR_NAME] = provider
+    yield provider
+    Clip._PROVIDER_CACHE.pop(ABSOLUTE_SIDECAR_NAME, None)
 
 
 def _rescanned_folder(tmp_path, rel):
@@ -478,6 +525,78 @@ def test_zero_hit_folder_writes_no_folder_row(
     assert Clip.objects.count() == 0
 
 
+def test_a_scan_writes_only_the_folder_columns_it_owns(
+    migrated_db, es_fake, es_page, fake_provider, tmp_path
+):
+    """FOLDER_SCAN_FIELDS is an allow-list, not a comment.
+
+    The instance a scan runs on can carry state a previous phase put
+    there — a collection_id an ingest resolved, say. A full save() writes
+    all of it back; the scan owns three columns.
+    """
+    rel = "2026/AH_20260101_folderfields"
+    sources = _write_clips(tmp_path, rel, ["CLIPFF"])
+    Folder.objects.create(
+        path=rel, storage_id=STORAGE_ID, collection_id="VX-REAL-COLLECTION"
+    )
+    es_fake.push(es_page(sources, total=1))
+
+    folder = _rescanned_folder(tmp_path, rel)
+    # A stale value on the instance, exactly as a caller could leave it.
+    folder.collection_id = "VX-STALE"
+    response = folder.scan(providers=[fake_provider.machine_name])
+
+    assert response["errors"] == []
+    saved = Folder.objects.get(path=rel, storage_id=STORAGE_ID)
+    assert saved.collection_id == "VX-REAL-COLLECTION"
+    # ...while the columns the scan does own were written.
+    assert saved.provider_names == fake_provider.machine_name
+    assert saved.scanned_on is not None
+
+
+def test_batched_writes_lose_no_rows(
+    migrated_db, es_fake, es_page, fake_provider, tmp_path, monkeypatch
+):
+    """Every write is chunked; chunking must not drop or duplicate rows.
+
+    The real ceiling (PostgreSQL's 65535 bind parameters) needs thousands
+    of files to reach, so the batch size is shrunk instead — the code
+    path is the same one a big card tree takes.
+    """
+    from portal.plugins.TapelessIngest.models import clip as clip_module
+    from portal.plugins.TapelessIngest.models import folder as folder_module
+
+    monkeypatch.setattr(clip_module, "BULK_BATCH_SIZE", 2)
+    monkeypatch.setattr(folder_module, "BULK_BATCH_SIZE", 2)
+
+    rel = "2026/AH_20260101_batched"
+    names = [f"CLIPB{index}" for index in range(7)]
+    es_fake.push(es_page(_write_clips(tmp_path, rel, names), total=7))
+
+    with CaptureQueriesContext(connection) as captured:
+        response = _folder(tmp_path, rel).scan(providers=[fake_provider.machine_name])
+
+    assert response["errors"] == []
+    assert Clip.objects.count() == 7
+    # provider + umid for each clip, none lost to a batch boundary.
+    assert ClipMetadata.objects.count() == 14
+
+    # And the writes really were split: 7 rows at 2 per statement is 4
+    # statements. Without a batch size it is ONE statement whatever the
+    # row count — which is the failure mode (all 7, or all 70000, in a
+    # single parameter list).
+    def _inserts(table):
+        return [
+            query["sql"]
+            for query in captured.captured_queries
+            if query["sql"].lstrip().upper().startswith("INSERT")
+            and table in query["sql"]
+        ]
+
+    assert len(_inserts('"TapelessIngest_clip"')) == 4
+    assert len(_inserts("TapelessIngest_clipmetadata")) == 7
+
+
 def test_multipage_folder_saved_once(
     migrated_db, es_fake, es_page, fake_provider, tmp_path
 ):
@@ -537,6 +656,40 @@ def test_persist_metadatas_is_idempotent(migrated_db):
     clip.persist_metadatas()
 
     assert ClipMetadata.objects.count() == 1
+
+
+def test_persist_metadatas_failure_does_not_poison_an_outer_transaction(
+    migrated_db, monkeypatch
+):
+    """The REST endpoint calls this inside a request transaction.
+
+    Its two statements (upsert + stale delete) are one edit of a clip's
+    key-set, so they are atomic; nested in a caller's transaction that
+    atomic block is a SAVEPOINT, which is what lets the caller carry on
+    after catching the error instead of being marked for rollback.
+    """
+    clip = Clip.objects.create(
+        umid="SAVEPOINT-1", path="2026/X", storage_id=STORAGE_ID, reference_file="F"
+    )
+    clip.metadatas = {"clipname": "value"}
+
+    def boom(writes, stale_deletes):
+        # Touch the DB first so the savepoint has something to roll back.
+        ClipMetadata.objects.create(clip_id="SAVEPOINT-1", name="half", value="written")
+        raise DatabaseError("stale delete exploded")
+
+    monkeypatch.setattr(Clip, "persist_metadatas_bulk", staticmethod(boom))
+
+    with transaction.atomic():
+        with pytest.raises(DatabaseError):
+            clip.persist_metadatas()
+        # The outer transaction is still usable — and the half-write is gone.
+        assert ClipMetadata.objects.count() == 0
+        Clip.objects.create(
+            umid="SAVEPOINT-2", path="2026/X", storage_id=STORAGE_ID, reference_file="F"
+        )
+
+    assert Clip.objects.filter(pk="SAVEPOINT-2").exists()
 
 
 def test_persist_metadatas_without_a_memo_writes_nothing(migrated_db):
@@ -640,6 +793,62 @@ def test_clip_xml_parse_failure_never_costs_the_clip(
     ), caplog.text
 
 
+def test_absolute_sidecar_outside_the_clip_directory_is_stored(
+    migrated_db, es_fake, es_page, absolute_sidecar_provider, tmp_path
+):
+    """FR-12 for the card formats that declare absolute sidecar paths."""
+    rel = "2026/AH_20260101_abssidecar/AUDIO"
+    sidecar_dir = tmp_path / "2026/AH_20260101_abssidecar/CLIPINF"
+    sidecar_dir.mkdir(parents=True)
+    (sidecar_dir / "C0001M01.XML").write_bytes(XDCAM_SIDECAR)
+    absolute_sidecar_provider.sidecar_path = str(sidecar_dir / "C0001M01.XML")
+
+    (tmp_path / rel).mkdir(parents=True)
+    (tmp_path / rel / "C0001.abs").write_bytes(b"media payload")
+    es_fake.push(es_page([_source(f"{rel}/C0001.abs", "VX-41-ABS")], total=1))
+
+    response = _folder(tmp_path, rel).scan(providers=[ABSOLUTE_SIDECAR_NAME])
+
+    assert response["errors"] == []
+    stored = Clip.objects.get(pk=f"{rel}/C0001").clip_xml
+    assert stored, "the absolute sidecar never reached clip_xml"
+    assert "XDCAM-UMID-C0001" in stored
+
+
+def test_a_stored_clip_xml_is_never_re_read_from_the_card(
+    migrated_db, es_fake, es_page, tmp_path
+):
+    """FR-12's whole point: the column is filled ONCE.
+
+    Without ``load_clip_xml``'s "only fills an empty column" guard, every
+    re-scan re-reads and re-parses every card sidecar from disk and
+    rewrites the column — the per-scan disk cost FR-12 exists to remove,
+    and a silent overwrite of the stored document.
+    """
+    rel = "2026/AH_20260101_xmlonce/XDROOT/Clip"
+    clip_dir = tmp_path / rel
+    clip_dir.mkdir(parents=True)
+    (clip_dir / "C0001.mxf").write_bytes(b"media payload")
+    (clip_dir / "C0001M01.XML").write_bytes(XDCAM_SIDECAR)
+    source = _source(f"{rel}/C0001.mxf", "VX-41-ONCE")
+
+    es_fake.push(es_page([source], total=1))
+    assert _folder(tmp_path, rel).scan(providers=["xdcam"])["errors"] == []
+    first = Clip.objects.get(pk="XDCAM-UMID-C0001").clip_xml
+    assert "250" in first
+
+    # The card is re-carded under the same umid with a different duration.
+    (clip_dir / "C0001M01.XML").write_bytes(
+        XDCAM_SIDECAR.replace(b'value="250"', b'value="999"')
+    )
+    es_fake.push(es_page([source], total=1))
+    assert _rescanned_folder(tmp_path, rel).scan(providers=["xdcam"])["errors"] == []
+
+    stored = Clip.objects.get(pk="XDCAM-UMID-C0001").clip_xml
+    assert stored == first, "a re-scan re-parsed and rewrote a stored clip_xml"
+    assert "999" not in stored
+
+
 def test_missing_sidecar_leaves_clip_xml_empty(
     migrated_db, es_fake, es_page, bad_sidecar_provider, tmp_path
 ):
@@ -679,6 +888,32 @@ def test_duplicate_folder_rows_resolve_first_by_pk(migrated_db, caplog):
     assert folder.pk == min(first.pk, second.pk)
     assert any(
         record.levelname == "WARNING" and "Duplicate Folder rows" in record.message
+        for record in caplog.records
+    ), caplog.text
+
+
+def test_duplicates_that_vanish_before_the_retry_read_yield_a_new_instance(
+    migrated_db, monkeypatch, caplog
+):
+    """``get()`` says "several", the retry read says "none".
+
+    Deleted in between (the duplicates are a data anomaly someone may be
+    cleaning up). Returning ``first()`` unchecked hands the caller
+    ``(None, False)`` — a folder that is not a folder, which blows up at
+    the next attribute access instead of here.
+    """
+
+    def raise_multiple(**kwargs):
+        raise Folder.MultipleObjectsReturned()
+
+    monkeypatch.setattr(Folder.objects, "get", raise_multiple)
+
+    folder, is_new = Folder.get_or_new(path="2026/GONE", storage_id=STORAGE_ID)
+
+    assert is_new is True
+    assert (folder.path, folder.storage_id) == ("2026/GONE", STORAGE_ID)
+    assert any(
+        record.levelname == "WARNING" and "disappeared" in record.message
         for record in caplog.records
     ), caplog.text
 

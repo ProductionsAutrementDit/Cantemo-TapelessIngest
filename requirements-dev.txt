@@ -8,5 +8,6 @@ lxml==6.0.2
 slack_sdk==3.43.0
 simplejson==3.20.2
 python-dateutil==2.9.0.post0
+djangorestframework==3.16.1
 pytest==9.1.1
 black==26.5.1

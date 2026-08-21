@@ -1,11 +1,12 @@
 import logging
+from collections.abc import Mapping
 from typing import Optional, Dict, List, Tuple, Any
 
 import os
 import urllib
 import pyxb.utils, simplejson as json
 from django.urls import reverse
-from django.db import models
+from django.db import models, transaction
 from django.contrib.auth.models import User
 from django.conf import settings
 from django.core.cache import cache
@@ -52,7 +53,9 @@ from portal.plugins.TapelessIngest.scan.context import browse_root_path
 from portal.plugins.TapelessIngest.scan.extraction import extract_metadatas
 from portal.plugins.TapelessIngest.scan.ingestion import needs_hash_recovery
 from portal.plugins.TapelessIngest.scan.persistence import (
+    BULK_BATCH_SIZE,
     MetadataWrite,
+    chunked,
     group_stale_deletes,
 )
 
@@ -62,6 +65,21 @@ log = logging.getLogger(__name__)
 # bearing: it decides which provider claims a file when several are
 # applicable. See docs/adding-a-provider.md.
 PROVIDERS_LIST = list(PROVIDER_NAMES)
+
+
+def job_id_from_response(response: Any) -> Optional[str]:
+    """The import job id in a Vidispine import response, or None.
+
+    FR-36 turns "no job id" into a failure verdict, so the check must
+    survive the shapes a helper can actually answer with: a mapping
+    without ``jobId``, an empty body, ``None``, or a non-mapping. A bare
+    ``"jobId" in response`` raises TypeError on the last two — out of
+    ``import_file``, past the per-clip catch, and into the folder's
+    error list instead of the failed counter.
+    """
+    if not isinstance(response, Mapping):
+        return None
+    return response.get("jobId") or None
 
 
 class ItemAPIEnhanced(ItemAPI):
@@ -269,16 +287,10 @@ class Clip(models.Model):
     ) -> Dict[str, Any]:
         """Pass 1 of the scan's two-pass lookup: everything before the DB.
 
-        Providers and identity validation — the head of
-        ``get_clip_from_file``, split out so a page's umids can be
+        Providers and identity validation only, so a page's umids can be
         collected first and looked up in ONE query (AD-6) instead of one
-        ``get`` per file.
-
-        Hash recovery used to live here too, i.e. BEFORE the clip was
-        known, which is what made it fire for every file on every scan.
-        Since 2.5 it is ``recover_item_id`` below, called once the lookup
-        has answered whether the clip already has an ``item_id`` (FR-8,
-        AD-15).
+        ``get`` per file. Hash recovery is NOT here: it needs the clip's
+        ``item_id``, i.e. the lookup's answer (see ``recover_item_id``).
 
         Args:
             file: VSFile instance to extract metadata from
@@ -308,27 +320,34 @@ class Clip(models.Model):
     ) -> Optional[str]:
         """Find this clip's item on a legacy storage, by file hash — if useful.
 
-        The gate is ``scan.ingestion.needs_hash_recovery`` and it is the
-        whole point of this method: a clip that already has an ``item_id``,
-        a file Cantemo has not hashed yet, or a run with no legacy
-        storages configured all cost ZERO HTTP calls. Pre-2.5 this loop
-        ran for every scanned file — one ``getFilesInStorage`` per legacy
-        storage, per file, per scan — and a hash-less file raised
-        ``TapelessIngestException`` instead of being skipped (NFR-1 rules
-        it a retry, not an error).
+        The gate is ``scan.ingestion.needs_hash_recovery``: a clip that
+        already has an ``item_id``, a file Cantemo has not hashed yet, or
+        a run with no legacy storages configured all cost ZERO HTTP calls
+        (FR-8).
 
         A recovered id is assigned to the clip whether the row is new or
-        pre-existing (ratified): recovery only ever fires when the clip
-        has no ``item_id``, so it can never overwrite a known one. The
-        scan's write unit still does not PERSIST it on an existing row
-        (``CLIP_UPDATE_FIELDS`` is 2.4/2.7 territory) — ``Clip.ingest``'s
-        targeted update is what writes it.
+        pre-existing — recovery only fires when there is no ``item_id``,
+        so it can never overwrite a known one — and the scan's write unit
+        persists it under a fill-only-NULL guard
+        (``PersistencePlan.recovered_item_ids``).
+
+        Every step is defensive: a storage that errors, a response of an
+        unexpected shape and an unreadable hash must all cost the clip
+        nothing more than this recovery attempt. Losing the clip here
+        would drop it from the write plan and leave no row at all.
 
         Returns:
             The recovered item id, or None when the gate closed or no
             legacy storage knew the hash.
         """
-        hash = file.getHash()
+        try:
+            hash = file.getHash()
+        except Exception:
+            log.error(
+                f"Cannot read the hash of {self.umid}'s scanned file",
+                exc_info=True,
+            )
+            return None
         if not needs_hash_recovery(self.item_id, hash, legacy_storages):
             return None
         sh = StorageHelper()
@@ -337,22 +356,41 @@ class Clip(models.Model):
                 results = sh.storageapi.getFilesInStorage(
                     legacy_storage, query={"hash": [hash], "includeItem": "true"}
                 )
+                item_id = self._item_id_from_hash_hits(results)
             except Exception as e:
                 log.error(
                     f"Error getting files with hash {hash} in storage {legacy_storage}: {e}"
                 )
                 continue
-            if results["hits"] > 0:
-                # We found a file with same hash
-                existing_file = results["file"][0]
-                if "item" in existing_file.keys() and len(existing_file["item"]) > 0:
-                    self.item_id = existing_file["item"][0]["id"]
-                    log.info(
-                        f"Recovered item {self.item_id} for {self.umid} from "
-                        f"storage {legacy_storage} by hash {hash}"
-                    )
-                    return self.item_id
+            if item_id:
+                self.item_id = item_id
+                log.info(
+                    f"Recovered item {item_id} for {self.umid} from "
+                    f"storage {legacy_storage} by hash {hash}"
+                )
+                return item_id
         return None
+
+    @staticmethod
+    def _item_id_from_hash_hits(results: Any) -> Optional[str]:
+        """The item id inside a ``getFilesInStorage`` answer, or None.
+
+        Every level is optional on purpose: a hit count without a ``file``
+        list, a file without an ``item``, an item without an ``id`` — any
+        of them used to raise KeyError/IndexError out of the scan's
+        per-file wrapper and cost the clip its row.
+        """
+        if not isinstance(results, dict):
+            return None
+        if not results.get("hits"):
+            return None
+        files = results.get("file") or []
+        if not files:
+            return None
+        items = (files[0] or {}).get("item") or []
+        if not items:
+            return None
+        return (items[0] or {}).get("id") or None
 
     @classmethod
     def new_clip_defaults(
@@ -363,9 +401,9 @@ class Clip(models.Model):
         The one copy of the new-row shape: both the per-file
         ``get_or_new`` path and the scan's batched path build a new clip
         from exactly this dict, so the two can never drift. ``item_id``
-        defaults to None and stays None here since 2.5: recovery now runs
-        AFTER the row is known (``recover_item_id``), which is what lets a
-        pre-existing row receive a recovered id too.
+        stays None here — recovery runs after the row is known
+        (``recover_item_id``), which is what lets a pre-existing row
+        receive a recovered id too.
         """
         return {
             "umid": metadatas["umid"],
@@ -378,11 +416,10 @@ class Clip(models.Model):
     def attach_file_metadatas(self, file: Any, metadatas: Dict[str, Any]) -> "Clip":
         """Pass 2 decoration: bind the scanned file and its metadatas.
 
-        Memo-only for ``metadatas`` since 2.4 — the setter no longer
-        writes rows, the folder's write unit does, once, in batch.
-        ``provider_name``/``file_id``/``reference_file`` are set on the
-        instance exactly as before; for an EXISTING clip they still do
-        not reach the DB during a scan (see ``CLIP_UPDATE_FIELDS``).
+        Instance state only: ``metadatas`` is memoized (the folder's
+        write unit persists it, once, in batch) and
+        ``provider_name``/``file_id``/``reference_file`` do not reach the
+        DB during a scan for an EXISTING clip (``CLIP_UPDATE_FIELDS``).
         """
         self.provider_name = metadatas["provider"]
         self.metadatas = metadatas
@@ -569,15 +606,14 @@ class Clip(models.Model):
     def cached_file_hash(self):
         """This clip's file hash, from the scan memo ONLY — never over HTTP.
 
-        The ingest ladder's ``has_hash`` input (see
-        ``scan.ingestion``): deliberately reads ``_file``, the file the
-        scan attached, instead of the ``file`` property, which issues a
-        ``getFileById`` call when the memo is cold — one call per clip to
-        decide the clip must not cost any.
+        The ingest ladder's ``has_hash`` input (``scan.ingestion``): it
+        reads ``_file``, the file the scan attached, and not the ``file``
+        property, which issues a ``getFileById`` call when the memo is
+        cold — one call per clip to decide the clip must not cost any.
 
-        A file whose hash cannot be read is treated as hash-less, which
-        under NFR-1 means "skip and retry next run": never ingest without
-        the dedup key.
+        A hash that cannot be read is treated as absent: under NFR-1 that
+        means "skip and retry next run", never ingest without the dedup
+        key.
         """
         file = getattr(self, "_file", None)
         if file is None:
@@ -609,11 +645,10 @@ class Clip(models.Model):
     def xml(self):
         """Parsed clip XML: memo, then the stored column, then the file.
 
-        FR-12 read order. The pre-2.4 property went straight to the
-        filesystem, and ``save()`` probed it on EVERY save — so a clip
-        whose XML was already serialized in ``clip_xml`` was re-read and
-        re-parsed from disk each time. A non-empty ``clip_xml`` is now
-        authoritative and never re-parsed from the file.
+        FR-12 read order: a non-empty ``clip_xml`` is authoritative and
+        is never re-parsed from the card. A corrected sidecar on disk is
+        therefore ignored for the life of the row — declared in
+        tests/fr4-waivers.md.
         """
         if hasattr(self, "_xml"):
             return self._xml
@@ -644,15 +679,14 @@ class Clip(models.Model):
         """FR-12: serialize the provider's sidecar into ``clip_xml`` ONCE.
 
         Called by the scan write unit's plan-prep, before the row is
-        inserted — the pre-2.4 ``save()`` override assigned ``clip_xml``
-        AFTER ``super().save()``, so the serialized XML never reached the
-        DB on a first save and the column was never read back.
+        inserted.
 
-        Only fills an empty column, and only from a ``clip_xml_file`` the
-        providers already resolved; the sidecar is located WITHOUT
-        touching Vidispine (the memoized root only), so a scan buys no
-        extra HTTP call. A parse failure is swallowed and logged: an
-        optional column must never cost a clip its ingest.
+        Fills an EMPTY column only — that guard is what keeps a re-scan
+        from re-reading and re-parsing every card sidecar — and only from
+        a ``clip_xml_file`` the providers already resolved; the sidecar is
+        located WITHOUT touching Vidispine (the memoized root only), so a
+        scan buys no extra HTTP call. A parse failure is swallowed and
+        logged: an optional column must never cost a clip its ingest.
 
         Returns:
             True when the column was filled by this call.
@@ -690,8 +724,8 @@ class Clip(models.Model):
         relative to the clip's own directory (xdcam's ``./Clip/...``
         form, and the MEDIAPRO URIs) — the same basename-against-the-clip
         resolution ``xdcam.getClipFiles`` uses. Resolution reads the
-        MEMOIZED root only: no storage lookup, and no AttributeError from
-        the pin-#5 ``root_path`` chain.
+        MEMOIZED root only, so it costs no storage lookup and cannot
+        raise out of the ``root_path`` chain.
         """
         if os.path.isabs(sidecar):
             return sidecar
@@ -711,11 +745,9 @@ class Clip(models.Model):
 
     @metadatas.setter
     def metadatas(self, new_metadatas):
-        # Memo only since 2.4 (AD-6). Assigning metadatas used to fan out
-        # one upsert query PER KEY for an already-saved clip, on top
-        # of the identical fan-out in save(); persistence is now the
-        # batched write unit's job — models/folder.persist_scan_results
-        # for the scan path, persist_metadatas() for everyone else.
+        # Memo only (AD-6): persisting is the batched write unit's job —
+        # models/folder.persist_scan_results for the scan path,
+        # persist_metadatas() for everyone else.
         self._metadatas = new_metadatas
 
     @property
@@ -1091,10 +1123,15 @@ class Clip(models.Model):
             ignore_sidecars=True,
         )
 
-        if "jobId" in res:
-            self.job = job_helper.getJob(res["jobId"])
+        job_id = job_id_from_response(res)
+        if job_id:
+            self.job = job_helper.getJob(job_id)
             return True
 
+        log.error(
+            f"Importing {self.item_id}: single-component import response "
+            f"carried no job id ({res!r}) — no import job was started"
+        )
         return False
 
     def _count_media_components(
@@ -1185,8 +1222,9 @@ class Clip(models.Model):
                     ignore_sidecars=True,
                     ingestprofile_groups=user_groups,
                 )
-                if "jobId" in component_res:
-                    log.info(f"... and got job {component_res['jobId']}")
+                component_job_id = job_id_from_response(component_res)
+                if component_job_id:
+                    log.info(f"... and got job {component_job_id}")
                 else:
                     log.info("... but got no job in response")
 
@@ -1208,15 +1246,16 @@ class Clip(models.Model):
             method="importFileToPlaceholder",
         )
 
-        if "jobId" in res:
-            self.job = job_helper.getJob(res["jobId"])
+        job_id = job_id_from_response(res)
+        if job_id:
+            self.job = job_helper.getJob(job_id)
 
         log.info(f"Retranscoding shape with item {self.item_id} and shape {shape_id}")
 
         # FR-36: no job id means Vidispine started no import job. Returning
         # True here — as this method unconditionally did — is how a clip
         # could be reported ingested with a NULL job_id and no import.
-        if "jobId" not in res:
+        if not job_id:
             log.error(
                 f"Importing {self.item_id}: multi-component import response "
                 f"carried no job id ({res!r}) — no import job was started"
@@ -1230,6 +1269,7 @@ class Clip(models.Model):
         user: Optional[User] = None,
         replace: bool = False,
         legacy_storages: Optional[List[str]] = None,
+        retry_incomplete: bool = False,
     ) -> Dict[str, bool]:
         """Import clip files into Vidispine, creating or updating an item.
 
@@ -1244,6 +1284,13 @@ class Clip(models.Model):
             user: User performing the import operation
             replace: Whether to replace existing original files
             legacy_storages: List of storage IDs considered as legacy for replacement
+            retry_incomplete: Whether to look past "the item already
+                exists" for a clip whose previous import created a
+                placeholder and never started a job. Deliberately NOT
+                ``replace``: it only lifts the blanket early return, so
+                an item that really holds original files still comes back
+                ``skipped`` instead of having its shape removed and
+                re-imported.
 
         Returns:
             Dictionary with status flags:
@@ -1275,7 +1322,7 @@ class Clip(models.Model):
             gh=_gh,
             ch=_ch,
         )
-        if not replace and not created:
+        if not replace and not created and not retry_incomplete:
             log.info("Item already exists, skipping it")
             result["skipped"] = True
             return result
@@ -1355,6 +1402,12 @@ class Clip(models.Model):
             result["failed"] = True
         return result
 
+    # The columns an ingest owns, and the only ones it writes back. Every
+    # column `import_file` mutates is here: item_id (create_item's
+    # placeholder), job_id (the import job), status, user — plus file_id,
+    # which the scan attached and the deleted full save() also persisted.
+    INGEST_STATE_FIELDS = ("item_id", "job_id", "status", "file_id", "user")
+
     def ingest(
         self,
         collection_id: Optional[str] = None,
@@ -1362,6 +1415,8 @@ class Clip(models.Model):
         folder: Optional[Any] = None,
         replace: bool = False,
         legacy_storages: Optional[List[str]] = None,
+        expect_persisted: bool = True,
+        retry_incomplete: bool = False,
     ) -> Dict[str, bool]:
         """Convenience method that wraps import_file for ingest operations.
 
@@ -1371,6 +1426,11 @@ class Clip(models.Model):
             folder: Folder object containing the clip
             replace: Whether to replace existing original files
             legacy_storages: List of storage IDs considered as legacy for replacement
+            expect_persisted: Whether the caller guarantees the clip's row
+                already exists (the scan path does; the REST endpoint,
+                which ingests a clip built from a request body, does not)
+            retry_incomplete: Whether this clip's last import left a
+                placeholder and no job (see ``import_file``)
 
         Returns:
             Dictionary with status flags from import_file operation
@@ -1380,50 +1440,73 @@ class Clip(models.Model):
             collection_id=collection_id,
             replace=replace,
             legacy_storages=legacy_storages,
+            retry_incomplete=retry_incomplete,
         )
-        if self._state.adding:
-            # Invariant check, not a code path: since 2.4 the scan's write
-            # unit materializes every clip BEFORE ingest, so a clip
-            # reaching here unsaved means something upstream skipped
-            # persistence. Save it rather than lose the ingest state.
-            log.error(
-                f"clip {self.umid} reached ingest unsaved — 2.4 persistence "
-                f"should have written it"
-            )
-            self.save()
-        else:
-            # AD-6 writer 2: ONE targeted UPDATE of the ingest-state
-            # columns. A full save() would rewrite every column of a row
-            # the scan just wrote — including the location columns the
-            # scan deliberately leaves alone (CLIP_UPDATE_FIELDS).
-            type(self).objects.filter(pk=self.umid).update(
-                item_id=self.item_id,
-                job_id=self.job_id,
-                status=self.status,
-                file_id=self.file_id,
-                user=self.user,
-            )
+        self.persist_ingest_state(expect_persisted=expect_persisted)
         if folder:
             # M2M row insert: a declared AD-6 deviation, dry-run gated by
             # the caller, tracked for 2.7 / the coordinator.
             self.folders.add(folder)
         return result
 
+    def persist_ingest_state(self, expect_persisted: bool = True) -> None:
+        """Write back what the import decided, and nothing else (AD-6).
+
+        ONE targeted UPDATE of ``INGEST_STATE_FIELDS``. A full ``save()``
+        would rewrite every column of a row the scan just wrote,
+        including the location columns the scan deliberately leaves alone
+        (``scan.persistence.CLIP_UPDATE_FIELDS``).
+
+        Two ways the row may not be there: an unsaved clip (the REST
+        endpoint builds one from the request body — legitimate, hence
+        ``expect_persisted``), or a row that vanished between the scan's
+        write unit and now. Both fall back to ``save()``: an ingest whose
+        state is not persisted is an ingest that runs again next scan.
+        """
+        if not self._state.adding:
+            updated = (
+                type(self)
+                .objects.filter(pk=self.pk)
+                .update(
+                    **{
+                        field: getattr(self, field)
+                        for field in self.INGEST_STATE_FIELDS
+                    }
+                )
+            )
+            if updated:
+                return
+            log.error(
+                f"clip {self.umid}: ingest-state UPDATE matched no row — the "
+                f"row was deleted concurrently; re-inserting it so the ingest "
+                f"is not silently lost"
+            )
+        elif expect_persisted:
+            log.error(
+                f"clip {self.umid} reached ingest unsaved — the scan's write "
+                f"unit should have written it"
+            )
+        self.save()
+
     def persist_metadatas(self) -> None:
         """Write this clip's memoized metadatas, batched.
 
-        The explicit replacement for the deleted ``save()`` fan-out, and
-        the SAME code path the scan write unit uses — two statements
-        whatever the key count, instead of one upsert query per metadata
-        key plus a delete. A clip that never had metadatas assigned
-        writes nothing at all (pre-2.4 ``save()`` guarded on the memo the
-        same way); an EMPTY metadatas mapping still clears the clip's
-        rows, also exactly as before.
+        The SAME code path the scan write unit uses — a bounded number of
+        statements whatever the key count, instead of one upsert per
+        metadata key plus a delete. A clip that never had metadatas
+        assigned writes nothing at all; an EMPTY metadatas mapping still
+        clears the clip's rows.
         """
         if not hasattr(self, "_metadatas"):
             return
         writes = (MetadataWrite(umid=self.pk, metadatas=self._metadatas),)
-        type(self).persist_metadatas_bulk(writes, group_stale_deletes(writes))
+        # Atomic like its scan-path twin (models/folder.persist_scan_results):
+        # the upsert and the stale-key DELETE are one edit of this clip's
+        # key-set, and half of it is worse than none. Nested inside a
+        # caller's transaction this is a savepoint, so a failure here
+        # cannot poison an outer request transaction.
+        with transaction.atomic():
+            type(self).persist_metadatas_bulk(writes, group_stale_deletes(writes))
 
     @classmethod
     def persist_metadatas_bulk(
@@ -1446,16 +1529,23 @@ class Clip(models.Model):
             for name, value in write.metadatas.items()
         ]
         if rows:
+            # batch_size, not "one statement whatever the size": a folder
+            # accumulates candidates across every page, and one card tree
+            # can carry more placeholders than PostgreSQL's 65535
+            # bind-parameter ceiling — which fails the whole folder's
+            # write, not just the overflowing rows.
             ClipMetadata.objects.bulk_create(
                 rows,
                 update_conflicts=True,
                 unique_fields=["clip", "name"],
                 update_fields=["value"],
+                batch_size=BULK_BATCH_SIZE,
             )
         for stale in stale_deletes:
-            ClipMetadata.objects.filter(clip_id__in=stale.umids).exclude(
-                name__in=stale.keep_names
-            ).delete()
+            for umids in chunked(stale.umids, BULK_BATCH_SIZE):
+                ClipMetadata.objects.filter(clip_id__in=umids).exclude(
+                    name__in=stale.keep_names
+                ).delete()
 
 
 class ClipMetadata(models.Model):

@@ -35,6 +35,11 @@ Decisions this layer owns
   so this is O(1) statements per folder, never O(files) or O(keys).
 * **the folder-save gate** — the Folder row is written at most once per
   scan invocation and only when at least one provider claimed a file.
+* **recovered item ids** — a scan may learn a clip's Vidispine item id
+  from a legacy-storage hash match. That id must reach the row (else the
+  lookup repeats every run, forever) without ever overwriting an id the
+  row already has, so it travels apart from the upsert, in
+  ``recovered_item_ids``, for a fill-only-NULL statement.
 """
 
 from dataclasses import dataclass, field
@@ -42,6 +47,7 @@ from types import MappingProxyType
 from typing import Any, Iterable, Mapping, Optional, Sequence, Tuple
 
 __all__ = [
+    "BULK_BATCH_SIZE",
     "CLIP_UNIQUE_FIELDS",
     "CLIP_UPDATE_FIELDS",
     "FOLDER_SCAN_FIELDS",
@@ -50,6 +56,7 @@ __all__ = [
     "PersistencePlan",
     "StaleDelete",
     "build_persistence_plan",
+    "chunked",
     "dedupe_candidates",
     "group_stale_deletes",
 ]
@@ -59,10 +66,24 @@ CLIP_UNIQUE_FIELDS = ("umid",)
 
 # The ONLY columns an existing clip's row may have rewritten by a scan.
 # Ask-First territory: adding one here is a behavioral change, not a tweak.
+# `item_id` is deliberately NOT here even though a scan can recover one:
+# an unconditional ON CONFLICT SET would let a stale in-memory NULL
+# overwrite an id a concurrent ingest just wrote. Recovered ids travel in
+# `PersistencePlan.recovered_item_ids` instead, under a fill-only-NULL
+# guard the ORM cannot express inside a conflict clause.
 CLIP_UPDATE_FIELDS = ("clip_xml",)
 
-# The Folder columns a scan owns.
+# The Folder columns a scan owns. `clips_total` is assigned in the page
+# loop from the index's hit total, so it is a scan output like the other
+# two, not a stale read-back.
 FOLDER_SCAN_FIELDS = ("provider_names", "scanned_on", "clips_total")
+
+# Rows per statement. Every write in this pipeline is batched, and a
+# batch is bounded: a folder accumulates candidates across ALL its pages,
+# so a big card tree can otherwise exceed PostgreSQL's 65535
+# bind-parameter ceiling and lose the whole folder's write. 500 rows ×
+# ~10 columns leaves an order of magnitude of headroom.
+BULK_BATCH_SIZE = 500
 
 
 @dataclass(frozen=True)
@@ -107,6 +128,11 @@ class PersistencePlan:
     stale_deletes: Tuple[StaleDelete, ...] = ()
     folder_fields: Mapping[str, Any] = field(default_factory=dict)
     save_folder: bool = False
+    # umid -> item id recovered from a legacy storage this scan. Written
+    # by a statement that can only FILL a NULL, never overwrite an id, so
+    # a clip whose ingest landed between this scan's read and its write
+    # keeps the id it earned. Empty on the overwhelming majority of runs.
+    recovered_item_ids: Tuple[Tuple[str, str], ...] = ()
 
     def __post_init__(self):
         # Frozen dataclass: bypass the frozen __setattr__ once to install a
@@ -123,6 +149,7 @@ class PersistencePlan:
             or self.metadata_writes
             or self.stale_deletes
             or self.save_folder
+            or self.recovered_item_ids
         )
 
 
@@ -158,11 +185,19 @@ def group_stale_deletes(
     )
 
 
+def chunked(items: Sequence[Any], size: int = BULK_BATCH_SIZE):
+    """Yield ``items`` in slices of at most ``size`` (never an empty one)."""
+    items = list(items)
+    for start in range(0, len(items), size):
+        yield items[start : start + size]
+
+
 def build_persistence_plan(
     candidates: Iterable[ClipCandidate],
     folder_fields: Optional[Mapping[str, Any]] = None,
     provider_hits: int = 0,
     update_fields: Sequence[str] = CLIP_UPDATE_FIELDS,
+    recovered_item_ids: Optional[Mapping[str, str]] = None,
 ) -> PersistencePlan:
     """Turn the clips a scan collected into one folder's write plan.
 
@@ -170,6 +205,10 @@ def build_persistence_plan(
     file in this scan invocation; zero means the folder row is not
     written at all — a zero-hit folder leaves no trace, files that only
     errored included.
+
+    ``recovered_item_ids`` maps umid -> the item id hash recovery found
+    for it this run. Only entries with both parts truthy survive: a
+    fill-only-NULL update of nothing is a statement for nothing.
     """
     deduped = dedupe_candidates(candidates)
     metadata_writes = tuple(
@@ -184,4 +223,9 @@ def build_persistence_plan(
         stale_deletes=group_stale_deletes(metadata_writes),
         folder_fields=dict(folder_fields or {}),
         save_folder=bool(provider_hits),
+        recovered_item_ids=tuple(
+            (umid, item_id)
+            for umid, item_id in (recovered_item_ids or {}).items()
+            if umid and item_id
+        ),
     )

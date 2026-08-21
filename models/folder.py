@@ -4,7 +4,12 @@ import uuid
 import os
 import re
 from typing import Optional, Dict, List, Any
-from django.db import models, transaction
+from django.db import DatabaseError, models, transaction
+
+# `Q` in this module is opensearch-dsl's (the search doc); the ORM's is
+# aliased so the two can never be confused at a call site.
+from django.db.models import Case, F, Value, When
+from django.db.models import Q as DBQ
 from django.utils import timezone
 from django.conf import settings
 from django.core.cache import cache
@@ -34,14 +39,18 @@ from portal.plugins.TapelessIngest.scan.extraction import (
     consumed_subdirs,
 )
 from portal.plugins.TapelessIngest.scan.ingestion import (
+    SKIP_ALREADY_INGESTED,
     SKIP_NO_HASH,
+    is_incomplete_import,
     select_clips_to_ingest,
 )
 from portal.plugins.TapelessIngest.scan.persistence import (
+    BULK_BATCH_SIZE,
     CLIP_UNIQUE_FIELDS,
     FOLDER_SCAN_FIELDS,
     ClipCandidate,
     build_persistence_plan,
+    chunked,
 )
 from portal.plugins.TapelessIngest.scan.verification import FolderListings
 
@@ -53,15 +62,12 @@ def persist_scan_results(folder, plan, dry_run=False):
 
     The Portal/ORM half of the plan/executor split: ``scan.persistence``
     decided WHAT to write with no Django in sight, this decides how, in
-    one ``transaction.atomic()`` per folder, in a fixed order —
-    Clip upsert, then ClipMetadata upsert + stale-key delete, then the
-    Folder row. The statement count is constant per folder: never one
-    per file, never one per metadata key.
+    one ``transaction.atomic()`` per folder, in a fixed order — Clip
+    upsert, recovered item ids, ClipMetadata upsert + stale-key delete,
+    then the Folder row. The statement count is bounded per folder: never
+    one per file, never one per metadata key.
 
-    ``dry_run`` gates the whole unit. A dry run pre-2.4 still saved the
-    folder row and still fanned out existing clips' metadata (``dry_run``
-    only ever gated ``Folder.ingest``'s ingest block); that write is gone
-    — a declared, waivered delta on the way to 2.7's full dry-run purity.
+    ``dry_run`` gates the whole unit.
 
     The clips are not passed separately: ``plan.clip_rows`` is the
     deduped, authoritative row set, and a second clip list travelling
@@ -85,14 +91,90 @@ def persist_scan_results(folder, plan, dry_run=False):
                 update_conflicts=True,
                 unique_fields=list(CLIP_UNIQUE_FIELDS),
                 update_fields=list(plan.update_fields),
+                batch_size=BULK_BATCH_SIZE,
             )
+        _persist_recovered_item_ids(plan.recovered_item_ids)
         if plan.metadata_writes or plan.stale_deletes:
             Clip.persist_metadatas_bulk(plan.metadata_writes, plan.stale_deletes)
         if plan.save_folder:
             for field_name, value in plan.folder_fields.items():
                 setattr(folder, field_name, value)
-            folder.save()
+            if folder._state.adding or not plan.folder_fields:
+                folder.save()
+            else:
+                # The narrowness FOLDER_SCAN_FIELDS advertises, enforced:
+                # a scan owns three columns of this row and must not write
+                # back whatever else the instance is carrying (a
+                # collection_id an ingest resolved, say).
+                folder.save(update_fields=list(plan.folder_fields))
     return True
+
+
+def _incomplete_import(clip):
+    """Did this clip's last import leave a placeholder and no job?
+
+    The state ``import_file`` writes when Vidispine answers without a job
+    id: ``create_item`` already assigned the placeholder's ``item_id``
+    and the status was already moved, but nothing was ever imported.
+    Narrow on purpose — a clip whose ``item_id`` came from hash RECOVERY
+    also has no job, and re-examining those every run is exactly the
+    per-clip HTTP cost FR-8 removed.
+    """
+    return is_incomplete_import(
+        clip.item_id,
+        clip.job_id,
+        clip.status == Clip.STATUS_PLACHOLDER_CREATED,
+    )
+
+
+def _ingest_state(clip):
+    """The ``(clip, has_hash, import_incomplete)`` triple the ladder reads."""
+    return (clip, bool(clip.cached_file_hash), _incomplete_import(clip))
+
+
+# One message per skip token. A mapping rather than an if/else so a new
+# token added to scan.ingestion cannot silently log as the wrong reason.
+_SKIP_REASON_MESSAGES = {
+    SKIP_NO_HASH: lambda clip: "no hash yet — will retry next run",
+    SKIP_ALREADY_INGESTED: lambda clip: f"already ingested as {clip.item_id}",
+}
+
+
+def _skip_reason_message(clip, reason):
+    render = _SKIP_REASON_MESSAGES.get(reason)
+    if render is None:
+        log.error(f"unknown ingest skip reason {reason!r} for clip {clip}")
+        return f"skipped ({reason})"
+    return render(clip)
+
+
+def _persist_recovered_item_ids(recovered_item_ids):
+    """Fill in item ids hash recovery found — only where the row has none.
+
+    Without this the recovered id lives on the in-memory object and dies
+    with it: the ingest ladder skips a clip the moment its ``item_id`` is
+    truthy, so ``Clip.ingest`` — the only other writer of that column —
+    is never reached for exactly these clips. The row would keep its NULL
+    and every future scan would pay the legacy-storage lookup again.
+
+    The ``item_id IS NULL`` filter is the safety half: recovery reads the
+    row, decides, and writes later, so between the two a real ingest may
+    have written a real id. That id always wins.
+    """
+    if not recovered_item_ids:
+        return
+    for batch in chunked(recovered_item_ids, BULK_BATCH_SIZE):
+        Clip.objects.filter(pk__in=[umid for umid, _ in batch]).filter(
+            DBQ(item_id__isnull=True) | DBQ(item_id="")
+        ).update(
+            item_id=Case(
+                *[When(pk=umid, then=Value(item_id)) for umid, item_id in batch],
+                # A row that matches no branch keeps what it has instead
+                # of being nulled — the pk filter makes that unreachable,
+                # but a CASE without a default is a loaded gun.
+                default=F("item_id"),
+            )
+        )
 
 
 class Folder(models.Model):
@@ -131,14 +213,17 @@ class Folder(models.Model):
         Returns:
             Tuple of (folder instance, is_new flag) where is_new is True if folder was created
         """
+
+        def _new_instance():
+            params = {k: v for k, v in kwargs.items()}
+            params.update(defaults or {})
+            # Try to create an object using passed params.
+            return cls(**params), True
+
         try:
             return cls.objects.get(**kwargs), False
         except cls.DoesNotExist:
-            defaults = defaults or {}
-            params = {k: v for k, v in kwargs.items()}
-            params.update(defaults)
-            # Try to create an object using passed params.
-            return cls(**params), True
+            return _new_instance()
         except cls.MultipleObjectsReturned:
             # FR-27, defensive only. The (path, storage_id) unique
             # constraint is live and enforced on prod (audited 2026-08-21:
@@ -153,7 +238,18 @@ class Folder(models.Model):
                 f"first by pk — a NULL storage_id lets the unique "
                 f"constraint through"
             )
-            return cls.objects.filter(**kwargs).order_by("pk").first(), False
+            existing = cls.objects.filter(**kwargs).order_by("pk").first()
+            if existing is not None:
+                return existing, False
+            # The duplicates vanished between the get() and this read.
+            # Returning (None, False) would hand the caller a folder that
+            # is not a folder; a brand-new instance is what the row set
+            # now says, and is what DoesNotExist would have produced.
+            log.warning(
+                f"Duplicate {cls.__name__} rows for {kwargs!r} disappeared "
+                f"before they could be read; building a new instance"
+            )
+            return _new_instance()
 
     def get_storage_helper(self) -> Any:
         """Get or create StorageHelper instance for this folder.
@@ -528,6 +624,16 @@ class Folder(models.Model):
             # The write unit's input, accumulated across every page of
             # this invocation and persisted ONCE after the loop (AD-6).
             candidates = []
+            # umid -> the clip object this invocation is building for it,
+            # across pages. Two files (possibly on two different pages)
+            # can carry one umid, and the umid is the primary key: they
+            # are one clip, they must share one object, and `created` must
+            # count once — the write plan dedupes them anyway.
+            invocation_clips = {}
+            # umid -> item id hash recovery found this run, for the
+            # fill-only-NULL write at the end (a recovered id that never
+            # reaches the row makes every future scan pay the lookup).
+            recovered_item_ids = {}
             has_next = True
             while has_next:
                 has_next = False
@@ -555,10 +661,9 @@ class Folder(models.Model):
                 if not count_only:
                     # Pass 1: extract every file's metadatas. One record
                     # per hit, in hit order, each holding either its
-                    # extraction result or the error it died of — so the
-                    # response's error/clip ordering is byte-identical to
-                    # the pre-2.4 single-pass loop even though the DB
-                    # lookup now happens between the two passes.
+                    # extraction result or the error it died of — which is
+                    # what keeps the response's error/clip ordering intact
+                    # with the DB lookup sitting between the two passes.
                     records = []
                     for result in hits:
                         record = {"result": result, "error": None}
@@ -624,16 +729,21 @@ class Folder(models.Model):
                             metadatas = record["metadatas"]
                             umid = metadatas["umid"]
                             clip = existing_clips.get(umid)
+                            if clip is None:
+                                clip = invocation_clips.get(umid)
                             created = clip is None
                             if created:
                                 clip = Clip(**Clip.new_clip_defaults(file, metadatas))
+                            invocation_clips[umid] = clip
                             clip.attach_file_metadatas(file, metadatas)
-                            # Hash recovery, gated (2.5): only a clip with
-                            # no item_id, a hashed file and configured
-                            # legacy storages costs a getFilesInStorage
-                            # call — and a recovered id lands on the clip
-                            # whether its row is new or pre-existing.
-                            clip.recover_item_id(file, legacy_storages)
+                            # Hash recovery, gated: only a clip with no
+                            # item_id, a hashed file and configured legacy
+                            # storages costs a getFilesInStorage call —
+                            # and a recovered id lands on the clip whether
+                            # its row is new or pre-existing.
+                            recovered = clip.recover_item_id(file, legacy_storages)
+                            if recovered:
+                                recovered_item_ids[umid] = recovered
                             # Seed the clip's memo attributes from the run
                             # context so ingest-time clip.root_path (xdcam)
                             # stops re-resolving — same seam the paged tests
@@ -651,11 +761,7 @@ class Folder(models.Model):
                             if created:
                                 response["created"] += 1
                             # FR-23: already-ingested IS item_id presence,
-                            # post-recovery. The pre-2.5 test — `clip.file
-                            # is not None` — was true for every clip the
-                            # scan touched (attach_file_metadatas always
-                            # sets it), so the counter reported the page
-                            # size (pinned-bugs row #1).
+                            # read after recovery.
                             if clip.item_id:
                                 response["already_ingested"] += 1
                             if clip.metadatas["provider"] not in providers:
@@ -679,20 +785,32 @@ class Folder(models.Model):
                     self.provider_names = ",".join(providers)
                     self.scanned_on = timezone.now()
             # The one write unit for this folder (AD-6): every page's
-            # clips, one transaction, a constant number of statements —
+            # clips, one transaction, a bounded number of statements —
             # and the Folder row written at most once per invocation.
-            persist_scan_results(
-                self,
-                build_persistence_plan(
-                    candidates,
-                    folder_fields={
-                        field_name: getattr(self, field_name)
-                        for field_name in FOLDER_SCAN_FIELDS
-                    },
-                    provider_hits=len(providers),
-                ),
-                dry_run=scan_context.options.dry_run,
-            )
+            try:
+                persist_scan_results(
+                    self,
+                    build_persistence_plan(
+                        candidates,
+                        folder_fields={
+                            field_name: getattr(self, field_name)
+                            for field_name in FOLDER_SCAN_FIELDS
+                        },
+                        provider_hits=len(providers),
+                        recovered_item_ids=recovered_item_ids,
+                    ),
+                    dry_run=scan_context.options.dry_run,
+                )
+            except DatabaseError as e:
+                # The transaction rolled back: this folder wrote nothing.
+                # Reporting it is the whole point — an escaping exception
+                # would take the folder (and, in tree mode, the run's
+                # remaining work for it) down silently, with the scan's
+                # own counters already claiming success.
+                traceback.print_exc()
+                response["errors"].append(
+                    f"Error persisting scan results for {self.path}: {e}"
+                )
             # FR-22: story 2.2 recorded every failed scandir on the
             # listings cache and left them unsurfaced. They join this
             # folder's errors, path-sorted so a cron log is deterministic.
@@ -793,9 +911,9 @@ class Folder(models.Model):
             # BEFORE spending any. `has_hash` comes from the scan-cached
             # file only — Clip.file would buy one getFileById per clip.
             to_ingest, skipped_reasons = select_clips_to_ingest(
-                ((clip, bool(clip.cached_file_hash)) for clip in response["clips"]),
-                providers,
-                replace,
+                (_ingest_state(clip) for clip in response["clips"]),
+                providers=providers,
+                replace=replace,
             )
             for clip, reason in skipped_reasons:
                 # An item_id-bearing clip counted `skipped` before too —
@@ -803,12 +921,7 @@ class Folder(models.Model):
                 # later. The hash-less one is new (NFR-1): no exception,
                 # no legacy match, no ingest, retried next run.
                 response["skipped"] += 1
-                if reason == SKIP_NO_HASH:
-                    log.info(f"Skipping clip {clip}: no hash yet — will retry next run")
-                else:
-                    log.info(
-                        f"Skipping clip {clip}: already ingested as {clip.item_id}"
-                    )
+                log.info(f"Skipping clip {clip}: {_skip_reason_message(clip, reason)}")
             if to_ingest:
                 # Collection resolution (a VS search/create per path level)
                 # is worth its calls only once a clip will actually ingest.
@@ -824,6 +937,12 @@ class Folder(models.Model):
                         folder=self,
                         replace=replace,
                         legacy_storages=legacy_storages,
+                        # A clip whose previous import left a placeholder
+                        # and no job would otherwise hit import_file's
+                        # "item already exists" early return and be
+                        # skipped forever. This lifts THAT return only —
+                        # an item holding real files is still skipped.
+                        retry_incomplete=_incomplete_import(clip),
                     )
                     for key, value in result.items():
                         if key not in response.keys():

@@ -4,10 +4,13 @@ The providers are imported statically here on purpose: in production they
 load dynamically via __import__ at models/clip.py:211, so nothing else pins
 their import health.
 
+`views` earns its place here rather than obviously deserving it: it is
+the only module that calls `Clip.persist_metadatas()` (the explicit
+replacement for the deleted `save()` fan-out), and nothing else imports
+it, so a typo in that call — or its quiet deletion — would have shipped.
+
 EXCLUDED (verified failing today, out of Epic 1 scope, tracked as deferred
 work — do not add without the stub additions they need):
-- views, serializers — need djangorestframework plus
-  portal.generic.baseviews / portal.generic.decorators (not stubbed);
 - update_original_file_metadatas — needs portal.search.models and
   postprocess_search (not stubbed);
 - providers.audio_files — pre-existing SyntaxError in production code
@@ -18,6 +21,7 @@ work — do not add without the stub additions they need):
 """
 
 import importlib
+import re
 from pathlib import Path
 
 import pytest
@@ -28,6 +32,8 @@ SWEEP_MODULES = [
     "portal.plugins.TapelessIngest.plugin",
     "portal.plugins.TapelessIngest.forms",
     "portal.plugins.TapelessIngest.metadatas",
+    "portal.plugins.TapelessIngest.serializers",
+    "portal.plugins.TapelessIngest.views",
     "portal.plugins.TapelessIngest.filesystem_scanner",
     "portal.plugins.TapelessIngest.models.settings",
     "portal.plugins.TapelessIngest.management.commands.scan_tapeless_dir",
@@ -55,3 +61,21 @@ def test_module_imports_through_substrate(dotted):
     assert module_file.is_relative_to(
         REPO_ROOT
     ), f"{dotted} resolved outside this repo: {module_file}"
+
+
+def test_views_calls_only_methods_clips_really_have():
+    """Importing views proves it loads; this proves what it calls exists.
+
+    ``views.py`` is the sole caller of ``Clip.persist_metadatas()`` — the
+    explicit replacement for the deleted ``save()`` metadata fan-out — and
+    a REST endpoint's runtime AttributeError is a production incident, not
+    a test failure. Cheap static guard over every ``clip.<name>(`` in the
+    module.
+    """
+    from portal.plugins.TapelessIngest.models.clip import Clip
+
+    source = (REPO_ROOT / "views.py").read_text(encoding="utf-8")
+    called = sorted(set(re.findall(r"\bclip\.(\w+)\(", source)))
+    assert "persist_metadatas" in called, called
+    missing = [name for name in called if not hasattr(Clip, name)]
+    assert not missing, f"views.py calls Clip methods that do not exist: {missing}"

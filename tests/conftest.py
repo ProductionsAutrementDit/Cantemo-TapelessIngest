@@ -46,7 +46,15 @@ django.setup()
 import pytest  # noqa: E402
 from django.core.management import call_command  # noqa: E402
 
-from tests.portal_stub import StorageHelperFake, query_elastic_fake  # noqa: E402
+from tests.portal_stub import (  # noqa: E402
+    RestTransportFake,
+    StorageHelperFake,
+    VidispineFake,
+    invalidate_item_cache_fake,
+    query_elastic_fake,
+    vidispine_post_ingest,
+    vidispine_pre_ingest,
+)
 
 
 @pytest.fixture(scope="session")
@@ -136,6 +144,22 @@ def _reset_storage_helper_fake():
     """Autouse: per-test roots and getStorage counters never leak across tests."""
     yield
     StorageHelperFake.reset()
+
+
+@pytest.fixture(autouse=True)
+def _reset_vidispine_fakes():
+    """Autouse: the ingest-side doubles are module-level singletons.
+
+    Their queues and call logs are class state, so without this one test
+    could observe another's calls (or consume its queued response) —
+    exactly the cross-test leak the query_elastic fixture prevents.
+    """
+    yield
+    VidispineFake.reset()
+    RestTransportFake.reset()
+    vidispine_pre_ingest.calls.clear()
+    vidispine_post_ingest.calls.clear()
+    invalidate_item_cache_fake.calls.clear()
 
 
 @pytest.fixture

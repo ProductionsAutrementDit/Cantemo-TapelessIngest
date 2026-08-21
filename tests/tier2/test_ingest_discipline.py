@@ -17,29 +17,36 @@ real ``scan()``/``ingest()``:
 - ``Clip.ingest`` writes ingest-state columns and nothing else (AD-6
   writer 2).
 
-Two seams are replaced with local doubles: ``Folder.getCollection`` and
-``Clip.import_file``. Both are PLUGIN code (not Portal — AD-11 is
-untouched), and both are unreachable off-server because the Portal
-helpers they construct take prod constructor kwargs the stubs
-deliberately refuse. Replacing them is what makes the ingest-side
-decisions observable; everything they guard is pinned separately from the
-component methods below, whose helpers are injected as arguments.
+``Folder.getCollection`` is replaced with a local double throughout: it
+is PLUGIN code (not Portal — AD-11 is untouched) and it needs a Settings
+row plus a live search backend, neither of which says anything about the
+ladder. ``Clip.import_file`` is doubled only where the test is about the
+COUNTERS; the tests under "the real import path" run it for real against
+the portal_stub Vidispine doubles, because a verdict nothing executes is
+a verdict nothing pins.
 """
 
 import os
 
 import pytest
-from django.db import connection
+from django.db import DatabaseError, connection
 from django.test.utils import CaptureQueriesContext
 
 from VidiRest.objects.storage import VSFile
 
-from portal.plugins.TapelessIngest.models.clip import Clip
-from portal.plugins.TapelessIngest.models.folder import Folder
+from portal.plugins.TapelessIngest.models.clip import Clip, ClipMetadata
+from portal.plugins.TapelessIngest.models.folder import Folder, persist_scan_results
+from portal.plugins.TapelessIngest.providers.providers import Provider as BaseProvider
+from portal.plugins.TapelessIngest.scan.persistence import build_persistence_plan
+
+from tests.portal_stub import VidispineFake
 
 STORAGE_ID = "VX-41"
 LEGACY_STORAGE = "VX-LEGACY"
 MISLABELLED_NAME = "fakemislabelled"
+FIXED_UMID_NAME = "fakefixedumid2"
+FIXED_UMID = "FIXED-UMID-INGEST"
+INGESTABLE_NAME = "fakeingestable"
 
 
 class MislabelledProvider:
@@ -75,6 +82,70 @@ def mislabelled_provider():
     Clip._PROVIDER_CACHE.pop(MISLABELLED_NAME, None)
 
 
+class FixedUmidProvider(MislabelledProvider):
+    """Every file it claims is the SAME clip — the duplicate-umid case."""
+
+    machine_name = FIXED_UMID_NAME
+
+    def getMetadatasFromFile(self, media_file, metadatas, context):
+        metadatas["provider"] = self.machine_name
+        metadatas["umid"] = FIXED_UMID
+        return metadatas
+
+
+@pytest.fixture
+def fixed_umid_provider():
+    provider = FixedUmidProvider()
+    Clip._PROVIDER_CACHE[FIXED_UMID_NAME] = provider
+    yield provider
+    Clip._PROVIDER_CACHE.pop(FIXED_UMID_NAME, None)
+
+
+class IngestableProvider(BaseProvider):
+    """A provider whose clips can go through the REAL ``import_file``.
+
+    Subclasses the base so ``_createDictFromMetadataMapping`` (a plain
+    MetadataMapping query) is the real one; the media-file accessors are
+    the minimum ``import_file`` reads.
+    """
+
+    def __init__(self):
+        BaseProvider.__init__(self)
+        self.name = "Fake Ingestable Provider"
+        self.machine_name = INGESTABLE_NAME
+
+    def getExtensions(self):
+        return [".ing"]
+
+    def getSubPaths(self):
+        return []
+
+    def getFilters(self, escaped_path):
+        return []
+
+    def getMetadatasFromFile(self, media_file, metadatas, context):
+        metadatas["provider"] = self.machine_name
+        metadatas["umid"] = os.path.splitext(media_file.getPath())[0]
+        return metadatas
+
+    def getClipMainMediaFile(self, clip):
+        return {"file_id": clip.file_id, "path": clip.path, "type": "video"}
+
+    def getClipAdditionalMediaFiles(self, clip):
+        return []
+
+    def getImportOptions(self):
+        return {}
+
+
+@pytest.fixture
+def ingestable_provider():
+    provider = IngestableProvider()
+    Clip._PROVIDER_CACHE[INGESTABLE_NAME] = provider
+    yield provider
+    Clip._PROVIDER_CACHE.pop(INGESTABLE_NAME, None)
+
+
 def _source(path, file_id, file_hash=None):
     return {
         "path": path,
@@ -92,19 +163,27 @@ def _folder(tmp_path, rel_path):
     return folder
 
 
-def _write_clips(tmp_path, rel, names, hashes=None):
+def _write_clips(tmp_path, rel, names, hashes=None, suffix=".fake"):
     (tmp_path / rel).mkdir(parents=True, exist_ok=True)
     sources = []
     for name in names:
-        (tmp_path / rel / f"{name}.fake").write_bytes(b"clip data")
+        (tmp_path / rel / f"{name}{suffix}").write_bytes(b"clip data")
         sources.append(
             _source(
-                f"{rel}/{name}.fake",
+                f"{rel}/{name}{suffix}",
                 f"VX-41-{name}",
                 file_hash=(hashes or {}).get(name),
             )
         )
     return sources
+
+
+def _rescanned_folder(tmp_path, rel):
+    """The production re-scan path: fetch the row the first scan wrote."""
+    folder, is_new = Folder.get_or_new(storage_id=STORAGE_ID, path=rel)
+    assert is_new is False
+    folder._root_path = str(tmp_path)
+    return folder
 
 
 def _folder_writes(captured):
@@ -117,21 +196,37 @@ def _folder_writes(captured):
 
 
 @pytest.fixture
-def ingest_seams(monkeypatch):
-    """Count the two plugin seams ``Folder.ingest`` drives (see module docstring).
-
-    ``import_file`` writes the ingest state a real import would, so
-    ``Clip.ingest``'s targeted UPDATE is exercised for real.
-    """
-    calls = {"collection": [], "import_file": []}
-    result = {"skipped": False, "failed": False, "replaced": False, "ingested": True}
+def collection_seam(monkeypatch):
+    """Count ``Folder.getCollection`` without resolving a real collection."""
+    calls = []
 
     def fake_get_collection(self, user, dryrun=False):
-        calls["collection"].append(self.path)
+        calls.append(self.path)
         return "VX-COLLECTION"
 
+    monkeypatch.setattr(Folder, "getCollection", fake_get_collection)
+    return calls
+
+
+@pytest.fixture
+def ingest_seams(monkeypatch, collection_seam):
+    """Count the two plugin seams ``Folder.ingest`` drives.
+
+    The doubled ``import_file`` writes the ingest state a real import
+    would, so ``Clip.ingest``'s targeted UPDATE is still exercised for
+    real. Tests about the import VERDICT use the real thing instead —
+    see "the real import path" below.
+    """
+    calls = {"collection": collection_seam, "import_file": []}
+    result = {"skipped": False, "failed": False, "replaced": False, "ingested": True}
+
     def fake_import_file(
-        self, collection_id=None, user=None, replace=False, legacy_storages=None
+        self,
+        collection_id=None,
+        user=None,
+        replace=False,
+        legacy_storages=None,
+        retry_incomplete=False,
     ):
         calls["import_file"].append(self.umid)
         if result["ingested"]:
@@ -140,7 +235,6 @@ def ingest_seams(monkeypatch):
             self.status = Clip.STATUS_PLACHOLDER_CREATED
         return dict(result)
 
-    monkeypatch.setattr(Folder, "getCollection", fake_get_collection)
     monkeypatch.setattr(Clip, "import_file", fake_import_file)
     calls["result"] = result
     return calls
@@ -576,7 +670,7 @@ def test_ingest_writes_only_ingest_state_columns(
 def test_an_unsaved_clip_reaching_ingest_is_logged_and_saved(
     migrated_db, tmp_path, ingest_seams, caplog
 ):
-    """The invariant guard: 2.4 persistence should have written it already."""
+    """The invariant guard: the scan's write unit should have written it."""
     clip = Clip(
         umid="UNSAVED-1", path="2026/X", storage_id=STORAGE_ID, reference_file="F"
     )
@@ -589,3 +683,399 @@ def test_an_unsaved_clip_reaching_ingest_is_logged_and_saved(
         record.levelname == "ERROR" and "reached ingest unsaved" in record.message
         for record in caplog.records
     ), caplog.text
+
+
+def test_the_rest_path_saves_an_unsaved_clip_without_crying_wolf(
+    migrated_db, ingest_seams, caplog
+):
+    """views.py builds its clip from a request body — that is not a bug.
+
+    The invariant is about the SCAN path. Logging an ERROR for the REST
+    endpoint's normal shape trains operators to ignore the message that
+    means something really went wrong.
+    """
+    clip = Clip(umid="RESTCLIP-1", path="2026/X", storage_id=STORAGE_ID)
+
+    clip.ingest(expect_persisted=False)
+
+    assert Clip.objects.filter(pk="RESTCLIP-1").exists()
+    assert not [
+        record for record in caplog.records if record.levelname == "ERROR"
+    ], caplog.text
+
+
+def test_a_row_deleted_under_an_ingest_is_re_inserted(migrated_db, caplog):
+    """A targeted UPDATE that matches nothing is silence, not persistence.
+
+    Without the row-count check the ingest state evaporates and the next
+    scan ingests the same clip again — the duplicate-ingest class NFR-1
+    governs.
+    """
+    clip = Clip.objects.create(
+        umid="VANISHED-1", path="2026/X", storage_id=STORAGE_ID, reference_file="F"
+    )
+    Clip.objects.filter(pk="VANISHED-1").delete()
+    clip.item_id = "VX-900"
+    clip.job_id = "VX-JOB-900"
+    clip.status = Clip.STATUS_PLACHOLDER_CREATED
+
+    clip.persist_ingest_state()
+
+    reloaded = Clip.objects.get(pk="VANISHED-1")
+    assert (reloaded.item_id, reloaded.job_id) == ("VX-900", "VX-JOB-900")
+    assert any(
+        record.levelname == "ERROR" and "matched no row" in record.message
+        for record in caplog.records
+    ), caplog.text
+
+
+# --------------------------------------------------------------------------
+# (A1) One umid is one clip is one ingest
+# --------------------------------------------------------------------------
+
+
+def test_two_files_one_umid_are_ingested_once(
+    migrated_db, es_fake, es_page, fixed_umid_provider, tmp_path, ingest_seams
+):
+    """The umid is the primary key: two files mapping to it are one clip.
+
+    The scan response still reports both files (unchanged), but the
+    ladder acts on one — ingesting both would create two Vidispine
+    placeholders for one clip.
+    """
+    rel = "2026/AH_20260101_dupingest"
+    sources = _write_clips(tmp_path, rel, ["FIRST", "LAST"])
+    es_fake.push(es_page(sources, total=2))
+
+    response = _folder(tmp_path, rel).ingest(providers=[FIXED_UMID_NAME])
+
+    assert len(response["clips"]) == 2
+    assert ingest_seams["import_file"] == [FIXED_UMID]
+    assert (response["ingested"], response["skipped"]) == (1, 0)
+    assert Clip.objects.count() == 1
+
+
+# --------------------------------------------------------------------------
+# (A2) A recovered item_id reaches the row — and never overwrites one
+# --------------------------------------------------------------------------
+
+
+def test_a_recovered_item_id_is_persisted_on_the_row(
+    migrated_db, es_fake, es_page, fake_provider, storage_fake, tmp_path
+):
+    """Otherwise the id dies with the object and every scan pays again.
+
+    The ingest ladder skips a clip the moment its ``item_id`` is truthy,
+    so ``Clip.ingest`` — the only other writer of that column — is never
+    reached for exactly the clips whose id was recovered.
+    """
+    rel = "2026/AH_20260101_recovpersist"
+    sources = _write_clips(tmp_path, rel, ["CLIPREC"], hashes={"CLIPREC": "hash-rec"})
+    Clip(umid=f"{rel}/CLIPREC", path=rel, storage_id=STORAGE_ID).save()
+    storage_fake.set_hash_item("hash-rec", "VX-800")
+    es_fake.push(es_page(sources, total=1))
+
+    response = _folder(tmp_path, rel).scan(
+        providers=[fake_provider.machine_name], legacy_storages=[LEGACY_STORAGE]
+    )
+
+    assert response["errors"] == []
+    assert Clip.objects.get(pk=f"{rel}/CLIPREC").item_id == "VX-800"
+
+
+def test_a_second_scan_no_longer_pays_the_recovery_lookup(
+    migrated_db, es_fake, es_page, fake_provider, storage_fake, tmp_path
+):
+    """FR-8, end to end: recovery happens ONCE, not once per scan."""
+    rel = "2026/AH_20260101_recovonce"
+    sources = _write_clips(tmp_path, rel, ["CLIPONCE"], hashes={"CLIPONCE": "hash-1x"})
+    storage_fake.set_hash_item("hash-1x", "VX-810")
+    providers = [fake_provider.machine_name]
+
+    es_fake.push(es_page(sources, total=1))
+    _folder(tmp_path, rel).scan(providers=providers, legacy_storages=[LEGACY_STORAGE])
+    es_fake.push(es_page(sources, total=1))
+    _rescanned_folder(tmp_path, rel).scan(
+        providers=providers, legacy_storages=[LEGACY_STORAGE]
+    )
+
+    assert storage_fake.get_files_in_storage_calls == [(LEGACY_STORAGE, "hash-1x")]
+
+
+def test_a_recovered_id_never_overwrites_an_id_the_row_already_has(migrated_db):
+    """The fill-only-NULL guard, at the statement level.
+
+    Recovery reads the row, decides, and writes at the end of the folder;
+    an ingest that lands in between must keep the id it earned.
+    """
+    Clip.objects.create(
+        umid="RACE-1",
+        path="2026/X",
+        storage_id=STORAGE_ID,
+        reference_file="F",
+        item_id="VX-REAL",
+    )
+    Clip.objects.create(
+        umid="RACE-2", path="2026/X", storage_id=STORAGE_ID, reference_file="F"
+    )
+
+    persist_scan_results(
+        Folder(storage_id=STORAGE_ID, path="2026/X"),
+        build_persistence_plan(
+            [],
+            recovered_item_ids={"RACE-1": "VX-RECOVERED", "RACE-2": "VX-RECOVERED-2"},
+        ),
+    )
+
+    assert Clip.objects.get(pk="RACE-1").item_id == "VX-REAL"
+    assert Clip.objects.get(pk="RACE-2").item_id == "VX-RECOVERED-2"
+
+
+# --------------------------------------------------------------------------
+# (12) A failed write unit is reported, not swallowed
+# --------------------------------------------------------------------------
+
+
+def test_a_failing_write_unit_lands_in_errors_and_rolls_back(
+    migrated_db, es_fake, es_page, fake_provider, tmp_path, monkeypatch
+):
+    """A DB failure must not take the folder down silently.
+
+    Pre-fix the exception escaped ``scan()`` with the counters already
+    claiming success, so a cron run reported clips it had not written.
+    """
+    rel = "2026/AH_20260101_dbfail"
+    sources = _write_clips(tmp_path, rel, ["CLIPDB1", "CLIPDB2"])
+    es_fake.push(es_page(sources, total=2))
+
+    def boom(writes, stale_deletes):
+        raise DatabaseError("metadata upsert exploded")
+
+    monkeypatch.setattr(Clip, "persist_metadatas_bulk", staticmethod(boom))
+
+    response = _folder(tmp_path, rel).scan(providers=[fake_provider.machine_name])
+
+    assert response["processed"] == 2
+    assert any("Error persisting scan results" in error for error in response["errors"])
+    # The transaction rolled back: the clip rows written before the
+    # exploding statement are gone too.
+    assert Clip.objects.count() == 0
+    assert Folder.objects.count() == 0
+
+
+# --------------------------------------------------------------------------
+# (16) `created` counts clips, not files
+# --------------------------------------------------------------------------
+
+
+def test_a_umid_spanning_two_pages_is_created_once(
+    migrated_db, es_fake, es_page, fixed_umid_provider, tmp_path
+):
+    """`created` is incremented in the page loop, the write is deduped
+    after it — so a umid appearing on two pages used to be counted twice
+    and written once."""
+    rel = "2026/AH_20260101_pagedup"
+    first_page = _write_clips(tmp_path, rel, [f"P{index:03d}" for index in range(100)])
+    second_page = _write_clips(tmp_path, rel, ["TAIL"])
+    es_fake.push(es_page(first_page, total=101))
+    es_fake.push(es_page(second_page, total=101))
+
+    response = _folder(tmp_path, rel).scan(number=0, providers=[FIXED_UMID_NAME])
+
+    assert response["processed"] == 101
+    assert response["created"] == 1
+    assert Clip.objects.count() == 1
+
+
+# --------------------------------------------------------------------------
+# (B6/A3) The real import path: verdicts nothing else executes
+# --------------------------------------------------------------------------
+
+
+def _ingestable_page(tmp_path, rel, names):
+    return _write_clips(tmp_path, rel, names, suffix=".ing")
+
+
+def test_a_real_import_without_a_job_id_is_failed_never_ingested(
+    migrated_db, es_fake, es_page, ingestable_provider, tmp_path, collection_seam
+):
+    """FR-36 where it is DECIDED, through the real ``import_file``.
+
+    The two component helpers were pinned before; their verdict's
+    consumption was not, and reverting ``import_file``'s closing ladder
+    to the pre-2.5 unconditional ``ingested = True`` left the suite green.
+    """
+    rel = "2026/AH_20260101_realnojob"
+    es_fake.push(es_page(_ingestable_page(tmp_path, rel, ["CLIPRAW"]), total=1))
+    VidispineFake.set_import_response({})
+
+    response = _folder(tmp_path, rel).ingest(providers=[INGESTABLE_NAME])
+
+    assert (response["failed"], response["ingested"]) == (1, 0)
+    assert response["errors"] == []
+    # The import really was attempted.
+    assert "importFileToPlaceholder" in VidispineFake.call_names()
+
+
+def test_a_real_import_with_a_job_id_is_ingested(
+    migrated_db, es_fake, es_page, ingestable_provider, tmp_path, collection_seam
+):
+    rel = "2026/AH_20260101_realjob"
+    es_fake.push(es_page(_ingestable_page(tmp_path, rel, ["CLIPOK"]), total=1))
+    VidispineFake.set_import_response({"jobId": "VX-JOB-77"})
+
+    response = _folder(tmp_path, rel).ingest(providers=[INGESTABLE_NAME])
+
+    assert (response["ingested"], response["failed"]) == (1, 0)
+    stored = Clip.objects.get(pk=f"{rel}/CLIPOK")
+    assert stored.job_id == "VX-JOB-77"
+    assert stored.item_id
+    assert stored.status == Clip.STATUS_PLACHOLDER_CREATED
+
+
+def test_a_failed_import_leaves_a_row_that_says_so(
+    migrated_db, es_fake, es_page, ingestable_provider, tmp_path, collection_seam
+):
+    """The persisted state after a job-id-less import — nothing observed
+    it before, and it is what the next run's ladder reads."""
+    rel = "2026/AH_20260101_failstate"
+    es_fake.push(es_page(_ingestable_page(tmp_path, rel, ["CLIPSTUCK"]), total=1))
+    VidispineFake.set_import_response({})
+
+    _folder(tmp_path, rel).ingest(providers=[INGESTABLE_NAME])
+
+    stored = Clip.objects.get(pk=f"{rel}/CLIPSTUCK")
+    # The placeholder exists in Vidispine, so its id is kept: forgetting
+    # it would orphan the placeholder and make the next run create
+    # another one.
+    assert stored.item_id
+    # ...but nothing was imported, and the row says exactly that.
+    assert stored.job_id is None
+    assert stored.status == Clip.STATUS_PLACHOLDER_CREATED
+
+
+def test_an_incomplete_import_is_retried_next_run_not_skipped_forever(
+    migrated_db, es_fake, es_page, ingestable_provider, tmp_path, collection_seam
+):
+    """A3: the placeholder its failed import left must not strand it.
+
+    Skipping on ``item_id`` alone would make this clip invisible for the
+    rest of its life — only an explicit --replace run would rescue it.
+    The retry goes in AS a replace, because ``import_file``'s "item
+    already exists" early return skips every non-replace call.
+    """
+    rel = "2026/AH_20260101_retrystuck"
+    sources = _ingestable_page(tmp_path, rel, ["CLIPRETRY"])
+
+    es_fake.push(es_page(sources, total=1))
+    VidispineFake.set_import_response({})
+    first = _folder(tmp_path, rel).ingest(providers=[INGESTABLE_NAME])
+    assert first["failed"] == 1
+    placeholder_id = Clip.objects.get(pk=f"{rel}/CLIPRETRY").item_id
+
+    es_fake.push(es_page(sources, total=1))
+    VidispineFake.set_import_response({"jobId": "VX-JOB-RETRY"})
+    second = _rescanned_folder(tmp_path, rel).ingest(providers=[INGESTABLE_NAME])
+
+    assert (second["ingested"], second["skipped"]) == (1, 0)
+    stored = Clip.objects.get(pk=f"{rel}/CLIPRETRY")
+    assert stored.job_id == "VX-JOB-RETRY"
+    # The SAME placeholder was reused — a second one would be a duplicate
+    # item for one clip.
+    assert stored.item_id == placeholder_id
+
+
+def test_a_recovered_item_id_is_not_mistaken_for_an_incomplete_import(
+    migrated_db, es_fake, es_page, ingestable_provider, tmp_path, collection_seam
+):
+    """A hash-recovered clip has no job either — and must stay skipped.
+
+    Its item already holds the file (that is what the hash match proved);
+    re-examining it every run would buy back exactly the per-clip HTTP
+    cost FR-8 removed.
+    """
+    rel = "2026/AH_20260101_recovnotstuck"
+    sources = _ingestable_page(tmp_path, rel, ["CLIPRECOV"])
+    Clip(
+        umid=f"{rel}/CLIPRECOV",
+        path=rel,
+        storage_id=STORAGE_ID,
+        item_id="VX-RECOVERED",
+        status=Clip.STATUS_NOT_IMPORTED,
+    ).save()
+    es_fake.push(es_page(sources, total=1))
+
+    response = _folder(tmp_path, rel).ingest(providers=[INGESTABLE_NAME])
+
+    assert (response["skipped"], response["ingested"]) == (1, 0)
+    assert VidispineFake.calls == []
+    assert collection_seam == []
+
+
+def test_an_empty_original_shape_does_not_block_the_retry(
+    migrated_db, es_fake, es_page, ingestable_provider, tmp_path, collection_seam
+):
+    """FR-35 where it is REACHABLE: the retry path, not the operator's
+    --replace.
+
+    A previous import can leave a placeholder SHAPE holding no file. The
+    old `len(original_files) >= 0` guard was always true, so such an item
+    was declared "already exists and has an original file" and skipped —
+    forever. With `> 0` the empty shape falls through to the checks that
+    can actually tell, the empty shape is removed, and the clip imports.
+    """
+    rel = "2026/AH_20260101_emptyshape"
+    sources = _ingestable_page(tmp_path, rel, ["CLIPEMPTY"])
+    Clip(
+        umid=f"{rel}/CLIPEMPTY",
+        path=rel,
+        storage_id=STORAGE_ID,
+        item_id="VX-EMPTY",
+        status=Clip.STATUS_PLACHOLDER_CREATED,
+    ).save()
+    VidispineFake.set_item("VX-EMPTY")
+    VidispineFake.set_original_shape("VX-EMPTY", "VX-EMPTY-SHAPE", files=[])
+    VidispineFake.set_import_response({"jobId": "VX-JOB-EMPTY"})
+    es_fake.push(es_page(sources, total=1))
+
+    response = _folder(tmp_path, rel).ingest(providers=[INGESTABLE_NAME])
+
+    assert (response["ingested"], response["skipped"]) == (1, 0)
+    assert response["replaced"] == 1
+    assert Clip.objects.get(pk=f"{rel}/CLIPEMPTY").job_id == "VX-JOB-EMPTY"
+
+
+def test_an_item_that_already_holds_the_file_is_not_re_imported(
+    migrated_db, es_fake, es_page, ingestable_provider, tmp_path, collection_seam
+):
+    """The safety net under the retry rung, through the real import.
+
+    A clip that reaches ``import_file`` with an item whose original shape
+    already carries files must come back `skipped`, never re-imported —
+    this is the check that makes letting anything through the ladder safe.
+    """
+    rel = "2026/AH_20260101_alreadyfiled"
+    sources = _ingestable_page(tmp_path, rel, ["CLIPDONE"])
+    umid = f"{rel}/CLIPDONE"
+    Clip(
+        umid=umid,
+        path=rel,
+        storage_id=STORAGE_ID,
+        item_id="VX-DONE",
+        status=Clip.STATUS_PLACHOLDER_CREATED,
+    ).save()
+    VidispineFake.set_item("VX-DONE")
+    VidispineFake.set_original_shape(
+        "VX-DONE",
+        "VX-DONE-SHAPE",
+        files=[{"id": "VX-OTHER-FILE", "storage": "VX-OTHERSTORAGE"}],
+    )
+    es_fake.push(es_page(sources, total=1))
+
+    response = _folder(tmp_path, rel).ingest(providers=[INGESTABLE_NAME])
+
+    # The ladder let it through (no job id on the row), the import path
+    # itself refused it.
+    assert (response["skipped"], response["ingested"], response["failed"]) == (1, 0, 0)
+    assert "importFileToPlaceholder" not in VidispineFake.call_names()
+    assert "doImportToPlaceholder" not in VidispineFake.call_names()

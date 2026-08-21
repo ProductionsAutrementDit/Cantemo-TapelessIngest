@@ -6,6 +6,7 @@ From here you can follow the Cantemo Portal Developers documentation for specifi
 framework code refer to the Django developers documentation.
 
 """
+
 import logging
 import os
 from django.urls import reverse_lazy
@@ -43,7 +44,6 @@ from portal.plugins.TapelessIngest.serializers import (
     ClipSerializer,
     FolderSerializer,
 )
-
 
 log = logging.getLogger(__name__)
 
@@ -210,13 +210,26 @@ class ClipsInPathsView(APIView):
                                 user=request.user,
                                 collection_id=folder.collection_id,
                                 folder=folder,
+                                # This clip comes from the request body,
+                                # not from a scan: having no row yet is
+                                # normal here, not the broken invariant
+                                # Clip.ingest logs for the scan path.
+                                expect_persisted=False,
                             )
                             # The serializer's writable `metadatas` field
                             # used to be persisted by Clip.save()'s
                             # per-key fan-out, deleted in story 2.4. This
                             # is the same rows, batched (models/clip.py).
+                            # persist_metadatas() is atomic, so a failure
+                            # rolls back to a savepoint instead of
+                            # poisoning this request's transaction.
                             clip.persist_metadatas()
                         except Exception as e:
+                            log.error(
+                                f"Error ingesting clip {clip} from the REST "
+                                f"endpoint: {e}",
+                                exc_info=True,
+                            )
                             clip.error = "%s" % e
                         new_clips.append(clip)
                     else:
@@ -325,6 +338,7 @@ class ClipsJobsProgress(APIView):
 
 class ClipsByItemView(APIView):
     """API endpoint to get clips associated with a specific item"""
+
     renderer_classes = (JSONRenderer,)
     permission_classes = [permissions.IsAuthenticated]
 
@@ -335,8 +349,7 @@ class ClipsByItemView(APIView):
             return Response(serializer.data, status=status.HTTP_200_OK)
         except Exception as e:
             return Response(
-                {"error": str(e)},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+                {"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
 
 
