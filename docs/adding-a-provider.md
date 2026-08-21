@@ -96,7 +96,11 @@ def getMetadatasFromFile(self, media_file, metadatas, context):
 * **Probe sidecars with `self.probe_is_file(path, context)`**, not
   `os.path.isfile`. It answers from the scan's directory listings, so a
   present sidecar costs no filesystem call and a parent directory is
-  listed at most once per scan. Pass absolute paths.
+  listed at most once per scan. Pass absolute paths. Probing a sibling
+  directory that does not exist on this card (`../CLIP`, `../CLIPINF`)
+  is free and silent — the probe is marked speculative, so "no such
+  directory" is an answer, not a folder error. A sibling directory that
+  exists but cannot be read is still reported.
 * **Resolve absolute paths with `self.get_file_absolute_path(file,
   context)`**, which reads the run's resolved storage roots instead of
   calling the storage API per file.
