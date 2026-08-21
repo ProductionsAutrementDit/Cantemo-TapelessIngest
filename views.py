@@ -211,6 +211,11 @@ class ClipsInPathsView(APIView):
                                 collection_id=folder.collection_id,
                                 folder=folder,
                             )
+                            # The serializer's writable `metadatas` field
+                            # used to be persisted by Clip.save()'s
+                            # per-key fan-out, deleted in story 2.4. This
+                            # is the same rows, batched (models/clip.py).
+                            clip.persist_metadatas()
                         except Exception as e:
                             clip.error = "%s" % e
                         new_clips.append(clip)

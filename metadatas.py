@@ -12,10 +12,32 @@ class XMLParser:
         self.nsmap = ""
         self.parse(xml_file)
 
+    @classmethod
+    def from_string(cls, xml_string):
+        """Parse an already-serialized document (story 2.4, FR-12).
+
+        The counterpart of ``tostring()``: a clip whose XML is stored in
+        its ``clip_xml`` column is re-hydrated from the string instead of
+        being re-read and re-parsed from the card. A ``str`` is encoded
+        first — lxml refuses a unicode string carrying an encoding
+        declaration, which every card sidecar has.
+        """
+        parser = cls.__new__(cls)
+        parser.tree = ""
+        parser.root = ""
+        parser.nsmap = ""
+        if isinstance(xml_string, str):
+            xml_string = xml_string.encode("utf-8")
+        parser._bind(etree.fromstring(xml_string).getroottree())
+        return parser
+
     def parse(self, xml_file):
         if not isfile(xml_file):
             raise FileNotFoundError
-        self.tree = etree.parse(xml_file)
+        self._bind(etree.parse(xml_file))
+
+    def _bind(self, tree):
+        self.tree = tree
         self.root = self.tree.getroot()
         if None in self.root.nsmap:
             self.nsmap = {"h": self.root.nsmap[None]}

@@ -46,9 +46,14 @@ from portal.plugins.TapelessIngest.models.settings import (
     Settings,
     MetadataMapping,
 )
+from portal.plugins.TapelessIngest.metadatas import XMLParser
 from portal.plugins.TapelessIngest.providers import PROVIDER_NAMES
 from portal.plugins.TapelessIngest.scan.context import browse_root_path
 from portal.plugins.TapelessIngest.scan.extraction import extract_metadatas
+from portal.plugins.TapelessIngest.scan.persistence import (
+    MetadataWrite,
+    group_stale_deletes,
+)
 
 log = logging.getLogger(__name__)
 
@@ -255,14 +260,24 @@ class Clip(models.Model):
             return cls(**params), True
 
     @classmethod
-    def get_clip_from_file(
+    def extract_file_metadatas(
         cls,
         file: Any,
         provider_list: Optional[List[Any]] = None,
         context: Optional[Dict[str, Any]] = None,
         legacy_storages: Optional[List[str]] = None,
-    ) -> Tuple["Clip", bool]:
-        """Extract clip metadata from file and get or create clip instance.
+    ) -> Tuple[Dict[str, Any], Optional[str]]:
+        """Pass 1 of the scan's two-pass lookup: everything before the DB.
+
+        Providers, identity validation and hash recovery — the whole
+        pre-2.4 head of ``get_clip_from_file``, byte-for-byte in the same
+        order, so a file that raised "No UMID"/"No hash" still raises it
+        at the same point with the same message. Split out so a page's
+        umids can be collected first and looked up in ONE query (AD-6)
+        instead of one ``get`` per file.
+
+        Hash recovery is deliberately left per-file here — story 2.5 owns
+        the Vidispine call discipline.
 
         Args:
             file: VSFile instance to extract metadata from
@@ -272,7 +287,7 @@ class Clip(models.Model):
             legacy_storages: Optional list of legacy storage IDs to check for existing items
 
         Returns:
-            Tuple of (clip instance, created flag)
+            Tuple of (metadatas dict, recovered item_id or None)
 
         Raises:
             TapelessIngestException: If no UMID or hash found in file
@@ -286,7 +301,6 @@ class Clip(models.Model):
         metadatas = extract_metadatas(file, provider_list, {}, context)
         if "umid" not in metadatas.keys():
             raise TapelessIngestException("No UMID found in file %s" % file.getPath())
-        umid = metadatas["umid"]
         item_id = None
         # Try to recover from file hash
         sh = StorageHelper()
@@ -313,19 +327,80 @@ class Clip(models.Model):
                     ):
                         item_id = existing_file["item"][0]["id"]
                         break
-        clip, created = cls.get_or_new(
-            umid=umid,
-            defaults={
-                "path": os.path.dirname(file.getPath()),
-                "storage_id": file.getStorage(),
-                "spanned": False,
-                "item_id": item_id,
-            },
+        return metadatas, item_id
+
+    @classmethod
+    def new_clip_defaults(
+        cls, file: Any, metadatas: Dict[str, Any], item_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """The column values a NEVER-SEEN clip is created with.
+
+        The one copy of the new-row shape: both the per-file
+        ``get_or_new`` path and the scan's batched path build a new clip
+        from exactly this dict, so the two can never drift. Note the
+        recovered ``item_id`` lands here, i.e. on the insert path only —
+        an existing clip's ingest state is never rewritten by a scan.
+        """
+        return {
+            "umid": metadatas["umid"],
+            "path": os.path.dirname(file.getPath()),
+            "storage_id": file.getStorage(),
+            "spanned": False,
+            "item_id": item_id,
+        }
+
+    def attach_file_metadatas(self, file: Any, metadatas: Dict[str, Any]) -> "Clip":
+        """Pass 2 decoration: bind the scanned file and its metadatas.
+
+        Memo-only for ``metadatas`` since 2.4 — the setter no longer
+        writes rows, the folder's write unit does, once, in batch.
+        ``provider_name``/``file_id``/``reference_file`` are set on the
+        instance exactly as before; for an EXISTING clip they still do
+        not reach the DB during a scan (see ``CLIP_UPDATE_FIELDS``).
+        """
+        self.provider_name = metadatas["provider"]
+        self.metadatas = metadatas
+        self.file = file
+        self.reference_file = file.getId()
+        return self
+
+    @classmethod
+    def get_clip_from_file(
+        cls,
+        file: Any,
+        provider_list: Optional[List[Any]] = None,
+        context: Optional[Dict[str, Any]] = None,
+        legacy_storages: Optional[List[str]] = None,
+    ) -> Tuple["Clip", bool]:
+        """Extract clip metadata from file and get or create clip instance.
+
+        The per-file composition of the two passes, kept for callers
+        outside the batched scan path (one lookup query per file).
+
+        Args:
+            file: VSFile instance to extract metadata from
+            provider_list: Optional list of provider instances. If None, uses all providers
+            context: Optional context dictionary shared across provider calls; it is
+                mutated in place by the providers, never replaced
+            legacy_storages: Optional list of legacy storage IDs to check for existing items
+
+        Returns:
+            Tuple of (clip instance, created flag)
+
+        Raises:
+            TapelessIngestException: If no UMID or hash found in file
+        """
+        metadatas, item_id = cls.extract_file_metadatas(
+            file,
+            provider_list=provider_list,
+            context=context,
+            legacy_storages=legacy_storages,
         )
-        clip.provider_name = metadatas["provider"]
-        clip.metadatas = metadatas
-        clip.file = file
-        clip.reference_file = file.getId()
+        clip, created = cls.get_or_new(
+            umid=metadatas["umid"],
+            defaults=cls.new_clip_defaults(file, metadatas, item_id),
+        )
+        clip.attach_file_metadatas(file, metadatas)
 
         return clip, created
 
@@ -477,18 +552,98 @@ class Clip(models.Model):
 
     @property
     def xml(self):
-        if not hasattr(self, "_xml"):
-            if os.path.splitext(self.reference_file)[1] not in [".xml", ".XML"]:
-                return None
-            xml_file = os.path.join(self.folder_path, self.reference_file)
-            if not os.path.isfile(xml_file):
-                return None
-            self._xml = self.provider.parseXML(xml_file)
+        """Parsed clip XML: memo, then the stored column, then the file.
+
+        FR-12 read order. The pre-2.4 property went straight to the
+        filesystem, and ``save()`` probed it on EVERY save — so a clip
+        whose XML was already serialized in ``clip_xml`` was re-read and
+        re-parsed from disk each time. A non-empty ``clip_xml`` is now
+        authoritative and never re-parsed from the file.
+        """
+        if hasattr(self, "_xml"):
+            return self._xml
+        if self.clip_xml:
+            try:
+                self._xml = XMLParser.from_string(self.clip_xml)
+            except Exception:
+                # A corrupt stored column must not take a clip down; fall
+                # through to the file, exactly as if nothing were stored.
+                log.error(
+                    f"Cannot parse the stored clip_xml of {self.umid}", exc_info=True
+                )
+            else:
+                return self._xml
+        if os.path.splitext(self.reference_file)[1] not in [".xml", ".XML"]:
+            return None
+        xml_file = os.path.join(self.folder_path, self.reference_file)
+        if not os.path.isfile(xml_file):
+            return None
+        self._xml = self.provider.parseXML(xml_file)
         return self._xml
 
     @xml.setter
     def xml(self, value):
         self._xml = value
+
+    def load_clip_xml(self, metadatas: Optional[Dict[str, Any]] = None) -> bool:
+        """FR-12: serialize the provider's sidecar into ``clip_xml`` ONCE.
+
+        Called by the scan write unit's plan-prep, before the row is
+        inserted — the pre-2.4 ``save()`` override assigned ``clip_xml``
+        AFTER ``super().save()``, so the serialized XML never reached the
+        DB on a first save and the column was never read back.
+
+        Only fills an empty column, and only from a ``clip_xml_file`` the
+        providers already resolved; the sidecar is located WITHOUT
+        touching Vidispine (the memoized root only), so a scan buys no
+        extra HTTP call. A parse failure is swallowed and logged: an
+        optional column must never cost a clip its ingest.
+
+        Returns:
+            True when the column was filled by this call.
+        """
+        if self.clip_xml:
+            return False
+        if metadatas is None:
+            metadatas = getattr(self, "_metadatas", None) or {}
+        sidecar = metadatas.get("clip_xml_file")
+        if not sidecar:
+            return False
+        xml_file = self._sidecar_absolute_path(sidecar)
+        if xml_file is None:
+            return False
+        try:
+            parsed = self.provider.parseXML(xml_file)
+            serialized = parsed.tostring()
+        except Exception:
+            log.error(
+                f"Cannot parse the clip XML {xml_file} of {self.umid}", exc_info=True
+            )
+            return False
+        if isinstance(serialized, bytes):
+            # lxml serializes to bytes; the column is text. Decoding here
+            # is what makes the stored value re-parseable by `xml` above.
+            serialized = serialized.decode("utf-8", "replace")
+        self.clip_xml = serialized
+        self._xml = parsed
+        return True
+
+    def _sidecar_absolute_path(self, sidecar: str) -> Optional[str]:
+        """Absolute path of a provider-declared ``clip_xml_file``.
+
+        Providers declare it either absolute (panasonicP2, ikegami) or
+        relative to the clip's own directory (xdcam's ``./Clip/...``
+        form, and the MEDIAPRO URIs) — the same basename-against-the-clip
+        resolution ``xdcam.getClipFiles`` uses. Resolution reads the
+        MEMOIZED root only: no storage lookup, and no AttributeError from
+        the pin-#5 ``root_path`` chain.
+        """
+        if os.path.isabs(sidecar):
+            return sidecar
+        root_path = getattr(self, "_root_path", None)
+        if not root_path:
+            return None
+        return os.path.join(root_path, self.path, os.path.basename(sidecar))
 
     @property
     def metadatas(self):
@@ -501,13 +656,12 @@ class Clip(models.Model):
 
     @metadatas.setter
     def metadatas(self, new_metadatas):
+        # Memo only since 2.4 (AD-6). Assigning metadatas used to fan out
+        # one upsert query PER KEY for an already-saved clip, on top
+        # of the identical fan-out in save(); persistence is now the
+        # batched write unit's job — models/folder.persist_scan_results
+        # for the scan path, persist_metadatas() for everyone else.
         self._metadatas = new_metadatas
-        if not self._state.adding:
-            # Then we update the database
-            for key, value in new_metadatas.items():
-                self.clipmetadata_set.update_or_create(
-                    name=key, defaults={"value": value}
-                )
 
     @property
     def media_files(self):
@@ -1155,19 +1309,52 @@ class Clip(models.Model):
             self.folders.add(folder)
         return result
 
-    def save(self, *args, **kwargs):
-        super().save(*args, **kwargs)
+    def persist_metadatas(self) -> None:
+        """Write this clip's memoized metadatas, batched.
 
-        if hasattr(self, "xml") and self.xml is not None:
-            self.clip_xml = self.xml.tostring()
+        The explicit replacement for the deleted ``save()`` fan-out, and
+        the SAME code path the scan write unit uses — two statements
+        whatever the key count, instead of one upsert query per metadata
+        key plus a delete. A clip that never had metadatas assigned
+        writes nothing at all (pre-2.4 ``save()`` guarded on the memo the
+        same way); an EMPTY metadatas mapping still clears the clip's
+        rows, also exactly as before.
+        """
+        if not hasattr(self, "_metadatas"):
+            return
+        writes = (MetadataWrite(umid=self.pk, metadatas=self._metadatas),)
+        type(self).persist_metadatas_bulk(writes, group_stale_deletes(writes))
 
-        if hasattr(self, "_metadatas"):
-            for name, value in self._metadatas.items():
-                ClipMetadata.objects.update_or_create(
-                    clip=self, name=name, defaults={"value": value}
-                )
-            ClipMetadata.objects.filter(clip=self).exclude(
-                name__in=self._metadatas.keys()
+    @classmethod
+    def persist_metadatas_bulk(
+        cls,
+        writes: Any,
+        stale_deletes: Any,
+    ) -> None:
+        """Upsert every clip's metadata rows, then drop the stale ones.
+
+        ``writes`` must hold at most one entry per umid — the plan layer
+        (``scan.persistence.dedupe_candidates``) guarantees it, and a
+        repeated conflict target inside one ``ON CONFLICT`` statement is
+        rejected by both sqlite and PostgreSQL. ``stale_deletes`` comes
+        from ``group_stale_deletes`` over the SAME writes, so the two can
+        never disagree about which keys survive.
+        """
+        rows = [
+            ClipMetadata(clip_id=write.umid, name=name, value=value)
+            for write in writes
+            for name, value in write.metadatas.items()
+        ]
+        if rows:
+            ClipMetadata.objects.bulk_create(
+                rows,
+                update_conflicts=True,
+                unique_fields=["clip", "name"],
+                update_fields=["value"],
+            )
+        for stale in stale_deletes:
+            ClipMetadata.objects.filter(clip_id__in=stale.umids).exclude(
+                name__in=stale.keep_names
             ).delete()
 
 

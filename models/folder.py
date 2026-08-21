@@ -4,7 +4,7 @@ import uuid
 import os
 import re
 from typing import Optional, Dict, List, Any
-from django.db import models
+from django.db import models, transaction
 from django.utils import timezone
 from django.conf import settings
 from django.core.cache import cache
@@ -30,9 +30,62 @@ from portal.plugins.TapelessIngest.scan.adapters import (
 )
 from portal.plugins.TapelessIngest.scan.context import browse_root_path
 from portal.plugins.TapelessIngest.scan.extraction import applicable_providers
+from portal.plugins.TapelessIngest.scan.persistence import (
+    CLIP_UNIQUE_FIELDS,
+    FOLDER_SCAN_FIELDS,
+    ClipCandidate,
+    build_persistence_plan,
+)
 from portal.plugins.TapelessIngest.scan.verification import FolderListings
 
 log = logging.getLogger(__name__)
+
+
+def persist_scan_results(folder, plan, dry_run=False):
+    """Execute one folder's persistence plan — the AD-6 write unit.
+
+    The Portal/ORM half of the plan/executor split: ``scan.persistence``
+    decided WHAT to write with no Django in sight, this decides how, in
+    one ``transaction.atomic()`` per folder, in a fixed order —
+    Clip upsert, then ClipMetadata upsert + stale-key delete, then the
+    Folder row. The statement count is constant per folder: never one
+    per file, never one per metadata key.
+
+    ``dry_run`` gates the whole unit. A dry run pre-2.4 still saved the
+    folder row and still fanned out existing clips' metadata (``dry_run``
+    only ever gated ``Folder.ingest``'s ingest block); that write is gone
+    — a declared, waivered delta on the way to 2.7's full dry-run purity.
+
+    The clips are not passed separately: ``plan.clip_rows`` is the
+    deduped, authoritative row set, and a second clip list travelling
+    beside it could only ever disagree with it.
+
+    Returns:
+        True when the transaction ran, False when there was nothing to
+        write or the run is a dry run.
+    """
+    if dry_run or plan.is_empty:
+        return False
+    with transaction.atomic():
+        if plan.clip_rows:
+            # Upsert, not insert: a concurrent scan (or a duplicate umid
+            # the plan collapsed) must never raise a constraint error.
+            # update_fields is the narrow allow-list from the plan layer,
+            # so an EXISTING clip's location and ingest state survive
+            # untouched — see scan.persistence.CLIP_UPDATE_FIELDS.
+            Clip.objects.bulk_create(
+                list(plan.clip_rows),
+                update_conflicts=True,
+                unique_fields=list(CLIP_UNIQUE_FIELDS),
+                update_fields=list(plan.update_fields),
+            )
+        if plan.metadata_writes or plan.stale_deletes:
+            Clip.persist_metadatas_bulk(plan.metadata_writes, plan.stale_deletes)
+        if plan.save_folder:
+            for field_name, value in plan.folder_fields.items():
+                setattr(folder, field_name, value)
+            folder.save()
+    return True
 
 
 class Folder(models.Model):
@@ -79,6 +132,21 @@ class Folder(models.Model):
             params.update(defaults)
             # Try to create an object using passed params.
             return cls(**params), True
+        except cls.MultipleObjectsReturned:
+            # FR-27, defensive only. The (path, storage_id) unique
+            # constraint is live and enforced on prod (audited 2026-08-21:
+            # zero duplicate rows, zero NULL storage_ids), so the ONLY way
+            # in is the SQL loophole where NULLs are distinct — two rows
+            # with the same path and a NULL storage_id. A scan always
+            # passes a storage_id, so it can only ever READ such a pair.
+            # Deterministic first-by-pk beats an unhandled exception that
+            # would take the whole folder down.
+            log.warning(
+                f"Duplicate {cls.__name__} rows for {kwargs!r}; using the "
+                f"first by pk — a NULL storage_id lets the unique "
+                f"constraint through"
+            )
+            return cls.objects.filter(**kwargs).order_by("pk").first(), False
 
     def get_storage_helper(self) -> Any:
         """Get or create StorageHelper instance for this folder.
@@ -434,6 +502,9 @@ class Folder(models.Model):
                 "scan_context": scan_context,
                 "listings": listings,
             }
+            # The write unit's input, accumulated across every page of
+            # this invocation and persisted ONCE after the loop (AD-6).
+            candidates = []
             has_next = True
             while has_next:
                 has_next = False
@@ -459,7 +530,15 @@ class Folder(models.Model):
                     hits, key=lambda hit: hit.get("_source", {}).get("path") or ""
                 )
                 if not count_only:
+                    # Pass 1: extract every file's metadatas. One record
+                    # per hit, in hit order, each holding either its
+                    # extraction result or the error it died of — so the
+                    # response's error/clip ordering is byte-identical to
+                    # the pre-2.4 single-pass loop even though the DB
+                    # lookup now happens between the two passes.
+                    records = []
                     for result in hits:
+                        record = {"result": result, "error": None}
                         try:
                             file = VSFile(
                                 result["_source"], settings.VIDISPINE_REPLACE_URLS
@@ -488,12 +567,50 @@ class Folder(models.Model):
                                 file_providers = applicable_providers(
                                     file.getFileName(), extension_map
                                 )
-                            clip, created = Clip.get_clip_from_file(
+                            metadatas, item_id = Clip.extract_file_metadatas(
                                 file,
                                 file_providers,
                                 provider_context,
                                 legacy_storages=legacy_storages,
                             )
+                            record["file"] = file
+                            record["metadatas"] = metadatas
+                            record["item_id"] = item_id
+                        except Exception as e:
+                            traceback.print_exc()
+                            record["error"] = (
+                                f"Error scanning file {result['_source']['path']}: {e}"
+                            )
+                        records.append(record)
+
+                        response["processed"] += 1
+                    # ONE lookup per page for the whole umid set, instead
+                    # of one query per file. `created` keeps its pinned
+                    # meaning: the umid was absent from this map.
+                    umids = [
+                        record["metadatas"]["umid"]
+                        for record in records
+                        if record["error"] is None
+                    ]
+                    existing_clips = Clip.objects.in_bulk(umids) if umids else {}
+                    # Pass 2: assemble the clips, in hit order.
+                    for record in records:
+                        if record["error"] is not None:
+                            response["errors"].append(record["error"])
+                            continue
+                        try:
+                            file = record["file"]
+                            metadatas = record["metadatas"]
+                            umid = metadatas["umid"]
+                            clip = existing_clips.get(umid)
+                            created = clip is None
+                            if created:
+                                clip = Clip(
+                                    **Clip.new_clip_defaults(
+                                        file, metadatas, record["item_id"]
+                                    )
+                                )
+                            clip.attach_file_metadatas(file, metadatas)
                             # Seed the clip's memo attributes from the run
                             # context so ingest-time clip.root_path (xdcam)
                             # stops re-resolving — same seam the paged tests
@@ -504,6 +621,10 @@ class Folder(models.Model):
                                     clip._storage = storage_info.storage
                                 if storage_info.root_path:
                                     clip._root_path = storage_info.root_path
+                            # FR-12 plan-prep: the sidecar is serialized
+                            # into clip_xml BEFORE the row is written, and
+                            # only while the column is empty.
+                            clip.load_clip_xml(metadatas)
                             if created:
                                 response["created"] += 1
                             if clip.file is not None:
@@ -512,17 +633,37 @@ class Folder(models.Model):
                                 providers.append(clip.metadatas["provider"])
                             response["clips"].append(clip)
                             provider_context["clips"].append(clip)
+                            candidates.append(
+                                ClipCandidate(
+                                    umid=umid,
+                                    clip=clip,
+                                    metadatas=metadatas,
+                                    created=created,
+                                )
+                            )
                         except Exception as e:
                             traceback.print_exc()
                             response["errors"].append(
-                                f"Error scanning file {result['_source']['path']}: {e}"
+                                f"Error scanning file "
+                                f"{record['result']['_source']['path']}: {e}"
                             )
-
-                        response["processed"] += 1
                     self.provider_names = ",".join(providers)
                     self.scanned_on = timezone.now()
-                if len(providers) > 0:
-                    self.save()
+            # The one write unit for this folder (AD-6): every page's
+            # clips, one transaction, a constant number of statements —
+            # and the Folder row written at most once per invocation.
+            persist_scan_results(
+                self,
+                build_persistence_plan(
+                    candidates,
+                    folder_fields={
+                        field_name: getattr(self, field_name)
+                        for field_name in FOLDER_SCAN_FIELDS
+                    },
+                    provider_hits=len(providers),
+                ),
+                dry_run=scan_context.options.dry_run,
+            )
         else:
             self.error = (
                 f"Cannot get full path from storage {self.storage_id}, path {self.path}"

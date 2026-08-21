@@ -87,11 +87,31 @@ def test_single_page_scan_counters(
         f"{rel}/CLIPOLD",
     ]
 
-    # Ledger quirk pinned as-is (tests/pinned-bugs.md): a "scan" is not
-    # read-only — it persists provider_names and scanned_on on the folder.
+    # Ledger row #4, FIXED by story 2.4 (deleted from tests/pinned-bugs.md;
+    # declared in tests/fr4-waivers.md). A scan still persists
+    # provider_names/scanned_on — that part is unchanged and stays pinned
+    # here — but the row is now written by the single atomic write unit
+    # AFTER the page loop: exactly once per scan invocation whatever the
+    # page count, and never at all for a folder no provider claimed.
     saved = Folder.objects.get(storage_id=STORAGE_ID, path=rel)
     assert saved.provider_names == fake_provider.machine_name
     assert saved.scanned_on is not None
+    assert Folder.objects.filter(storage_id=STORAGE_ID, path=rel).count() == 1
+    # (the multi-page half of "exactly once" is
+    # test_persistence_write_unit.py::test_multipage_folder_saved_once)
+
+    # Zero-hit folder: its file errors out exactly like CLIPGONE above, so
+    # no provider claimed anything — and nothing at all is written.
+    zero_rel = "2026/AH_20260101_zerohit"
+    (tmp_path / zero_rel).mkdir(parents=True)
+    es_fake.push(es_page([_source(f"{zero_rel}/ABSENT.fake", "VX-41-ABSENT")], total=1))
+    zero_response = _folder(tmp_path, zero_rel).scan(
+        providers=[fake_provider.machine_name]
+    )
+
+    assert len(zero_response["errors"]) == 1
+    assert not Folder.objects.filter(path=zero_rel).exists()
+    assert Folder.objects.count() == 1
 
 
 def test_ingest_dry_run_key_superset(
