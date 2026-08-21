@@ -57,46 +57,53 @@ def resolve_storages(storage_ids: Iterable[str]) -> Dict[str, StorageInfo]:
 
 
 def build_provider_registry(names: Optional[Iterable[str]] = None) -> tuple:
-    """Instantiate the provider registry for ``names`` (AD-1: adapter-side).
+    """Instantiate the provider registry for ``names``.
 
     ``None`` means the canonical ``PROVIDER_NAMES`` tuple. Instantiation
-    goes through ``Clip.get_provider_by_name`` so the ``_PROVIDER_CACHE``
-    test seam (and its process-wide instance reuse) is preserved — the
-    registry holds exactly the same instances ``Clip._get_provider_list``
-    hands out. Order follows ``names``; duplicates are kept, exactly as
-    ``_get_provider_list`` keeps them today.
+    goes through ``Clip.get_provider_by_name``, so the registry holds
+    exactly the instances the provider cache hands out everywhere else.
+    Order follows ``names``; a repeated name yields one entry, since a
+    provider that ran twice would merge its own contribution over itself.
 
-    Imported lazily: ``models.clip`` pulls in Django models and Portal,
-    and ``models.folder`` imports this module.
+    ``models.clip`` is imported lazily: it pulls in Django models and
+    Portal, and ``models.folder`` imports this module.
     """
     from portal.plugins.TapelessIngest.models.clip import Clip
 
     if names is None:
         names = PROVIDER_NAMES
-    return tuple(Clip.get_provider_by_name(name) for name in names)
+    unique_names = list(dict.fromkeys(names))
+    return tuple(Clip.get_provider_by_name(name) for name in unique_names)
 
 
 def _build_registry_and_map(providers: Optional[List[str]]):
     """Registry + extension map for a context, or ``(None, None)``.
 
-    A name that does not resolve (today: ``ImportError`` from
-    ``get_provider_by_name``'s ``__import__``) must keep failing where it
-    fails TODAY — inside ``Folder.scan``'s ``Clip._get_provider_list``
-    call, not at context-construction time, which no caller expects to
-    validate provider names. So the build degrades to ``(None, None)``
-    here and ``Folder.scan``'s documented fallback re-raises the very
-    same error at the very same site.
+    An unresolvable provider name must keep failing where it has always
+    failed — inside ``Folder.scan``'s ``Clip._get_provider_list`` call,
+    not at context construction, which no caller expects to validate
+    names. Only that case degrades to ``(None, None)``: the scan's
+    fallback then raises the identical ``ImportError`` at the identical
+    site.
+
+    Nothing else may degrade. A provider whose ``__init__`` or
+    ``getExtensions()`` blows up would leave the fallback SUCCEEDING with
+    the pre-filter silently disabled, so the run would select providers
+    differently from a healthy one. Those propagate.
     """
     try:
         registry = build_provider_registry(providers)
-        return registry, build_extension_map(registry)
-    except Exception:
+    except ImportError:
+        # Logged per context build, i.e. once per tree run but once per
+        # PAGE for paged UI callers, which rebuild their default context
+        # on every scan()/ingest() call.
         log.warning(
-            f"build_provider_registry({providers!r}) failed; the scan will "
-            f"resolve providers the legacy way and surface the error there",
+            f"cannot resolve provider names {providers!r}; this scan will "
+            f"resolve them the legacy way and raise there",
             exc_info=True,
         )
         return None, None
+    return registry, build_extension_map(registry)
 
 
 def build_context(
@@ -110,9 +117,8 @@ def build_context(
 ) -> ScanContext:
     """Build the one per-run context for tree mode (commands' ``handle()``).
 
-    The provider registry and its extension map are built ONCE here, from
-    ``providers`` (story 2.3) — the same instantiation cost the old
-    per-call ``_get_provider_list`` paid, now paid once per run.
+    The provider registry and its extension map are built once here and
+    reused by every folder of the run.
     """
     registry, extension_map = _build_registry_and_map(providers)
     return ScanContext(

@@ -45,10 +45,8 @@ class Provider(BaseProvider):
         return []
 
     def getAllClipMetadatas(self, metadatas, media_file, context=None):
-        # Story 2.3 completes 2.1's deferred dedup: the provider context is
-        # threaded through so the absolute path comes from the run's
-        # ScanContext (zero storage HTTP calls). `context=None` keeps the
-        # legacy per-call resolution for context-less callers.
+        # `context` carries the run's resolved storage roots; without it
+        # the path is resolved per call, one storage API round trip.
         media_absolute_path = self.get_file_absolute_path(media_file, context)
         timestamp = os.path.getmtime(media_absolute_path)
         shooting_date = datetime.fromtimestamp(timestamp)
@@ -131,8 +129,6 @@ class Provider(BaseProvider):
             if media_file.getHash():
                 metadatas["umid"] = media_file.getHash()
             metadatas = self.getAllClipMetadatas(metadatas, media_file, context)
-        # AD-7 (story 2.3): return the metadatas only; `context` stays an
-        # argument and stays mutable in place.
         return metadatas
 
     def getClipMainMediaFile(self, clip, rebuild=False):

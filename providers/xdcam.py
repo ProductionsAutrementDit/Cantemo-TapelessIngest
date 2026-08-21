@@ -28,6 +28,14 @@ class Provider(BaseProvider):
     def getExtensions(self):
         return [".mxf", ".mp4"]
 
+    def is_extension_guarded(self):
+        # getMetadatasFromFile guards on sidecar presence only
+        # ({clip}M01.XML), which is extension-agnostic: an .mov or .wav
+        # sitting in an XDCAM structure is claimed here today. Declaring
+        # the suffixes above as the pre-filter's bound would narrow the
+        # filter below the guard and flip those clips' umid.
+        return False
+
     def getSubPaths(self):
         return [
             "((PRIVATE/)?(M4ROOT/|XDROOT/))?(Clip|CLIP)",
@@ -126,10 +134,7 @@ class Provider(BaseProvider):
         media_absolute_path = self.get_file_absolute_path(media_file, context)
         media_dirname = os.path.dirname(media_absolute_path)
         clip_xml = None
-        # Get Metadata File — FR-16: the sidecar probe is answered from the
-        # scan's batched listings when the context carries them (the media
-        # directory was already scandir'd for verification), else it is
-        # today's os.path.isfile.
+        # Sidecar presence is the ONLY guard here; see is_extension_guarded.
         if self.probe_is_file(
             os.path.join(media_dirname, filename + "M01.XML"), context
         ):
@@ -142,10 +147,10 @@ class Provider(BaseProvider):
             # So the mediapro_xml context is an dict, keyed by mediapro paths
             if "mediapro_xml" not in context.keys():
                 context["mediapro_xml"] = {}
-            # Deliberately NOT normpath'd: this string is also the
-            # mediapro_xml cache key and the XMLParser argument, both
-            # unchanged. FolderListings normalizes internally, so the
-            # parent-directory probe still shares one lazy scandir.
+            # Deliberately NOT normpath'd: this string doubles as the
+            # mediapro_xml cache key and the XMLParser argument. The
+            # listings normalize internally, so the probe still shares one
+            # directory listing with any normalized form.
             mediaproxml_path = os.path.join(media_dirname, "../MEDIAPRO.XML")
             if mediaproxml_path not in context["mediapro_xml"].keys():
                 if self.probe_is_file(mediaproxml_path, context):
@@ -157,8 +162,6 @@ class Provider(BaseProvider):
                     metadatas, context["mediapro_xml"][mediaproxml_path]
                 )
 
-        # AD-7 (story 2.3): metadatas only; `context` stays an argument and
-        # stays mutable in place (the mediapro_xml cache above).
         return metadatas
 
         # TODO: add PD-EDL handling

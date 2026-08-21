@@ -26,8 +26,15 @@ TapelessIngest/
 │   ├── settings.py             # Settings & MetadataMapping ~3KB
 │   └── models.py               # Job tracking models ~3KB
 │
-├── providers/                  # 🎥 Camera Format Providers
+├── scan/                       # 🔍 Scan pipeline (Portal-free except adapters)
 │   ├── __init__.py
+│   ├── context.py              # Frozen per-run ScanContext, storage roots
+│   ├── adapters.py             # The one Portal import site; registry build
+│   ├── verification.py         # Batched directory listings (one scandir/dir)
+│   └── extraction.py           # Provider pre-filter + metadata merge loop
+│
+├── providers/                  # 🎥 Camera Format Providers
+│   ├── __init__.py             # PROVIDER_NAMES — canonical registry membership
 │   ├── providers.py            # Base Provider class ~6KB
 │   ├── red.py                  # RED camera support ~5KB
 │   ├── xdcam.py                # Sony XDCAM ~11KB
@@ -98,6 +105,7 @@ TapelessIngest/
 │   ├── data-models.md          # Database schema
 │   ├── api-contracts.md        # REST API reference
 │   ├── source-tree-analysis.md # This file
+│   ├── adding-a-provider.md    # Provider contract + the superset rule
 │   ├── development-guide.md    # Developer setup
 │   └── project-scan-report.json # Scan state
 │
@@ -183,7 +191,7 @@ XML configuration for Vidispine import workflows.
 ### Business Logic
 - `models/clip.py` - Clip operations
 - `models/folder.py` - Scan operations
-- `providers/providers.py` - Provider base class
+- `providers/providers.py` - Provider base class (contract: `docs/adding-a-provider.md`)
 
 ### API
 - `urls.py` - Route definitions

@@ -32,7 +32,46 @@ class Provider:
         self.folders_to_ignore = []
 
     def getExtensions(self):
+        """Filename suffixes this provider may claim (see the class docstring).
+
+        An empty declaration means "unknown reach": the scan pre-filter
+        then treats this provider as applicable to every file.
+        """
         return []
+
+    def is_extension_guarded(self):
+        """Whether ``getExtensions()`` bounds what this provider can claim.
+
+        Return ``False`` when the runtime guard in ``getMetadatasFromFile``
+        does not test the file extension — the card providers, whose guard
+        is sidecar presence and therefore extension-agnostic. Such a
+        provider is applicable to every file, and its own guard decides.
+        """
+        return True
+
+    def getMetadatasFromFile(self, media_file, metadatas, context):
+        """Contribute this provider's metadatas for ``media_file``.
+
+        Contract, enforced by the scan pipeline:
+
+        * RETURN THE METADATAS ONLY. ``context`` is an argument and is
+          mutated in place; returning it (the pre-registry-v2 two-tuple)
+          raises a ``TypeError`` in the merge loop.
+        * Every applicable provider runs and its result is merged, so
+          contributing means either mutating ``metadatas`` in place or
+          returning a mapping of the keys you own. Returning ``None``
+          contributes nothing.
+        * ``getExtensions()`` MUST be a SUPERSET of the guard used here.
+          If the guard is not extension-based, override
+          ``is_extension_guarded()`` to return ``False`` instead of
+          widening the declaration.
+        * Overwriting ``umid`` or ``provider`` once another provider has
+          set them changes the clip's primary key; the merge loop logs an
+          error when it happens.
+
+        The base implementation contributes nothing.
+        """
+        return metadatas
 
     def getSubPaths(self):
         return []
@@ -96,10 +135,9 @@ class Provider:
         return True
 
     def get_file_absolute_path(self, file, context=None):
-        # Context-first (story 2.1): the run's ScanContext resolves the root
-        # with zero storage HTTP calls; the per-call resolution below is the
-        # legacy fallback for context-less callers (e.g. providers/file.py
-        # until 2.3's AD-7 contract threads context provider-internally).
+        # Context-first: the run's ScanContext resolves the root with zero
+        # storage HTTP calls. The per-call resolution below is the fallback
+        # for callers that have no context, and costs one call per file.
         if context is not None:
             scan_context = context.get("scan_context")
             if scan_context is not None:
@@ -123,26 +161,35 @@ class Provider:
         return os.path.join(root_path, file.getPath())
 
     def probe_is_file(self, path, context=None):
-        """Sidecar existence probe, answered from the scan's listings (FR-16).
+        """Sidecar existence probe, answered from the scan's listings.
 
-        Story 2.3: when the provider context carries the scan's
-        ``FolderListings`` (``context["listings"]``, story 2.2), a sidecar
-        probe costs zero extra ``stat`` calls — the directory was already
-        scandir'd for verification, and a probe into an unlisted directory
-        (xdcam's ``../MEDIAPRO.XML``, panasonicP2's ``../CLIP/…``,
-        ikegami's ``../CLIPINF/…``) lazily scandirs THAT directory once and
-        caches it. ``FolderListings`` normalizes the path internally, so
-        callers keep passing their un-normalized path (it is also a cache
-        key in xdcam) and still hit the same listing.
+        When the provider context carries the scan's ``FolderListings``,
+        a probe into a directory the scan already listed is answered from
+        that listing, and a probe into an unlisted directory (a parent
+        such as ``../MEDIAPRO.XML``, ``../CLIP/…``, ``../CLIPINF/…``)
+        lazily lists THAT directory once and caches it for the rest of
+        the invocation. A PRESENT sidecar then costs no filesystem call
+        at all; an ABSENT one still costs one confirming ``stat`` per
+        probe, because a membership miss is confirmed against the real
+        filesystem before answering False.
 
-        Without listings — a legacy/context-less caller, or a relative
-        path, which the verification API refuses by contract — this is
-        exactly today's ``os.path.isfile``.
+        ``FolderListings`` normalizes internally, so callers keep passing
+        their un-normalized path (in xdcam it doubles as a cache key).
+        Without listings this is exactly ``os.path.isfile``.
         """
         if context:
             listings = context.get("listings")
-            if listings is not None and os.path.isabs(path):
-                return listings.is_file(path)
+            if listings is not None:
+                if os.path.isabs(path):
+                    return listings.is_file(path)
+                # The verification API refuses relative paths by contract
+                # (they would resolve against the process CWD). Surface
+                # the caller bug instead of silently answering from it.
+                log.error(
+                    f"{self.machine_name}: relative sidecar probe {path!r} "
+                    f"cannot use the scan listings; the storage root should "
+                    f"already be joined. Falling back to os.path.isfile."
+                )
         return os.path.isfile(path)
 
     def _createDictFromMetadataMapping(self, clip):

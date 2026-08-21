@@ -1,19 +1,17 @@
-"""Canonical provider registry membership (story 2.3).
+"""Canonical provider registry membership.
 
-Pure data, ZERO imports: this module is the single source of truth for
-which providers participate in a scan, and it must stay importable from
-anywhere (models, adapters, the management commands, the golden-doc
-recorder) without dragging Portal, Django, or a provider module in.
+Pure data, ZERO imports: the single source of truth for which providers
+participate in a scan, importable from anywhere (models, adapters, the
+management commands, the golden-doc recorder) without dragging Portal,
+Django, or a provider module in.
 
-Order is the production cron order (`--providers` default in both
-management commands), ratified as canonical: the UI's paged scans move
-from the old red-first ordering to this one, which is behaviorally inert
-(red guards on ``.R3D``; ``file`` is last in both lists; no other key
-overlap). Membership is IDENTICAL to every live list before 2.3 — same
-8 names — so the byte-frozen golden search doc is unchanged.
+Order is load bearing. It is the production cron order, and it decides
+which provider claims a file when several are applicable to it — so it
+decides the clip's umid and primary key.
 
-Adding or removing a name here changes the golden doc and needs human
-sign-off (spec 2.3, "Ask First").
+Membership feeds the Elasticsearch discovery query, so adding or
+removing a name changes the byte-frozen golden search doc and needs
+human sign-off. See docs/adding-a-provider.md.
 """
 
 PROVIDER_NAMES = (

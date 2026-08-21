@@ -24,7 +24,10 @@ from portal.plugins.TapelessIngest.helpers import (
     TapelessIngestHelper,
     TapelessIngestException,
 )
-from portal.plugins.TapelessIngest.scan.adapters import build_default_context
+from portal.plugins.TapelessIngest.scan.adapters import (
+    build_default_context,
+    build_provider_registry,
+)
 from portal.plugins.TapelessIngest.scan.context import browse_root_path
 from portal.plugins.TapelessIngest.scan.extraction import applicable_providers
 from portal.plugins.TapelessIngest.scan.verification import FolderListings
@@ -243,10 +246,14 @@ class Folder(models.Model):
         else:
             self._providers = None
             if self.provider_names != "":
-                self._providers = []
-                provider_names = self.provider_names.split(",")
-                for provider_name in provider_names:
-                    self._providers.append(Clip.get_provider_by_name(provider_name))
+                # Same resolution path as a scan's registry: one instance
+                # per name out of the provider cache. Not the scan
+                # context's registry, though — this reads the names a PAST
+                # scan persisted on the row, which is a different (and
+                # possibly stale) set from the run's --providers.
+                self._providers = list(
+                    build_provider_registry(self.provider_names.split(","))
+                )
         return self._providers
 
     @providers.setter
@@ -329,10 +336,6 @@ class Folder(models.Model):
         return search_doc
 
     def count(self, user=None, providers=None):
-        # Story 2.3: the stray `Clip._get_provider_list()` that used to sit
-        # here ignored this method's own `providers` argument and threw its
-        # result away, instantiating every provider as a pure side effect.
-        # `scan` below forwards `providers` and builds the registry once.
         response = self.scan(
             first=0, number=0, user=user, providers=providers, count_only=True
         )
@@ -394,10 +397,9 @@ class Folder(models.Model):
             user = scan_context.options.user
             providers = scan_context.options.providers
             legacy_storages = scan_context.options.legacy_storages
-        # Registry v2 (story 2.3): the context carries the ONE registry and
-        # its extension map, built once per run (tree) / per paged call.
-        # The legacy resolution is the documented fallback — and the site
-        # where an unknown provider name raises today's ImportError.
+        # The context carries the registry and its extension map. When the
+        # registry could not be built (an unresolvable provider name), this
+        # fallback is where that name raises, as it always has.
         provider_list = scan_context.provider_registry
         if provider_list is None:
             provider_list = Clip._get_provider_list(providers)
@@ -423,10 +425,9 @@ class Folder(models.Model):
             listings = FolderListings()
             search_doc = self.build_search_doc(provider_list)
             # Named provider_context (not `context`) so the mutable provider
-            # dict never shadows the ScanContext kwarg. Built ONCE per
-            # scan() invocation (story 2.3 — it used to be rebuilt per page,
-            # throwing away xdcam's MEDIAPRO cache at every page boundary);
-            # it never escapes the invocation (AD-4).
+            # dict never shadows the ScanContext kwarg. One per scan()
+            # invocation, spanning every page: the providers' sidecar caches
+            # live in it. It never escapes the invocation.
             provider_context = {
                 "folder": self,
                 "clips": [],
@@ -451,12 +452,14 @@ class Folder(models.Model):
                 if number == 0 and len(hits) == result_number:
                     has_next = True
                     first += result_number
+                # Deterministic per-page iteration order. The key tolerates
+                # a malformed hit so a missing `_source` can never raise out
+                # here, outside the per-file error wrapper.
+                hits = sorted(
+                    hits, key=lambda hit: hit.get("_source", {}).get("path") or ""
+                )
                 if not count_only:
-                    # Deterministic per-page iteration order (FR-4). Sorting
-                    # lives INSIDE the `not count_only` branch on purpose:
-                    # count-only pagination fixtures carry `_source`-less
-                    # hits, which the key would KeyError on.
-                    for result in sorted(hits, key=lambda hit: hit["_source"]["path"]):
+                    for result in hits:
                         try:
                             file = VSFile(
                                 result["_source"], settings.VIDISPINE_REPLACE_URLS
@@ -474,23 +477,18 @@ class Folder(models.Model):
                                 raise TapelessIngestException(
                                     f"File {file} does not exist ({file_absolute_path})"
                                 )
-                            # FR-13 pre-filter (story 2.3): only providers
-                            # whose declared suffixes match this filename
-                            # are invoked. Applicability is a SUPERSET of
-                            # each provider's own runtime guard — the guard
-                            # still decides. No map (legacy/degraded
-                            # context) => today's full provider list.
-                            if extension_map is None:
+                            # Pre-filter: only providers that may claim this
+                            # filename are invoked; each provider's own guard
+                            # still decides. A missing or unusable map must
+                            # never starve a file — fall back to the whole
+                            # list, which is what running unfiltered means.
+                            if not extension_map:
                                 file_providers = provider_list
                             else:
                                 file_providers = applicable_providers(
                                     file.getFileName(), extension_map
                                 )
-                            (
-                                clip,
-                                provider_context,
-                                created,
-                            ) = Clip.get_clip_from_file(
+                            clip, created = Clip.get_clip_from_file(
                                 file,
                                 file_providers,
                                 provider_context,

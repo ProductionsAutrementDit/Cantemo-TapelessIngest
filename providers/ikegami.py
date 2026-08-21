@@ -23,6 +23,11 @@ class Provider(BaseProvider):
     def getExtensions(self):
         return [".mxf"]
 
+    def is_extension_guarded(self):
+        # Guarded on ../CLIPINF/CLIP{name}.XML presence only —
+        # extension-agnostic, like the other card providers.
+        return False
+
     def getSubPaths(self):
         return [
             "BIN([0-9]{3})/VIDEO",
@@ -155,13 +160,10 @@ class Provider(BaseProvider):
         metadata_file_path = os.path.normpath(
             os.path.join(media_dirname, "../CLIPINF/CLIP" + clipname + ".XML")
         )
-        # FR-16: parent-directory sidecar probe through the scan's batched
-        # listings when available (one lazy scandir of ../CLIPINF, cached),
-        # else today's os.path.isfile.
+        # Sidecar presence is the ONLY guard here; see is_extension_guarded.
         if self.probe_is_file(metadata_file_path, context):
             metadatas["clipname"] = clipname
             metadatas["clip_xml_file"] = metadata_file_path
             clip_xml = XMLParser(metadata_file_path)
             metadatas = self.getAllClipMetadatas(metadatas, clip_xml)
-        # AD-7 (story 2.3): metadatas only; `context` stays an argument.
         return metadatas

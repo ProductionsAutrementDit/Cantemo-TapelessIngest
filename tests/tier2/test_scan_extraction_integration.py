@@ -1,20 +1,22 @@
-"""Tier 2 (story 2.3): registry v2 + the extraction phase inside Folder.scan.
+"""Tier 2: the provider registry and extraction phase inside Folder.scan.
 
-Sibling to test_scan_counters.py (which stays byte-unmodified). Here:
+Sibling to test_scan_counters.py, which stays byte-unmodified. Covered
+here, end to end through a real ``scan()``:
 
-- FR-32 end-to-end: two applicable providers both run, in registry order,
-  and the second one's FRESH-dict return is MERGED rather than dropped —
-  the pre-2.3 loop kept only in-place mutations;
-- the FR-13 pre-filter, spy-counted: a provider whose declared suffixes
-  do not match a file is never invoked for it;
-- deterministic per-page iteration: hits are processed in
-  ``_source["path"]`` order regardless of the index's order;
-- FR-16 sidecar probes through ``context["listings"]``: a same-directory
-  sidecar costs ZERO extra scandir (the directory was already listed for
-  verification), a parent-directory sidecar lazily scandirs that
-  directory ONCE and caches it across files and pages, an absent sidecar
-  simply contributes nothing, and a context without listings falls back
-  to ``os.path.isfile`` — today's behavior exactly.
+- every applicable provider runs and merges, including one returning a
+  fresh dict rather than mutating in place;
+- the pre-filter, spy-counted: a provider is never invoked for a file it
+  cannot claim — and the card providers, whose guard is sidecar presence
+  rather than the extension, keep every file they claim today;
+- hits are processed in ``_source["path"]`` order whatever order the
+  index returns them in;
+- the degraded paths (no registry, empty extension map) behave like an
+  unfiltered run rather than starving every file;
+- the provider context dict spans the whole invocation, so a sidecar
+  resolved on page 1 is not resolved again on page 2;
+- sidecar probes go through the scan's directory listings: a listed
+  directory costs no extra scandir, an unlisted parent costs exactly one,
+  and a listings-less context behaves like ``os.path.isfile``.
 
 ORM needed: Clip.get_or_new and folder.save hit the DB.
 """
@@ -26,6 +28,13 @@ import pytest
 from portal.plugins.TapelessIngest.models.clip import Clip
 from portal.plugins.TapelessIngest.models.folder import Folder
 from portal.plugins.TapelessIngest.providers.providers import Provider as BaseProvider
+from portal.plugins.TapelessIngest.scan.context import (
+    RunOptions,
+    ScanContext,
+    StorageInfo,
+)
+from portal.plugins.TapelessIngest.scan.extraction import build_extension_map
+from portal.plugins.TapelessIngest.scan.verification import FolderListings
 
 STORAGE_ID = "VX-41"
 
@@ -77,7 +86,7 @@ class SpyProvider:
 
 
 class FreshDictProvider:
-    """Returns a FRESH dict — the AD-7 contribution pre-2.3 threw away."""
+    """Returns a fresh dict instead of mutating metadatas in place."""
 
     def __init__(self, machine_name, extensions):
         self.machine_name = machine_name
@@ -99,13 +108,14 @@ class FreshDictProvider:
 
 
 class SidecarProvider(BaseProvider):
-    """Probes a same-directory AND a parent-directory sidecar (FR-16)."""
+    """Probes a same-directory AND a parent-directory sidecar."""
 
     def __init__(self):
         BaseProvider.__init__(self)
         self.name = "Fake Sidecar Provider"
         self.machine_name = SIDECAR_NAME
         self.probes = []
+        self.parsed = []
 
     def getExtensions(self):
         return [".fake"]
@@ -123,12 +133,15 @@ class SidecarProvider(BaseProvider):
         same_dir_sidecar = os.path.join(media_dirname, filename + "M01.XML")
         # Deliberately un-normalized, exactly like xdcam's MEDIAPRO probe.
         parent_sidecar = os.path.join(media_dirname, "../MEDIAPRO.XML")
-        self.probes.append(
-            (
-                self.probe_is_file(same_dir_sidecar, context),
-                self.probe_is_file(parent_sidecar, context),
-            )
-        )
+        same_dir_hit = self.probe_is_file(same_dir_sidecar, context)
+        # Parse-once-per-invocation cache in the provider context, the
+        # shape xdcam uses for MEDIAPRO.XML.
+        cache = context.setdefault("sidecar_cache", {})
+        if parent_sidecar not in cache:
+            cache[parent_sidecar] = self.probe_is_file(parent_sidecar, context)
+            if cache[parent_sidecar]:
+                self.parsed.append(parent_sidecar)
+        self.probes.append((same_dir_hit, cache[parent_sidecar]))
         metadatas["provider"] = self.machine_name
         metadatas["umid"] = os.path.splitext(media_file.getPath())[0]
         return metadatas
@@ -166,7 +179,7 @@ def _count_scandirs(monkeypatch, root):
 
 
 # --------------------------------------------------------------------------
-# FR-32: two applicable providers, both merged
+# Two applicable providers, both merged
 # --------------------------------------------------------------------------
 
 
@@ -220,7 +233,7 @@ def test_registry_order_decides_which_key_wins(
 
 
 # --------------------------------------------------------------------------
-# FR-13 pre-filter, spy-counted
+# The pre-filter, spy-counted
 # --------------------------------------------------------------------------
 
 
@@ -277,7 +290,7 @@ def test_zero_applicable_providers_errors_with_no_umid(
 
 
 # --------------------------------------------------------------------------
-# Deterministic per-page iteration order (FR-4)
+# Deterministic per-page iteration order
 # --------------------------------------------------------------------------
 
 
@@ -313,7 +326,7 @@ def test_hits_are_processed_in_path_order(
 
 
 # --------------------------------------------------------------------------
-# FR-16 sidecar probes through context["listings"]
+# Sidecar probes through context["listings"]
 # --------------------------------------------------------------------------
 
 
@@ -389,3 +402,226 @@ def test_probe_falls_back_to_os_path_without_listings(tmp_path):
     for context in (None, {}, {"folder": None}):
         assert provider.probe_is_file(str(present), context) is True
         assert provider.probe_is_file(str(absent), context) is False
+
+
+# --------------------------------------------------------------------------
+# The superset rule, end to end: a card provider must keep its clips
+# --------------------------------------------------------------------------
+
+XDCAM_SIDECAR = b"""<?xml version="1.0" encoding="UTF-8"?>
+<NonRealTimeMeta>
+  <TargetMaterial umidRef="XDCAM-UMID-C0001"/>
+  <Duration value="250"/>
+  <CreationDate value="2026-01-01T10:00:00+01:00"/>
+  <Device manufacturer="Sony" modelName="PXW-Z750" serialNo="12345"/>
+</NonRealTimeMeta>
+"""
+
+
+@pytest.mark.parametrize("clip_name", ["C0001.wav", "C0001.mov"])
+def test_card_provider_keeps_files_outside_its_declared_suffixes(
+    migrated_db, es_fake, es_page, tmp_path, clip_name
+):
+    """A .wav/.mov inside an XDCAM structure is xdcam's, not `file`'s.
+
+    xdcam declares only [".mxf", ".mp4"] but its runtime guard is sidecar
+    presence, which is extension-agnostic. If the pre-filter bounded it
+    by suffix, `file` would claim this clip and the umid would flip from
+    the card's umidRef to an ffprobe/hash value — a new primary key and a
+    duplicate ingest on the next run. The REAL xdcam provider runs here,
+    against a real sidecar.
+    """
+    rel = "2026/AH_20260101_card/XDROOT/Clip"
+    clip_dir = tmp_path / rel
+    clip_dir.mkdir(parents=True)
+    (clip_dir / clip_name).write_bytes(b"media payload")
+    (clip_dir / "C0001M01.XML").write_bytes(XDCAM_SIDECAR)
+
+    es_fake.push(es_page([_source(f"{rel}/{clip_name}", "VX-41-CARD")], total=1))
+
+    folder = _folder(tmp_path, rel)
+    response = folder.scan(providers=["xdcam", "file"])
+
+    assert response["errors"] == []
+    [clip] = response["clips"]
+    assert clip.metadatas["provider"] == "xdcam"
+    assert clip.umid == "XDCAM-UMID-C0001"
+    # `file` never claimed it, so no ffprobe hash umid.
+    assert clip.metadatas["umid"] != f"hash-VX-41-CARD"
+
+
+def test_card_provider_declines_without_its_sidecar(
+    migrated_db, es_fake, es_page, registered_providers, tmp_path
+):
+    # The mirror image: always-applicable does NOT mean always-claiming.
+    # With no sidecar, xdcam contributes nothing and the next applicable
+    # provider wins, exactly as before the pre-filter existed.
+    rel = "2026/AH_20260101_nocard"
+    (tmp_path / rel).mkdir(parents=True)
+    (tmp_path / rel / "LOOSE.fake").write_bytes(b"media payload")
+
+    es_fake.push(es_page([_source(f"{rel}/LOOSE.fake", "VX-41-LOOSE")], total=1))
+
+    folder = _folder(tmp_path, rel)
+    response = folder.scan(providers=["xdcam", MUTATING_NAME])
+
+    assert response["errors"] == []
+    [clip] = response["clips"]
+    assert clip.metadatas["provider"] == MUTATING_NAME
+
+
+# --------------------------------------------------------------------------
+# The degraded-registry fallbacks are reachable and equivalent
+# --------------------------------------------------------------------------
+
+
+def _page_sources(rel):
+    return [
+        _source(f"{rel}/CLIPA.fake", "VX-41-FA"),
+        _source(f"{rel}/CLIPB.fake", "VX-41-FB"),
+    ]
+
+
+def _bare_context(root_path, providers):
+    """A ScanContext with the registry seams left unfilled."""
+    return ScanContext(
+        storages={STORAGE_ID: StorageInfo(id=STORAGE_ID, root_path=str(root_path))},
+        options=RunOptions(providers=providers, legacy_storages=[]),
+        provider_registry=None,
+        extension_map=None,
+    )
+
+
+def test_scan_without_a_registry_matches_the_registry_backed_run(
+    migrated_db, es_fake, es_page, registered_providers, tmp_path
+):
+    rel = "2026/AH_20260101_noregistry"
+    (tmp_path / rel).mkdir(parents=True)
+    for name in ("CLIPA.fake", "CLIPB.fake"):
+        (tmp_path / rel / name).write_bytes(b"clip data")
+
+    es_fake.push(es_page(_page_sources(rel), total=2))
+    registry_backed = _folder(tmp_path, rel).scan(providers=[MUTATING_NAME])
+
+    # Same folder path replayed: reset the rows the first scan persisted.
+    Clip.objects.all().delete()
+    Folder.objects.all().delete()
+    registered_providers[MUTATING_NAME].seen_paths.clear()
+
+    es_fake.push(es_page(_page_sources(rel), total=2))
+    ctx = _bare_context(tmp_path, [MUTATING_NAME])
+    assert ctx.provider_registry is None and ctx.extension_map is None
+    degraded = _folder(tmp_path, rel).scan(context=ctx)
+
+    assert [c.umid for c in degraded["clips"]] == [
+        c.umid for c in registry_backed["clips"]
+    ]
+    for key in ("hits", "processed", "created", "already_ingested", "errors"):
+        assert degraded[key] == registry_backed[key], key
+
+
+def test_scan_with_an_empty_extension_map_does_not_starve_files(
+    migrated_db, es_fake, es_page, registered_providers, tmp_path
+):
+    """An empty map is falsy but NOT None — it must take the same fallback.
+
+    Guarding on `is None` would hand every file zero applicable providers
+    and fail the whole page with "No UMID found".
+    """
+    rel = "2026/AH_20260101_emptymap"
+    (tmp_path / rel).mkdir(parents=True)
+    (tmp_path / rel / "CLIPE.fake").write_bytes(b"clip data")
+
+    provider = registered_providers[MUTATING_NAME]
+    empty_map = build_extension_map(())
+    assert empty_map is not None and not empty_map
+
+    ctx = ScanContext(
+        storages={STORAGE_ID: StorageInfo(id=STORAGE_ID, root_path=str(tmp_path))},
+        options=RunOptions(providers=[MUTATING_NAME], legacy_storages=[]),
+        provider_registry=(provider,),
+        extension_map=empty_map,
+    )
+
+    es_fake.push(es_page([_source(f"{rel}/CLIPE.fake", "VX-41-E")], total=1))
+    response = _folder(tmp_path, rel).scan(context=ctx)
+
+    assert response["errors"] == []
+    assert [c.umid for c in response["clips"]] == [f"{rel}/CLIPE"]
+    assert provider.seen_paths == [f"{rel}/CLIPE.fake"]
+
+
+# --------------------------------------------------------------------------
+# The provider context spans the whole invocation, not one page
+# --------------------------------------------------------------------------
+
+
+def test_provider_context_cache_survives_the_page_boundary(
+    migrated_db, es_fake, es_page, registered_providers, tmp_path
+):
+    """Sidecar work done on page 1 is not repeated on page 2.
+
+    The provider context dict is built once per scan() invocation; if it
+    were rebuilt per page, every provider cache in it (xdcam's parsed
+    MEDIAPRO.XML, for one) would be thrown away at each page boundary and
+    re-done.
+    """
+    rel = "2026/AH_20260101_ctxpages"
+    clip_dir = tmp_path / rel
+    clip_dir.mkdir(parents=True)
+    (clip_dir.parent / "MEDIAPRO.XML").write_bytes(b"<xml/>")
+
+    page1 = []
+    for i in range(100):
+        name = f"P1_{i:03d}.fake"
+        (clip_dir / name).write_bytes(b"clip data")
+        page1.append(_source(f"{rel}/{name}", f"VX-41-P1-{i:03d}"))
+    page2 = []
+    for name in ("P2_A.fake", "P2_B.fake"):
+        (clip_dir / name).write_bytes(b"clip data")
+        page2.append(_source(f"{rel}/{name}", f"VX-41-{name}"))
+
+    es_fake.push(es_page(page1, total=102))
+    es_fake.push(es_page(page2, total=102))
+
+    response = _folder(tmp_path, rel).scan(providers=[SIDECAR_NAME], number=0)
+
+    assert es_fake.calls == [(0, 100), (100, 100)]
+    assert response["processed"] == 102
+    assert response["errors"] == []
+    # The shared parent sidecar was resolved ONCE for all 102 files across
+    # both pages — the cache lives in the invocation-wide context dict.
+    assert registered_providers[SIDECAR_NAME].parsed == [
+        os.path.join(str(clip_dir), "../MEDIAPRO.XML")
+    ]
+    assert all(
+        probe == (False, True) for probe in registered_providers[SIDECAR_NAME].probes
+    )
+
+
+# --------------------------------------------------------------------------
+# probe_is_file contract
+# --------------------------------------------------------------------------
+
+
+def test_relative_probe_with_listings_is_reported_not_silently_resolved(
+    tmp_path, monkeypatch, caplog
+):
+    """A relative probe cannot use the listings (they refuse relative paths).
+
+    It must be surfaced rather than silently answered against the process
+    CWD, and it must not raise out of the provider either.
+    """
+    provider = SidecarProvider()
+    (tmp_path / "SIDE.XML").write_bytes(b"<xml/>")
+    monkeypatch.chdir(tmp_path)
+
+    context = {"listings": FolderListings()}
+    assert provider.probe_is_file("SIDE.XML", context) is True
+
+    assert any(
+        record.levelname == "ERROR" and "relative sidecar probe" in record.message
+        for record in caplog.records
+    ), caplog.text
+    # And the listings cache was never asked to normalize it.
+    assert context["listings"].errors() == {}

@@ -52,10 +52,9 @@ from portal.plugins.TapelessIngest.scan.extraction import extract_metadatas
 
 log = logging.getLogger(__name__)
 
-# Back-compat alias over the ONE canonical membership tuple (story 2.3).
-# Pre-2.3 this was a divergent red-first copy; the canonical order is the
-# production cron order and the swap is behaviorally inert (red guards on
-# ``.R3D``, ``file`` stays last, no other key overlap).
+# Alias over the canonical membership tuple. Registry order is load
+# bearing: it decides which provider claims a file when several are
+# applicable. See docs/adding-a-provider.md.
 PROVIDERS_LIST = list(PROVIDER_NAMES)
 
 
@@ -262,17 +261,18 @@ class Clip(models.Model):
         provider_list: Optional[List[Any]] = None,
         context: Optional[Dict[str, Any]] = None,
         legacy_storages: Optional[List[str]] = None,
-    ) -> Tuple["Clip", Dict[str, Any], bool]:
+    ) -> Tuple["Clip", bool]:
         """Extract clip metadata from file and get or create clip instance.
 
         Args:
             file: VSFile instance to extract metadata from
             provider_list: Optional list of provider instances. If None, uses all providers
-            context: Optional context dictionary shared across provider calls
+            context: Optional context dictionary shared across provider calls; it is
+                mutated in place by the providers, never replaced
             legacy_storages: Optional list of legacy storage IDs to check for existing items
 
         Returns:
-            Tuple of (clip instance, updated context dict, created flag)
+            Tuple of (clip instance, created flag)
 
         Raises:
             TapelessIngestException: If no UMID or hash found in file
@@ -281,11 +281,8 @@ class Clip(models.Model):
             provider_list = cls._get_provider_list()
         if context is None:
             context = {}
-        # AD-7 merge loop (story 2.3): every provider in `provider_list`
-        # runs — the list is already pre-filtered to the applicable ones by
-        # the caller — and each contribution is merged. No break on first
-        # match; a provider returning a FRESH dict now contributes, where
-        # before it was silently dropped.
+        # `provider_list` is already pre-filtered to the applicable
+        # providers by the caller; every one of them runs and merges.
         metadatas = extract_metadatas(file, provider_list, {}, context)
         if "umid" not in metadatas.keys():
             raise TapelessIngestException("No UMID found in file %s" % file.getPath())
@@ -330,7 +327,7 @@ class Clip(models.Model):
         clip.file = file
         clip.reference_file = file.getId()
 
-        return clip, context, created
+        return clip, created
 
     @classmethod
     def get_clip_from_item(self, item, provider=None):

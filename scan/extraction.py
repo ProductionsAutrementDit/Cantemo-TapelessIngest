@@ -1,80 +1,89 @@
-"""Pure extraction-phase logic (story 2.3).
+"""Pure extraction-phase logic: the provider pre-filter and merge loop.
 
-Stdlib-only by contract (AD-1), like ``scan.context`` and
-``scan.verification``: this module must import with no Portal stub
-installed, so it holds NO provider imports, no registry instantiation
-(that lives adapter-side in ``scan.adapters.build_provider_registry``)
-and no Django. Everything here takes the already-built registry as an
-argument.
+Stdlib-only by contract, like ``scan.context`` and ``scan.verification``:
+this module must import with no Portal stub installed, so it holds no
+provider imports, no registry instantiation (that lives adapter-side in
+``scan.adapters.build_provider_registry``) and no Django. Everything here
+takes the already-built registry as an argument.
 
-Three pieces:
+See ``docs/adding-a-provider.md`` for the contract a provider must hold
+up and the traps this pre-filter creates.
 
-``build_extension_map``
-    Registry -> immutable ``suffix -> providers`` map. Each provider's
-    declared ``getExtensions()`` suffixes are lowercased; a provider that
-    returns a ``dict_keys`` view (``providers/file.py``) is list()ed.
-    Buckets preserve registry order, and the map remembers the registry
-    so unions across buckets can be re-ordered by it.
+Applicability rule
+------------------
+A provider is applicable to a filename iff
+``filename.lower().endswith(suffix.lower())`` for any suffix it declares,
+OR it is always-applicable (see below). The result is the union across
+every matched suffix bucket plus the always-applicable set, registry-
+ordered and deduplicated.
 
-``applicable_providers``
-    The FR-13 pre-filter, mirroring the ES wildcard the search doc uses:
-    a provider is applicable to a filename iff
-    ``filename.lower().endswith(suffix.lower())`` for any suffix it
-    declares. The result is the union across every matched suffix bucket,
-    registry-ordered and deduplicated.
+Applicability MUST be a SUPERSET of each provider's runtime guard — the
+guard decides, never the filter. Narrowing the filter below a guard
+silently changes which provider claims a file, which changes its umid,
+which changes the clip's primary key and re-ingests it as a duplicate.
 
-    FROZEN PRINCIPLE — pre-filter applicability is a SUPERSET of each
-    provider's own runtime guard; the GUARD decides, never the filter.
-    That is why ``providers/red.py`` declares BOTH ``"_001.r3d"`` and
-    ``".r3d"``: red stays applicable to every ``.r3d``/``.R3D`` file
-    exactly as before 2.3, and its internal ``== ".R3D"`` check
-    reproduces today's selection byte-for-byte (regression-pinned with
-    an uppercase ``X_002.R3D`` row). Narrowing the filter below a guard
-    would silently drop clips.
+A provider is ALWAYS-APPLICABLE when either holds:
 
-    Applicability is EXTENSION-ONLY (ratified): extension-only filtering
-    is a strict superset of extension AND sub-path, so no provider that
-    could match today is ever excluded. ``getSubPaths()`` narrowing can
-    come with the index-path work in Epic 4 if it is ever needed.
+* it declares itself non-extension-guarded
+  (``Provider.is_extension_guarded()`` returns ``False``) — the card
+  providers whose only runtime guard is sidecar presence, which is
+  extension-agnostic: xdcam, panasonicP2, ikegami;
+* it declares no usable suffixes at all — an empty declaration means
+  unknown reach, and unknown reach must not be silently filtered out.
 
-``extract_metadatas``
-    The AD-7 merge loop: every applicable provider runs, in registry
-    order, and its return value is merged with ``metadatas.update(...)``.
-    It NEVER breaks on first match (FR-13/FR-32) and it no longer
-    depends on providers mutating ``metadatas`` in place — a provider
-    returning a FRESH dict now contributes, where before 2.3 its result
-    was silently dropped unless an earlier provider had already set both
-    ``provider`` and ``umid``. Later providers' keys win. Provider
-    exceptions propagate to ``models/folder.py``'s existing per-file
-    wrapper, whose error-string template is unchanged.
+Applicability is extension-only: extension-only filtering is a strict
+superset of extension AND sub-path, so no provider that could match
+today is excluded. ``getSubPaths()`` narrowing can come with the
+index-path work in Epic 4 if it is ever needed.
+
+Merge rule
+----------
+Every applicable provider runs, in registry order, and its return value
+is merged with ``metadatas.update(...)``. The loop never breaks on first
+match, and it does not depend on providers mutating ``metadatas`` in
+place: a provider returning a fresh dict contributes too. Later
+providers' keys win, EXCEPT that overwriting ``umid`` or ``provider`` —
+the two keys that decide the clip's identity — is logged as an error.
+Provider exceptions propagate to ``models/folder.py``'s per-file wrapper.
 """
 
+import logging
 from collections.abc import Mapping
 
+log = logging.getLogger(__name__)
+
 __all__ = [
+    "IDENTITY_KEYS",
     "ExtensionMap",
     "applicable_providers",
     "build_extension_map",
     "extract_metadatas",
 ]
 
+# The keys that decide a clip's primary key and its metadata-mapping
+# profile. Silent reassignment of either is a duplicate-ingest bug.
+IDENTITY_KEYS = ("umid", "provider")
+
+
+def _provider_label(provider):
+    return getattr(provider, "machine_name", None) or repr(provider)
+
 
 class ExtensionMap(Mapping):
-    """Immutable ``suffix -> tuple(providers)`` map that knows registry order.
+    """Immutable ``suffix -> tuple(providers)`` map plus the always-applicable set.
 
-    A read-only ``Mapping`` (AD-4: nothing in the context is mutable),
-    keyed by LOWERCASED suffixes, whose values are registry-ordered
-    provider tuples. It also carries the registry itself so
-    ``applicable_providers`` can order a union that spans several buckets
-    (a plain ``dict`` works too — it just falls back to first-appearance
-    order).
+    A read-only ``Mapping`` keyed by LOWERCASED suffixes whose values are
+    registry-ordered provider tuples. It also carries the registry, so a
+    union spanning several buckets can be re-ordered by it, and the
+    always-applicable providers, which belong to every file's result.
     """
 
-    __slots__ = ("_buckets", "_registry", "_ranks")
+    __slots__ = ("_buckets", "_registry", "_always", "_ranks")
 
-    def __init__(self, buckets, registry):
+    def __init__(self, buckets, registry, always=()):
         self._buckets = {suffix: tuple(providers) for suffix, providers in buckets}
         self._registry = tuple(registry)
+        self._always = tuple(always)
         # Identity-keyed: provider instances are not hashable-by-value and
         # two distinct instances of the same class must rank separately.
         self._ranks = {
@@ -90,47 +99,97 @@ class ExtensionMap(Mapping):
     def __len__(self):
         return len(self._buckets)
 
+    def __bool__(self):
+        # A map with no suffix buckets but some always-applicable provider
+        # is still a usable pre-filter; only a map that can never select
+        # anything is falsy, and callers then fall back to the full list.
+        return bool(self._buckets or self._always)
+
     def __repr__(self):
-        return f"ExtensionMap({dict(self._buckets)!r})"
+        return f"ExtensionMap({dict(self._buckets)!r}, always={self._always!r})"
 
     @property
     def registry(self):
         """The registry this map was built from, in registry order."""
         return self._registry
 
+    @property
+    def always(self):
+        """Providers applicable to every file regardless of its suffix."""
+        return self._always
+
     def rank(self, provider):
         """Registry index of ``provider``; unknown providers sort last."""
         return self._ranks.get(id(provider), len(self._registry))
 
 
-def build_extension_map(registry):
-    """Build the lowercased ``suffix -> providers`` map for ``registry``.
+def _declared_suffixes(provider):
+    """Usable lowercased suffixes declared by ``provider``.
 
-    ``getExtensions()`` may return a list (most providers) or a
-    ``dict_keys`` view (``providers/file.py``); both are materialized.
-    A provider declaring the same suffix twice is recorded once, and
-    each bucket keeps registry order.
+    ``getExtensions()`` may return a list, a tuple or a ``dict_keys``
+    view; all are materialized. Non-string and empty entries are dropped
+    defensively — a provider returning a bare string would otherwise be
+    iterated character by character and claim unrelated files.
+    """
+    declared = provider.getExtensions()
+    if declared is None:
+        return []
+    if isinstance(declared, str):
+        log.error(
+            f"provider {_provider_label(provider)} returned a bare string from "
+            f"getExtensions(); expected a sequence of suffixes — ignoring it"
+        )
+        return []
+    suffixes = []
+    for suffix in list(declared):
+        if not isinstance(suffix, str) or not suffix:
+            log.error(
+                f"provider {_provider_label(provider)} declared an unusable "
+                f"extension {suffix!r}; ignoring it"
+            )
+            continue
+        suffixes.append(suffix.lower())
+    return suffixes
+
+
+def build_extension_map(registry):
+    """Build the ``suffix -> providers`` map (plus always-applicable set).
+
+    A provider declaring the same suffix twice is recorded once, and each
+    bucket keeps registry order. A provider that is not extension-guarded,
+    or that declares no usable suffix, lands in the always-applicable set
+    instead of (not as well as) the suffix buckets.
     """
     buckets = {}
+    always = []
     for provider in registry:
-        for suffix in list(provider.getExtensions()):
-            bucket = buckets.setdefault(suffix.lower(), [])
+        suffixes = _declared_suffixes(provider)
+        extension_guarded = True
+        is_extension_guarded = getattr(provider, "is_extension_guarded", None)
+        if callable(is_extension_guarded):
+            extension_guarded = bool(is_extension_guarded())
+        if not suffixes or not extension_guarded:
+            if not any(known is provider for known in always):
+                always.append(provider)
+            continue
+        for suffix in suffixes:
+            bucket = buckets.setdefault(suffix, [])
             if not any(known is provider for known in bucket):
                 bucket.append(provider)
-    return ExtensionMap(buckets.items(), registry)
+    return ExtensionMap(buckets.items(), registry, always)
 
 
 def applicable_providers(filename, extension_map):
-    """Providers whose declared suffixes match ``filename`` (registry order).
+    """Providers that may claim ``filename``, in registry order.
 
     Mirrors the ES wildcard: case-insensitive ``endswith`` over every
-    declared suffix. Union across matched buckets, deduplicated by
-    identity, ordered by the registry.
+    declared suffix, unioned with the always-applicable set, deduplicated
+    by identity.
     """
     if not extension_map:
         return ()
     lowered = filename.lower()
-    matched = []
+    matched = list(getattr(extension_map, "always", ()))
     for suffix, providers in extension_map.items():
         if not lowered.endswith(suffix):
             continue
@@ -146,14 +205,35 @@ def applicable_providers(filename, extension_map):
 
 
 def extract_metadatas(media_file, providers, metadatas, context):
-    """Run every applicable provider and merge its contribution (AD-7).
+    """Run every applicable provider and merge its contribution.
 
-    ``context`` stays an argument and stays provider-mutable IN PLACE
-    (xdcam's ``mediapro_xml`` cache relies on it); providers no longer
-    return it. Never breaks on first match.
+    ``context`` stays an argument and stays provider-mutable in place
+    (xdcam's ``mediapro_xml`` cache relies on it); providers return the
+    metadatas only.
     """
+    owners = {}
     for provider in providers:
+        label = _provider_label(provider)
+        before = {key: metadatas[key] for key in IDENTITY_KEYS if key in metadatas}
         result = provider.getMetadatasFromFile(media_file, metadatas, context)
-        if result:
+        if result is not None and not isinstance(result, Mapping):
+            raise TypeError(
+                f"provider {label} returned {type(result).__name__} from "
+                f"getMetadatasFromFile; expected a mapping of metadatas "
+                f"(context is mutated in place, not returned)"
+            )
+        if result and result is not metadatas:
             metadatas.update(result)
+        for key, previous in before.items():
+            if metadatas.get(key) != previous:
+                log.error(
+                    f"provider {label} overwrote {key!r} for "
+                    f"{media_file.getPath()}: {previous!r} (set by "
+                    f"{owners.get(key, 'an earlier provider')}) -> "
+                    f"{metadatas.get(key)!r}"
+                )
+                owners[key] = label
+        for key in IDENTITY_KEYS:
+            if key in metadatas and key not in owners:
+                owners[key] = label
     return metadatas

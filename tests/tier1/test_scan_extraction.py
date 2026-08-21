@@ -1,24 +1,25 @@
-"""Tier 1 (story 2.3): scan/extraction.py — the pure extraction phase.
+"""Tier 1: scan/extraction.py — the pure pre-filter and merge logic.
 
-Portal-freedom is proven the same way 2.1/2.2 prove it for scan.context
-and scan.verification: a bare subprocess with NO stub installed.
+Portal-freedom is proven the way scan.context and scan.verification
+prove theirs: a bare subprocess with no stub installed.
 
-The rest covers the spec's I/O matrix on pure logic:
+Covered here:
 
-- extension-map build: lowercasing, ``dict_keys`` materialization
-  (providers/file.py), registry-ordered buckets, red's TWO declared
-  suffixes;
-- the pre-filter: applicable / zero-applicable, case-insensitive
-  ``endswith``, union across matched buckets deduplicated and
-  registry-ordered;
-- the AD-7 merge loop: every applicable provider runs (never break on
-  first match), fresh-dict returns are merged instead of dropped, later
-  keys win, and a raising provider's exception propagates to the caller;
-- the REGRESSION PIN for the frozen superset principle: an uppercase
-  non-``_001`` ``X_002.R3D`` file still reaches the real ``red`` provider,
-  whose real ``== ".R3D"`` guard wins provider/umid selection over the
-  real ``file`` provider's ``"provider" not in metadatas`` guard —
-  byte-identical selection to pre-2.3.
+- extension-map build: lowercasing, ``dict_keys`` materialization,
+  registry-ordered buckets, unusable declarations skipped, and the
+  always-applicable set (non-extension-guarded providers, and providers
+  declaring nothing at all);
+- the pre-filter: case-insensitive ``endswith``, union across matched
+  buckets deduplicated and registry-ordered;
+- the merge loop: every applicable provider runs, fresh-dict returns are
+  merged, later keys win, reassigning an identity key is logged, a
+  legacy two-tuple return fails by name, exceptions propagate;
+- registry construction: the healthy path carries a pre-filter, an
+  unresolvable name degrades exactly once and raises where it always
+  did, and a broken declaration propagates instead of degrading;
+- the regression pin for the superset rule: an uppercase non-``_001``
+  ``X_002.R3D`` still reaches the real ``red`` provider, whose real
+  ``== ".R3D"`` guard beats the real ``file`` provider's guard.
 """
 
 import subprocess
@@ -191,23 +192,88 @@ def test_real_registry_prefilter_matches_the_matrix_rows():
     # ...and the classic _001 form is unchanged.
     assert applicable_providers("X_001.R3D", extension_map) == r3d
 
-    # A .wav never invokes the video providers.
+    # The card providers guard on sidecar presence, not on the extension,
+    # so they stay applicable to EVERY file — including a .wav, which
+    # they do claim today when the sidecar is there.
     assert tuple(
         p.machine_name for p in applicable_providers("Z.wav", extension_map)
-    ) == (
-        "zoom",
-        "file",
-    )
-    # A suffix no provider declares invokes nothing at all.
-    assert applicable_providers("README.txt", extension_map) == ()
+    ) == ("panasonicP2", "xdcam", "zoom", "file")
+    # A suffix no provider declares still reaches the card providers only.
+    assert tuple(
+        p.machine_name for p in applicable_providers("README.txt", extension_map)
+    ) == ("panasonicP2", "xdcam")
+    # ...and every extension-guarded provider is genuinely filtered out.
+    assert by_name["hdslr"] not in applicable_providers("Z.wav", extension_map)
+
+
+def test_card_providers_declare_themselves_non_extension_guarded():
+    # Their runtime guard is sidecar presence, which says nothing about
+    # the extension: narrowing them by suffix would flip a card clip's
+    # umid to a file hash. Pinned so a future edit cannot quietly widen
+    # the pre-filter's authority over them.
+    registry = build_provider_registry()
+    by_name = {provider.machine_name: provider for provider in registry}
+
+    for name in ("xdcam", "panasonicP2"):
+        assert by_name[name].is_extension_guarded() is False
+        assert by_name[name] in build_extension_map(registry).always
+    for name in ("red", "file", "hdslr", "zoom", "avchd", "atomos"):
+        assert by_name[name].is_extension_guarded() is True
+
+    ikegami = build_provider_registry(["ikegami"])[0]
+    assert ikegami.is_extension_guarded() is False
+
+
+def test_provider_declaring_no_extensions_is_always_applicable():
+    # The base Provider returns [] from getExtensions(). An empty
+    # declaration means unknown reach, and unknown reach must never be
+    # silently filtered out — pre-registry-v2 such a provider still ran.
+    silent = StubProvider("silent", [])
+    guarded = StubProvider("guarded", [".mxf"])
+    extension_map = build_extension_map((silent, guarded))
+
+    assert extension_map.always == (silent,)
+    assert applicable_providers("ANY.zzz", extension_map) == (silent,)
+    assert applicable_providers("A.mxf", extension_map) == (silent, guarded)
+
+
+def test_always_applicable_only_map_is_truthy():
+    # Item 2's guard is `if not extension_map`: a map whose only content
+    # is the always-applicable set must NOT read as empty.
+    always_only = build_extension_map((StubProvider("silent", []),))
+    assert len(always_only) == 0
+    assert bool(always_only) is True
+
+    empty = build_extension_map(())
+    assert bool(empty) is False
+    assert applicable_providers("A.mxf", empty) == ()
+
+
+def test_unusable_extension_declarations_are_skipped():
+    # A bare string would otherwise be iterated character by character
+    # and claim every file ending in one of its letters.
+    class BareString(StubProvider):
+        def getExtensions(self):
+            return ".mxf"
+
+    bare = BareString("bare", [])
+    junk = StubProvider("junk", [".mxf", "", None, 3, ".MP4"])
+    extension_map = build_extension_map((bare, junk))
+
+    assert set(extension_map) == {".mxf", ".mp4"}
+    assert extension_map[".mxf"] == (junk,)
+    # No declaration survived for `bare`, so it is always-applicable
+    # rather than matching "f", "m", "x"...
+    assert extension_map.always == (bare,)
+    assert applicable_providers("README.txt", extension_map) == (bare,)
 
 
 # --------------------------------------------------------------------------
-# extract_metadatas (AD-7)
+# extract_metadatas
 # --------------------------------------------------------------------------
 
 
-def test_merge_runs_every_provider_in_order_and_later_keys_win():
+def test_merge_runs_every_provider_in_order_and_later_keys_win(caplog):
     first = StubProvider("first", [".fake"], {"provider": "first", "umid": "U1"})
     second = StubProvider("second", [".fake"], {"umid": "U2", "extra": "second"})
     media_file = _vsfile("2026/AH_x/CLIP.fake")
@@ -215,11 +281,19 @@ def test_merge_runs_every_provider_in_order_and_later_keys_win():
 
     metadatas = extract_metadatas(media_file, (first, second), {}, context)
 
-    # Never breaks on first match: BOTH ran (FR-13/FR-32)...
+    # Never breaks on first match: BOTH ran...
     assert first.calls == [media_file]
     assert second.calls == [media_file]
     # ...both FRESH-dict contributions are present, later keys winning.
     assert metadatas == {"provider": "first", "umid": "U2", "extra": "second"}
+    # ...but reassigning an identity key is never silent.
+    assert any(
+        record.levelname == "ERROR"
+        and "overwrote 'umid'" in record.message
+        and "second" in record.message
+        and "first" in record.message
+        for record in caplog.records
+    ), caplog.text
 
 
 def test_merge_keeps_in_place_mutation_working():
@@ -241,7 +315,7 @@ def test_merge_keeps_in_place_mutation_working():
     )
 
     assert metadatas == {"provider": "inplace", "umid": "U-INPLACE"}
-    # `context` stays an argument and stays mutable IN PLACE (AD-7).
+    # `context` stays an argument and stays mutable IN PLACE.
     assert context == {"touched": True}
 
 
@@ -324,3 +398,162 @@ def test_uppercase_non_001_r3d_selection_is_byte_identical(storage_fake, monkeyp
     # `file` ran (never break on first match) but its own guard declined,
     # so it never shelled out to ffprobe and never overrode red.
     assert metadatas["clipname"] == "X_002"
+
+
+def test_non_mapping_return_names_the_offending_provider():
+    # The pre-registry-v2 contract returned (metadatas, context). A
+    # provider still on it must fail loudly and by name, not with an
+    # opaque ValueError from dict.update() unpacking two keys.
+    class LegacyTupleProvider:
+        machine_name = "legacytuple"
+
+        def getExtensions(self):
+            return [".fake"]
+
+        def getMetadatasFromFile(self, media_file, metadatas, context):
+            return metadatas, context
+
+    with pytest.raises(TypeError, match="legacytuple"):
+        extract_metadatas(
+            _vsfile("2026/AH_x/CLIP.fake"), (LegacyTupleProvider(),), {}, {}
+        )
+
+
+def test_in_place_overwrite_of_an_identity_key_is_also_logged(caplog):
+    setter = StubProvider("setter", [".fake"], {"provider": "setter", "umid": "U1"})
+
+    class InPlaceThief:
+        machine_name = "thief"
+
+        def getExtensions(self):
+            return [".fake"]
+
+        def getMetadatasFromFile(self, media_file, metadatas, context):
+            metadatas["umid"] = "STOLEN"
+            return metadatas
+
+    metadatas = extract_metadatas(
+        _vsfile("2026/AH_x/CLIP.fake"), (setter, InPlaceThief()), {}, {}
+    )
+
+    assert metadatas["umid"] == "STOLEN"
+    assert any(
+        record.levelname == "ERROR" and "thief" in record.message
+        for record in caplog.records
+    ), caplog.text
+
+
+def test_reasserting_the_same_identity_value_is_not_logged(caplog):
+    # Two providers agreeing on the umid is not a conflict.
+    first = StubProvider("first", [".fake"], {"provider": "first", "umid": "SAME"})
+    second = StubProvider("second", [".fake"], {"umid": "SAME", "extra": 1})
+
+    extract_metadatas(_vsfile("2026/AH_x/CLIP.fake"), (first, second), {}, {})
+
+    assert [r for r in caplog.records if r.levelname == "ERROR"] == []
+
+
+# --------------------------------------------------------------------------
+# Registry build: the healthy path, the one sanctioned degrade, the re-raise
+# --------------------------------------------------------------------------
+
+
+def test_healthy_context_carries_a_registry_and_a_prefilter(storage_fake):
+    storage_fake.set_root("VX-REG-OK", "/mnt/regok")
+
+    ctx = build_context(
+        ["VX-REG-OK"],
+        user=None,
+        dry_run=True,
+        providers=["red", "file"],
+        legacy_storages=[],
+        replace=False,
+    )
+
+    assert ctx.provider_registry is not None
+    assert [p.machine_name for p in ctx.provider_registry] == ["red", "file"]
+    assert ctx.extension_map is not None
+    assert bool(ctx.extension_map) is True
+    # The registry holds the shared cached instances, not fresh ones.
+    assert ctx.provider_registry == build_provider_registry(["red", "file"])
+
+
+def test_registry_dedupes_repeated_names():
+    # `--providers red red` must not run red twice: the second pass would
+    # merge red's own contribution over itself.
+    assert [
+        p.machine_name for p in build_provider_registry(["red", "red", "file"])
+    ] == [
+        "red",
+        "file",
+    ]
+
+
+def test_unknown_provider_name_degrades_and_is_logged(storage_fake, caplog):
+    storage_fake.set_root("VX-REG-BAD", "/mnt/regbad")
+
+    ctx = build_context(
+        ["VX-REG-BAD"],
+        user=None,
+        dry_run=True,
+        providers=["definitely_not_a_provider"],
+        legacy_storages=[],
+        replace=False,
+    )
+
+    # Degraded, not raised: the scan re-raises at its legacy resolution.
+    assert ctx.provider_registry is None
+    assert ctx.extension_map is None
+    assert any(
+        record.levelname == "WARNING" and "definitely_not_a_provider" in record.message
+        for record in caplog.records
+    ), caplog.text
+
+
+def test_unknown_provider_name_still_raises_importerror_from_scan(storage_fake):
+    from portal.plugins.TapelessIngest.models.folder import Folder
+
+    storage_fake.set_root("VX-REG-BAD2", "/mnt/regbad2")
+    ctx = build_context(
+        ["VX-REG-BAD2"],
+        user=None,
+        dry_run=True,
+        providers=["definitely_not_a_provider"],
+        legacy_storages=[],
+        replace=False,
+    )
+    folder = Folder(storage_id="VX-REG-BAD2", path="2026/AH_x")
+
+    with pytest.raises(ImportError):
+        folder.scan(number=0, count_only=True, context=ctx)
+
+
+def test_a_broken_getextensions_propagates_instead_of_degrading(storage_fake):
+    """A map that cannot be built must NOT fall back to no pre-filter.
+
+    The fallback resolves providers fine, so the run would silently
+    proceed with the pre-filter disabled and select providers differently
+    from a healthy run. That is the failure mode this re-raise prevents.
+    """
+    from portal.plugins.TapelessIngest.models.clip import Clip
+
+    class BrokenProvider:
+        machine_name = "brokenext"
+
+        def getExtensions(self):
+            raise RuntimeError("declaration is broken")
+
+    storage_fake.set_root("VX-REG-BOOM", "/mnt/regboom")
+    Clip._PROVIDER_CACHE["brokenext"] = BrokenProvider()
+    try:
+        with pytest.raises(RuntimeError, match="declaration is broken"):
+            build_context(
+                ["VX-REG-BOOM"],
+                user=None,
+                dry_run=True,
+                providers=["brokenext"],
+                legacy_storages=[],
+                replace=False,
+            )
+    finally:
+        Clip._PROVIDER_CACHE.pop("brokenext", None)
