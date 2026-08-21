@@ -43,8 +43,10 @@ def test_single_page_scan_counters(
     # CLIPGONE.fake is deliberately absent from disk (index/filesystem desync).
 
     # Pre-existing umid: the FakeProvider derives umid from the full storage
-    # path with the extension stripped.
-    Clip(umid=f"{rel}/CLIPOLD").save()
+    # path with the extension stripped. It carries an item_id so the honest
+    # already_ingested counter is actually exercised — without one the
+    # expected value would be 0 and the assertion would pin nothing.
+    Clip(umid=f"{rel}/CLIPOLD", item_id="VX-100").save()
 
     es_fake.push(
         es_page(
@@ -67,11 +69,12 @@ def test_single_page_scan_counters(
     assert response["hits"] == 3
     assert response["processed"] == 3
     assert response["created"] == 1
-    # Ledger bug pinned as-is (do not fix, tests/pinned-bugs.md):
-    # already_ingested counts every successfully processed clip, because
-    # get_clip_from_file always sets clip.file (clip.py:332) — not only
-    # clips already known to the index.
-    assert response["already_ingested"] == 2
+    # Ledger row #1, FIXED by story 2.5 (deleted from tests/pinned-bugs.md;
+    # declared in tests/fr4-waivers.md). already_ingested is now item_id
+    # presence (FR-23): CLIPOLD counts, the brand-new CLIPNEW does not.
+    # Pre-2.5 the counter reported 2 — every clip the page processed,
+    # because attach_file_metadatas always sets clip.file.
+    assert response["already_ingested"] == 1
     gone_abs = tmp_path / rel / "CLIPGONE.fake"
     # Caveat: the exact wording after "Error scanning file {path}: " partly
     # reflects the stub VSFile.__str__ (the path); prod's default repr would
@@ -120,8 +123,23 @@ def test_ingest_dry_run_key_superset(
     rel = "2026/AH_20260101_ingestkeys"
     (tmp_path / rel).mkdir(parents=True)
     (tmp_path / rel / "CLIPKEYS.fake").write_bytes(b"clip data")
+    # An already-ingested clip in the fixture makes the zeros below
+    # DISCRIMINATING: it is exactly the clip the 2.5 ladder buckets
+    # `skipped` on a real run, so a dry run leaking ladder-skip counting
+    # would report skipped=1 here. Dry-run counters stay at today's
+    # baseline until story 2.7 redefines them as would-be counters.
+    (tmp_path / rel / "CLIPSEEN.fake").write_bytes(b"clip data")
+    Clip(umid=f"{rel}/CLIPSEEN", item_id="VX-200").save()
 
-    es_fake.push(es_page([_source(f"{rel}/CLIPKEYS.fake", "VX-41-KEYS")], total=1))
+    es_fake.push(
+        es_page(
+            [
+                _source(f"{rel}/CLIPKEYS.fake", "VX-41-KEYS"),
+                _source(f"{rel}/CLIPSEEN.fake", "VX-41-SEEN"),
+            ],
+            total=2,
+        )
+    )
 
     folder = _folder(tmp_path, rel)
     response = folder.ingest(dry_run=True, providers=[fake_provider.machine_name])
@@ -134,5 +152,6 @@ def test_ingest_dry_run_key_superset(
         response["failed"],
         response["replaced"],
     ) == (0, 0, 0, 0)
-    assert response["processed"] == 1
+    assert response["processed"] == 2
+    assert response["already_ingested"] == 1
     assert response["errors"] == []

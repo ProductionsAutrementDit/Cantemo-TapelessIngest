@@ -30,6 +30,10 @@ from portal.plugins.TapelessIngest.scan.adapters import (
 )
 from portal.plugins.TapelessIngest.scan.context import browse_root_path
 from portal.plugins.TapelessIngest.scan.extraction import applicable_providers
+from portal.plugins.TapelessIngest.scan.ingestion import (
+    SKIP_NO_HASH,
+    select_clips_to_ingest,
+)
 from portal.plugins.TapelessIngest.scan.persistence import (
     CLIP_UNIQUE_FIELDS,
     FOLDER_SCAN_FIELDS,
@@ -567,15 +571,13 @@ class Folder(models.Model):
                                 file_providers = applicable_providers(
                                     file.getFileName(), extension_map
                                 )
-                            metadatas, item_id = Clip.extract_file_metadatas(
+                            metadatas = Clip.extract_file_metadatas(
                                 file,
                                 file_providers,
                                 provider_context,
-                                legacy_storages=legacy_storages,
                             )
                             record["file"] = file
                             record["metadatas"] = metadatas
-                            record["item_id"] = item_id
                         except Exception as e:
                             traceback.print_exc()
                             record["error"] = (
@@ -605,12 +607,14 @@ class Folder(models.Model):
                             clip = existing_clips.get(umid)
                             created = clip is None
                             if created:
-                                clip = Clip(
-                                    **Clip.new_clip_defaults(
-                                        file, metadatas, record["item_id"]
-                                    )
-                                )
+                                clip = Clip(**Clip.new_clip_defaults(file, metadatas))
                             clip.attach_file_metadatas(file, metadatas)
+                            # Hash recovery, gated (2.5): only a clip with
+                            # no item_id, a hashed file and configured
+                            # legacy storages costs a getFilesInStorage
+                            # call — and a recovered id lands on the clip
+                            # whether its row is new or pre-existing.
+                            clip.recover_item_id(file, legacy_storages)
                             # Seed the clip's memo attributes from the run
                             # context so ingest-time clip.root_path (xdcam)
                             # stops re-resolving — same seam the paged tests
@@ -627,7 +631,13 @@ class Folder(models.Model):
                             clip.load_clip_xml(metadatas)
                             if created:
                                 response["created"] += 1
-                            if clip.file is not None:
+                            # FR-23: already-ingested IS item_id presence,
+                            # post-recovery. The pre-2.5 test — `clip.file
+                            # is not None` — was true for every clip the
+                            # scan touched (attach_file_metadatas always
+                            # sets it), so the counter reported the page
+                            # size (pinned-bugs row #1).
+                            if clip.item_id:
                                 response["already_ingested"] += 1
                             if clip.metadatas["provider"] not in providers:
                                 providers.append(clip.metadatas["provider"])
@@ -717,12 +727,35 @@ class Folder(models.Model):
         )
         for key in ["ingested", "skipped", "failed", "replaced"]:
             response[key] = 0
-        if not dry_run and len(response["clips"]) > 0:
-            self.collection_id = self.getCollection(user)
-            self.save()
-            for index, clip in enumerate(response["clips"]):
-                if providers is not None and clip.provider_name not in providers:
-                    continue
+        if not dry_run:
+            # The ladder (AD-15): decide who is worth a Vidispine call
+            # BEFORE spending any. `has_hash` comes from the scan-cached
+            # file only — Clip.file would buy one getFileById per clip.
+            to_ingest, skipped_reasons = select_clips_to_ingest(
+                ((clip, bool(clip.cached_file_hash)) for clip in response["clips"]),
+                providers,
+                replace,
+            )
+            for clip, reason in skipped_reasons:
+                # An item_id-bearing clip counted `skipped` before too —
+                # import_file's early return did it, several HTTP calls
+                # later. The hash-less one is new (NFR-1): no exception,
+                # no legacy match, no ingest, retried next run.
+                response["skipped"] += 1
+                if reason == SKIP_NO_HASH:
+                    log.info(f"Skipping clip {clip}: no hash yet — will retry next run")
+                else:
+                    log.info(
+                        f"Skipping clip {clip}: already ingested as {clip.item_id}"
+                    )
+            if to_ingest:
+                # Collection resolution (a VS search/create per path level)
+                # is worth its calls only once a clip will actually ingest.
+                self.collection_id = self.getCollection(user)
+                # The row exists: the scan's write unit wrote it before
+                # this point. Targeted update, not a full save (AD-6).
+                self.save(update_fields=["collection_id"])
+            for clip in to_ingest:
                 try:
                     result = clip.ingest(
                         user=user,

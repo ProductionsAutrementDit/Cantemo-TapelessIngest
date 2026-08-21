@@ -50,6 +50,7 @@ from portal.plugins.TapelessIngest.metadatas import XMLParser
 from portal.plugins.TapelessIngest.providers import PROVIDER_NAMES
 from portal.plugins.TapelessIngest.scan.context import browse_root_path
 from portal.plugins.TapelessIngest.scan.extraction import extract_metadatas
+from portal.plugins.TapelessIngest.scan.ingestion import needs_hash_recovery
 from portal.plugins.TapelessIngest.scan.persistence import (
     MetadataWrite,
     group_stale_deletes,
@@ -265,32 +266,31 @@ class Clip(models.Model):
         file: Any,
         provider_list: Optional[List[Any]] = None,
         context: Optional[Dict[str, Any]] = None,
-        legacy_storages: Optional[List[str]] = None,
-    ) -> Tuple[Dict[str, Any], Optional[str]]:
+    ) -> Dict[str, Any]:
         """Pass 1 of the scan's two-pass lookup: everything before the DB.
 
-        Providers, identity validation and hash recovery — the whole
-        pre-2.4 head of ``get_clip_from_file``, byte-for-byte in the same
-        order, so a file that raised "No UMID"/"No hash" still raises it
-        at the same point with the same message. Split out so a page's
-        umids can be collected first and looked up in ONE query (AD-6)
-        instead of one ``get`` per file.
+        Providers and identity validation — the head of
+        ``get_clip_from_file``, split out so a page's umids can be
+        collected first and looked up in ONE query (AD-6) instead of one
+        ``get`` per file.
 
-        Hash recovery is deliberately left per-file here — story 2.5 owns
-        the Vidispine call discipline.
+        Hash recovery used to live here too, i.e. BEFORE the clip was
+        known, which is what made it fire for every file on every scan.
+        Since 2.5 it is ``recover_item_id`` below, called once the lookup
+        has answered whether the clip already has an ``item_id`` (FR-8,
+        AD-15).
 
         Args:
             file: VSFile instance to extract metadata from
             provider_list: Optional list of provider instances. If None, uses all providers
             context: Optional context dictionary shared across provider calls; it is
                 mutated in place by the providers, never replaced
-            legacy_storages: Optional list of legacy storage IDs to check for existing items
 
         Returns:
-            Tuple of (metadatas dict, recovered item_id or None)
+            The merged metadatas dict
 
         Raises:
-            TapelessIngestException: If no UMID or hash found in file
+            TapelessIngestException: If no UMID found in file
         """
         if provider_list is None:
             provider_list = cls._get_provider_list()
@@ -301,33 +301,58 @@ class Clip(models.Model):
         metadatas = extract_metadatas(file, provider_list, {}, context)
         if "umid" not in metadatas.keys():
             raise TapelessIngestException("No UMID found in file %s" % file.getPath())
-        item_id = None
-        # Try to recover from file hash
-        sh = StorageHelper()
+        return metadatas
+
+    def recover_item_id(
+        self, file: Any, legacy_storages: Optional[List[str]] = None
+    ) -> Optional[str]:
+        """Find this clip's item on a legacy storage, by file hash — if useful.
+
+        The gate is ``scan.ingestion.needs_hash_recovery`` and it is the
+        whole point of this method: a clip that already has an ``item_id``,
+        a file Cantemo has not hashed yet, or a run with no legacy
+        storages configured all cost ZERO HTTP calls. Pre-2.5 this loop
+        ran for every scanned file — one ``getFilesInStorage`` per legacy
+        storage, per file, per scan — and a hash-less file raised
+        ``TapelessIngestException`` instead of being skipped (NFR-1 rules
+        it a retry, not an error).
+
+        A recovered id is assigned to the clip whether the row is new or
+        pre-existing (ratified): recovery only ever fires when the clip
+        has no ``item_id``, so it can never overwrite a known one. The
+        scan's write unit still does not PERSIST it on an existing row
+        (``CLIP_UPDATE_FIELDS`` is 2.4/2.7 territory) — ``Clip.ingest``'s
+        targeted update is what writes it.
+
+        Returns:
+            The recovered item id, or None when the gate closed or no
+            legacy storage knew the hash.
+        """
         hash = file.getHash()
-        if not hash:
-            raise TapelessIngestException("No hash found in file %s" % file.getPath())
-        if legacy_storages:
-            for legacy_storage in legacy_storages:
-                try:
-                    results = sh.storageapi.getFilesInStorage(
-                        legacy_storage, query={"hash": [hash], "includeItem": "true"}
+        if not needs_hash_recovery(self.item_id, hash, legacy_storages):
+            return None
+        sh = StorageHelper()
+        for legacy_storage in legacy_storages:
+            try:
+                results = sh.storageapi.getFilesInStorage(
+                    legacy_storage, query={"hash": [hash], "includeItem": "true"}
+                )
+            except Exception as e:
+                log.error(
+                    f"Error getting files with hash {hash} in storage {legacy_storage}: {e}"
+                )
+                continue
+            if results["hits"] > 0:
+                # We found a file with same hash
+                existing_file = results["file"][0]
+                if "item" in existing_file.keys() and len(existing_file["item"]) > 0:
+                    self.item_id = existing_file["item"][0]["id"]
+                    log.info(
+                        f"Recovered item {self.item_id} for {self.umid} from "
+                        f"storage {legacy_storage} by hash {hash}"
                     )
-                except Exception as e:
-                    log.error(
-                        f"Error getting files with hash {hash} in storage {legacy_storage}: {e}"
-                    )
-                    continue
-                if results["hits"] > 0:
-                    # We found a file with same hash
-                    existing_file = results["file"][0]
-                    if (
-                        "item" in existing_file.keys()
-                        and len(existing_file["item"]) > 0
-                    ):
-                        item_id = existing_file["item"][0]["id"]
-                        break
-        return metadatas, item_id
+                    return self.item_id
+        return None
 
     @classmethod
     def new_clip_defaults(
@@ -337,9 +362,10 @@ class Clip(models.Model):
 
         The one copy of the new-row shape: both the per-file
         ``get_or_new`` path and the scan's batched path build a new clip
-        from exactly this dict, so the two can never drift. Note the
-        recovered ``item_id`` lands here, i.e. on the insert path only —
-        an existing clip's ingest state is never rewritten by a scan.
+        from exactly this dict, so the two can never drift. ``item_id``
+        defaults to None and stays None here since 2.5: recovery now runs
+        AFTER the row is known (``recover_item_id``), which is what lets a
+        pre-existing row receive a recovered id too.
         """
         return {
             "umid": metadatas["umid"],
@@ -388,19 +414,22 @@ class Clip(models.Model):
             Tuple of (clip instance, created flag)
 
         Raises:
-            TapelessIngestException: If no UMID or hash found in file
+            TapelessIngestException: If no UMID found in file
         """
-        metadatas, item_id = cls.extract_file_metadatas(
+        metadatas = cls.extract_file_metadatas(
             file,
             provider_list=provider_list,
             context=context,
-            legacy_storages=legacy_storages,
         )
+        # Lookup FIRST, recovery second (2.5): the clip's own item_id is
+        # what decides whether a legacy-storage hash lookup is worth any
+        # HTTP call at all.
         clip, created = cls.get_or_new(
             umid=metadatas["umid"],
-            defaults=cls.new_clip_defaults(file, metadatas, item_id),
+            defaults=cls.new_clip_defaults(file, metadatas),
         )
         clip.attach_file_metadatas(file, metadatas)
+        clip.recover_item_id(file, legacy_storages)
 
         return clip, created
 
@@ -535,6 +564,32 @@ class Clip(models.Model):
     def file(self, file):
         self._file = file
         self.file_id = file.getId()
+
+    @property
+    def cached_file_hash(self):
+        """This clip's file hash, from the scan memo ONLY — never over HTTP.
+
+        The ingest ladder's ``has_hash`` input (see
+        ``scan.ingestion``): deliberately reads ``_file``, the file the
+        scan attached, instead of the ``file`` property, which issues a
+        ``getFileById`` call when the memo is cold — one call per clip to
+        decide the clip must not cost any.
+
+        A file whose hash cannot be read is treated as hash-less, which
+        under NFR-1 means "skip and retry next run": never ingest without
+        the dedup key.
+        """
+        file = getattr(self, "_file", None)
+        if file is None:
+            return None
+        try:
+            return file.getHash()
+        except Exception:
+            log.error(
+                f"Cannot read the hash of {self.umid}'s scanned file",
+                exc_info=True,
+            )
+            return None
 
     @property
     def provider(self):
@@ -916,7 +971,12 @@ class Clip(models.Model):
         if not self.file:
             return False
 
-        if len(original_files) >= 0 and replace == False:
+        # FR-35: this length test used to be `>=`, i.e. always true, so
+        # the rung swallowed every non-replace call whatever the shape
+        # held. An item whose original shape has NO file is not "already
+        # imported" — it falls through to the checks below, which are the
+        # ones that can actually tell.
+        if len(original_files) > 0 and replace == False:
             log.info(
                 f"Importing {self.item_id}: Item already exists and has an original file, skipping it"
             )
@@ -1152,6 +1212,16 @@ class Clip(models.Model):
             self.job = job_helper.getJob(res["jobId"])
 
         log.info(f"Retranscoding shape with item {self.item_id} and shape {shape_id}")
+
+        # FR-36: no job id means Vidispine started no import job. Returning
+        # True here — as this method unconditionally did — is how a clip
+        # could be reported ingested with a NULL job_id and no import.
+        if "jobId" not in res:
+            log.error(
+                f"Importing {self.item_id}: multi-component import response "
+                f"carried no job id ({res!r}) — no import job was started"
+            )
+            return False
         return True
 
     def import_file(
@@ -1256,13 +1326,11 @@ class Clip(models.Model):
 
         # Import based on component count
         if len(extra_files) == 0:
-            if self._import_single_component(
+            imported = self._import_single_component(
                 main_file_id, user_groups, no_transcode, _igh, _ijh
-            ):
-                result["ingested"] = True
-                return result
+            )
         else:
-            if self._import_multi_component(
+            imported = self._import_multi_component(
                 main_file,
                 extra_files,
                 shape_id,
@@ -1271,11 +1339,20 @@ class Clip(models.Model):
                 user,
                 _ith,
                 _ijh,
-            ):
-                result["ingested"] = True
-                return result
+            )
 
-        result["ingested"] = True
+        # FR-36: an import with no job id is a FAILURE, never an ingest.
+        # The unconditional `result["ingested"] = True` that used to close
+        # this method reported success for exactly the responses the two
+        # helpers had just rejected.
+        if imported:
+            result["ingested"] = True
+        else:
+            log.error(
+                f"Importing {self.item_id}: no import job was started, counting "
+                f"this clip failed"
+            )
+            result["failed"] = True
         return result
 
     def ingest(
@@ -1304,8 +1381,31 @@ class Clip(models.Model):
             replace=replace,
             legacy_storages=legacy_storages,
         )
-        self.save()
+        if self._state.adding:
+            # Invariant check, not a code path: since 2.4 the scan's write
+            # unit materializes every clip BEFORE ingest, so a clip
+            # reaching here unsaved means something upstream skipped
+            # persistence. Save it rather than lose the ingest state.
+            log.error(
+                f"clip {self.umid} reached ingest unsaved — 2.4 persistence "
+                f"should have written it"
+            )
+            self.save()
+        else:
+            # AD-6 writer 2: ONE targeted UPDATE of the ingest-state
+            # columns. A full save() would rewrite every column of a row
+            # the scan just wrote — including the location columns the
+            # scan deliberately leaves alone (CLIP_UPDATE_FIELDS).
+            type(self).objects.filter(pk=self.umid).update(
+                item_id=self.item_id,
+                job_id=self.job_id,
+                status=self.status,
+                file_id=self.file_id,
+                user=self.user,
+            )
         if folder:
+            # M2M row insert: a declared AD-6 deviation, dry-run gated by
+            # the caller, tracked for 2.7 / the coordinator.
             self.folders.add(folder)
         return result
 

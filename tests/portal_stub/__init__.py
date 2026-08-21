@@ -160,6 +160,45 @@ class FakeStorage:
         return list(self._methods)
 
 
+class StorageAPIFake:
+    """The ``storageapi`` attribute of StorageHelperFake (story 2.5).
+
+    Models the ONE call the plugin makes through it: the legacy-storage
+    hash lookup of ``Clip.recover_item_id``. Configured and counted
+    class-side on StorageHelperFake, because plugin code builds a fresh
+    ``StorageHelper()`` per call site.
+
+    Default answer for any hash is a clean miss (``hits: 0``), so a test
+    that expects ZERO lookups fails on the call counter rather than on a
+    mysterious KeyError.
+    """
+
+    def getFilesInStorage(self, storage_id, query=None):
+        cls = StorageHelperFake
+        query = query or {}
+        hashes = query.get("hash") or []
+        file_hash = hashes[0] if hashes else None
+        cls.get_files_in_storage_calls.append((storage_id, file_hash))
+        for key in ((storage_id, file_hash), (None, file_hash)):
+            if key in cls.hash_errors:
+                raise VSAPIError(
+                    f"getFilesInStorage failed for hash {file_hash} in "
+                    f"storage {storage_id} (configured)"
+                )
+            if key in cls.hash_items:
+                item_id = cls.hash_items[key]
+                return {
+                    "hits": 1,
+                    "file": [
+                        {
+                            "id": f"{storage_id}-FILE-{file_hash}",
+                            "item": [{"id": item_id}] if item_id else [],
+                        }
+                    ],
+                }
+        return {"hits": 0, "file": []}
+
+
 class StorageHelperFake:
     """Configurable counting stand-in for portal.vidispine.istorage.StorageHelper
     (QueryElasticFake tradition, story 2.1).
@@ -176,24 +215,37 @@ class StorageHelperFake:
     - an UNCONFIGURED id raises AssertionError naming the id — silent
       success would hide unintended storage traffic;
     - ``get_storage_calls`` counts ``getStorage`` per id (all outcomes,
-      the assertion included) for the once-per-run acceptance criterion.
+      the assertion included) for the once-per-run acceptance criterion;
+    - ``set_hash_item(hash, item_id, storage_id=None)`` /
+      ``set_hash_error(hash, storage_id=None)`` configure the
+      ``storageapi.getFilesInStorage`` hash lookup, whose every call is
+      recorded in ``get_files_in_storage_calls`` — the counter story
+      2.5's "zero Vidispine calls for an already-ingested clip" rests on.
 
-    Only ``getStorage`` is implemented — any other method access still
-    raises AttributeError, keeping tests off-server honest. The conftest
-    autouse fixture resets the class state after every test. The story-1.3
-    pins bypass this fake entirely (preset ``_root_path``, ``context=None``
-    -> property fallback never reaches a StorageHelper).
+    Only ``getStorage`` and ``storageapi.getFilesInStorage`` are
+    implemented — any other method access still raises AttributeError,
+    keeping tests off-server honest. The conftest autouse fixture resets
+    the class state after every test. The story-1.3 pins bypass this fake
+    entirely (preset ``_root_path``, ``context=None`` -> property fallback
+    never reaches a StorageHelper).
     """
 
     roots = {}
     no_browse = set()
     missing = set()
     get_storage_calls = {}
+    # (storage_id or None, hash) -> item id returned by the hash lookup.
+    hash_items = {}
+    # (storage_id or None, hash) whose lookup raises, per the try/except
+    # around getFilesInStorage.
+    hash_errors = set()
+    get_files_in_storage_calls = []
 
     def __init__(self, slug=None, user=None, runas=None):
         self.slug = slug
         self.user = user
         self.runas = runas
+        self.storageapi = StorageAPIFake()
 
     @classmethod
     def set_root(cls, storage_id, root):
@@ -208,11 +260,24 @@ class StorageHelperFake:
         cls.missing.add(storage_id)
 
     @classmethod
+    def set_hash_item(cls, file_hash, item_id, storage_id=None):
+        """Make the hash lookup find ``item_id`` (storage_id None = any)."""
+        cls.hash_items[(storage_id, file_hash)] = item_id
+
+    @classmethod
+    def set_hash_error(cls, file_hash, storage_id=None):
+        """Make the hash lookup raise for this hash (storage_id None = any)."""
+        cls.hash_errors.add((storage_id, file_hash))
+
+    @classmethod
     def reset(cls):
         cls.roots.clear()
         cls.no_browse.clear()
         cls.missing.clear()
         cls.get_storage_calls.clear()
+        cls.hash_items.clear()
+        cls.hash_errors.clear()
+        cls.get_files_in_storage_calls.clear()
 
     def getStorage(self, storage_id):
         cls = type(self)
@@ -232,6 +297,46 @@ class StorageHelperFake:
             f"set_missing (silent success would hide unintended storage "
             f"traffic)"
         )
+
+
+class SignalFake:
+    """Recording stand-in for a Django signal (portal.vidispine.signals).
+
+    ``Clip._import_multi_component`` fires ``vidispine_pre_ingest`` /
+    ``vidispine_post_ingest`` on its way to the job-id check story 2.5
+    fixed (FR-36), so the FR-36 pin cannot be written without them.
+    Recording rather than raising: prod's ``send`` returns the receivers'
+    results and has no other effect on the caller, and a recorded call is
+    still not a silent one.
+    """
+
+    def __init__(self, name):
+        self.name = name
+        self.calls = []
+
+    def send(self, sender=None, **kwargs):
+        self.calls.append((sender, kwargs))
+        return []
+
+
+class InvalidateItemCacheFake:
+    """Recording no-op for portal.items.cache.invalidate_item_cache.
+
+    Same reason as SignalFake: it sits on the multi-component import path
+    before the job-id check. Prod's version drops cache entries and
+    returns nothing, so recording the item ids models it faithfully.
+    """
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, item_id):
+        self.calls.append(item_id)
+
+
+vidispine_pre_ingest = SignalFake("vidispine_pre_ingest")
+vidispine_post_ingest = SignalFake("vidispine_post_ingest")
+invalidate_item_cache_fake = InvalidateItemCacheFake()
 
 
 def _stub_class(name):
@@ -286,7 +391,10 @@ _MODULES = {
         "format_datetime": _stub_callable("portal.api.v2.utils.format_datetime")
     },
     "portal.vidispine": {},
-    "portal.vidispine.signals": {},
+    "portal.vidispine.signals": {
+        "vidispine_pre_ingest": vidispine_pre_ingest,
+        "vidispine_post_ingest": vidispine_post_ingest,
+    },
     "portal.vidispine.ijob": {"JobHelper": _stub_class("JobHelper")},
     "portal.vidispine.iitem": {
         "ItemHelper": _stub_class("ItemHelper"),
@@ -309,11 +417,7 @@ _MODULES = {
         "performVSAPICall": _stub_callable("portal.vidispine.igeneral.performVSAPICall")
     },
     "portal.items": {},
-    "portal.items.cache": {
-        "invalidate_item_cache": _stub_callable(
-            "portal.items.cache.invalidate_item_cache"
-        )
-    },
+    "portal.items.cache": {"invalidate_item_cache": invalidate_item_cache_fake},
     "portal.utils": {},
     "portal.utils.templatetags": {},
     "portal.utils.templatetags.vidispinetags": {

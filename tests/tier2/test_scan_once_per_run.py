@@ -64,13 +64,14 @@ def test_tree_run_resolves_each_storage_once(
 
     # Results equal today's: same NFR-5 key sets, same counters.
     assert set(response_a.keys()) == SCAN_KEYS
+    # already_ingested counts item_id presence, so a brand-new clip is 0 (FR-23).
     assert (
         response_a["hits"],
         response_a["processed"],
         response_a["created"],
         response_a["already_ingested"],
         response_a["errors"],
-    ) == (1, 1, 1, 1, [])
+    ) == (1, 1, 1, 0, [])
     assert [clip.umid for clip in response_a["clips"]] == [f"{rel_a}/CLIPA"]
 
     assert set(response_b.keys()) == INGEST_KEYS
