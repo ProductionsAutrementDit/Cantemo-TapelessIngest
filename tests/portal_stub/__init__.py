@@ -694,10 +694,21 @@ class SignalFake:
     def __init__(self, name):
         self.name = name
         self.calls = []
+        self.receivers = []
 
     def send(self, sender=None, **kwargs):
         self.calls.append((sender, kwargs))
-        return []
+        return [(receiver, receiver(**kwargs)) for receiver in self.receivers]
+
+    def connect(self, receiver, **kwargs):
+        """Register a receiver, as ``django.dispatch.Signal.connect`` does.
+
+        Recording it is the point: ``plistner`` connects at import time and
+        the plugin went years with that module never imported, so "was a
+        receiver actually registered" is the thing a test has to be able
+        to ask.
+        """
+        self.receivers.append(receiver)
 
 
 class InvalidateItemCacheFake:
@@ -717,6 +728,7 @@ class InvalidateItemCacheFake:
 
 vidispine_pre_ingest = SignalFake("vidispine_pre_ingest")
 vidispine_post_ingest = SignalFake("vidispine_post_ingest")
+vidispine_post_delete = SignalFake("vidispine_post_delete")
 invalidate_item_cache_fake = InvalidateItemCacheFake()
 
 
@@ -785,6 +797,7 @@ _MODULES = {
     "portal.vidispine.signals": {
         "vidispine_pre_ingest": vidispine_pre_ingest,
         "vidispine_post_ingest": vidispine_post_ingest,
+        "vidispine_post_delete": vidispine_post_delete,
     },
     "portal.vidispine.ijob": {"JobHelper": JobHelperFake},
     "portal.vidispine.iitem": {
