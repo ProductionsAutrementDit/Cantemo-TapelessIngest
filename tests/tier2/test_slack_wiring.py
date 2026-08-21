@@ -7,9 +7,15 @@ call_command test pins the happy path — the token the config read returns
 the WebClient is constructed with — plus the sibling skip cases: get returns
 None (absent section) and "" (present section, empty value).
 
-AD-11: only the command module's OWN attributes (ConfigParser, WebClient,
-scan_tapeless_dir) are monkeypatched — never Portal, never slack_sdk
-internals. The REAL CustomLogger runs.
+AD-11: only the command module's OWN attributes (ConfigParser, WebClient)
+and one PLUGIN method (Folder.scan_tree) are monkeypatched — never Portal,
+never slack_sdk internals. The REAL CustomLogger runs.
+
+Story 2.8 rebound the run seam: `handle()` no longer calls a module-level
+`scan_tapeless_dir`, it calls `folder.scan_tree(ctx, emit=logger.log)`. The
+stub stands in for that instead. It is deliberately silent — this test is
+about the TOKEN reaching the client, and the run's own report would only
+add noise; the messages the send loop packs are handle()'s own header line.
 """
 
 import importlib
@@ -17,6 +23,8 @@ import importlib
 import pytest
 from django.contrib.auth.models import User
 from django.core.management import call_command
+
+from portal.plugins.TapelessIngest.models.folder import Folder
 
 COMMANDS = ["scan_tapeless_dir", "check_clips_in_folder"]
 
@@ -75,7 +83,7 @@ def test_config_token_reaches_web_client(
     monkeypatch.setattr(module, "SLACK_ACCESS_TOKEN", module.SLACK_ACCESS_TOKEN)
     monkeypatch.setattr(module, "logger", module.logger)
 
-    monkeypatch.setattr(module, "scan_tapeless_dir", lambda parent_folder, **kw: 0)
+    monkeypatch.setattr(Folder, "scan_tree", lambda self, ctx, *, emit: None)
     monkeypatch.setattr(module, "ConfigParser", _stub_config_parser(token))
     monkeypatch.setattr(module, "WebClient", _RecordingWebClient)
     # No cache.set("storage:VX-41", ...) preset any more (story 2.1): tree

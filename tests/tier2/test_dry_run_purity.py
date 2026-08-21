@@ -65,6 +65,12 @@ from portal.plugins.TapelessIngest.models.clip import Clip, ClipMetadata
 from portal.plugins.TapelessIngest.models.folder import Folder
 from portal.plugins.TapelessIngest.providers.providers import Provider as BaseProvider
 from portal.plugins.TapelessIngest.scan.adapters import build_default_context
+from portal.plugins.TapelessIngest.scan.coordinator import (
+    FolderOutcome,
+    FolderTimings,
+    WorkerCounters,
+    WorkerResult,
+)
 
 from tests.portal_stub import VidispineFake
 
@@ -565,6 +571,25 @@ def test_a_post_ladder_skip_shows_the_bound_not_the_equality(
 
 COMMANDS = ["scan_tapeless_dir", "check_clips_in_folder"]
 
+# Per-folder timings chosen so their seven-fold sums are unambiguous at one
+# decimal place — no half-way value, no banker's-rounding coin flip. They
+# make the assertion below discriminating rather than a prefix match:
+# verified by mutation that a `summary_lines` rendering zeros, and a
+# `merge_results` that overwrote instead of summing the phases, each fail
+# all four cases here.
+PER_FOLDER_TIMINGS = FolderTimings(
+    discovery=0.5,  # x7 -> 3.5
+    verification=1.0,  # x7 -> 7.0
+    extraction=0.2,  # x7 -> 1.4
+    persistence=0.0,  # x7 -> 0.0
+    ingest=2.0,  # x7 -> 14.0
+)
+SUMMARY_TAIL = (
+    r"7 folders scanned, 0 failed in \d+\.\ds — "
+    r"discovery 3\.5s, verification 7\.0s, extraction 1\.4s, "
+    r"persistence 0\.0s, ingest 14\.0s$"
+)
+
 
 @pytest.mark.parametrize("command", COMMANDS)
 @pytest.mark.parametrize("dryrun", [True, False], ids=["dryrun", "real"])
@@ -577,9 +602,32 @@ def test_summary_line_is_labelled_under_dryrun(
     proves the sibling command's ``handle`` carries the same edit; this
     runs it for both anyway, because source equality of a block nobody
     executes is not evidence that the block works.
+
+    Story 2.8 (SIXTH sanctioned rewrite — this site could not appear in
+    that spec's five-site list because it landed with 2.7, after the list
+    was written) moved the summary out of ``Command.handle`` and into the
+    coordinator, and superseded 2.7's single-count string with the
+    phase-timing literal ``scan.coordinator.summary_lines`` renders. The
+    2.7 claim is unchanged and is what is still asserted: for BOTH
+    commands and BOTH flag states, the DRY-RUN label reaches the operator
+    through the real emission path.
+
+    So the seam moved DOWN rather than sideways. Stubbing
+    ``Folder.scan_tree`` — the obvious analogue of the old
+    ``scan_tapeless_dir`` stub, and what `test_slack_wiring` /
+    `test_cli_validation` do, because they do not care what the run
+    reports — would stub out the summary itself and leave this test
+    comparing a string against a string it supplied. Only ``walk_tree`` is
+    doubled, so everything downstream of it is REAL: real
+    ``merge_results``, real ``fold_timings``, real ``summary_lines``, real
+    ``CustomLogger.log``, real ``handle()``. The only thing the double
+    decides is how many folders the walk found.
     """
     import importlib
 
+    folder_module = importlib.import_module(
+        "portal.plugins.TapelessIngest.models.folder"
+    )
     module = importlib.import_module(
         f"portal.plugins.TapelessIngest.management.commands.{command}"
     )
@@ -587,7 +635,24 @@ def test_summary_line_is_labelled_under_dryrun(
     # current values via monkeypatch restores them on teardown.
     monkeypatch.setattr(module, "SLACK_ACCESS_TOKEN", module.SLACK_ACCESS_TOKEN)
     monkeypatch.setattr(module, "logger", module.logger)
-    monkeypatch.setattr(module, "scan_tapeless_dir", lambda parent_folder, **kw: 7)
+
+    def seven_folders(root_storage_id, root_path, **kwargs):
+        return [
+            FolderOutcome(
+                result=WorkerResult(
+                    folder_path=f"{root_path}/AH_{index}",
+                    counters=WorkerCounters(hits=1),
+                    timings=PER_FOLDER_TIMINGS,
+                ),
+                consumed_subdirs=frozenset(),
+                failed=False,
+            )
+            for index in range(7)
+        ]
+
+    # PLUGIN code, not Portal (AD-11 untouched): the walk the coordinator
+    # runs, replaced by a fixed set of outcomes.
+    monkeypatch.setattr(folder_module, "walk_tree", seven_folders)
     storage_fake.set_root("VX-41", "/dryrun-root")
 
     user = User.objects.create(pk=4244, username=f"story27-summary-{command}-{dryrun}")
@@ -600,9 +665,18 @@ def test_summary_line_is_labelled_under_dryrun(
     finally:
         user.delete()  # keep the auth table empty for the unknown-user tests
 
-    if dryrun:
-        assert "DRY-RUN: 7 folders scanned — no changes were made" in messages
-        assert "7 folders scanned" not in messages
+    # check_clips_in_folder is read-only BY CONSTRUCTION (FR-37), so its
+    # summary is labelled whether or not --dryrun was passed. That is the
+    # command's whole point, not an exception to the rule below.
+    expect_label = dryrun or module.FORCE_DRY_RUN
+    summaries = [
+        message for message in messages if re.search(SUMMARY_TAIL, message) is not None
+    ]
+    assert len(summaries) == 1, messages
+    [summary] = summaries
+
+    if expect_label:
+        assert re.fullmatch("DRY-RUN: " + SUMMARY_TAIL, summary), summary
     else:
-        assert "7 folders scanned" in messages
+        assert re.fullmatch(SUMMARY_TAIL, summary), summary
         assert not [message for message in messages if "DRY-RUN" in message]

@@ -1,25 +1,28 @@
-# Ported verbatim from /opt/cantemo/scripts/check_clips_in_folder.py (prod
-# copy, fetched 2026-08-20). Behavior-preserving, asymmetries included: calls
-# folder.scan() (not folder.ingest()) and has no generic `except Exception`
-# in the scan loop. The duplicated `skip` check went with story 2.6, which
-# extracted the filter block into the shared `should_scan_entry` helper: the
-# second check was byte-identical to the first and could never change the
-# outcome. Approved deviations: the missing `WebClient` import is added (the
-# prod script crashes at launch with NameError without it), django.setup()
-# boilerplate dropped (manage.py owns setup), and module-level side effects
-# (portal.conf read, Slack client, logger construction, main() call) moved
-# into handle().
+# Rebuilt on the shared scan pipeline by story 2.8 (FR-37).
 #
-# KNOWN PRESERVED DEFECTS — the "preserved behavior" includes fatal runtime
-# defects; this command has never completed a run in production:
-# 1. folder.scan(...) is called with `dry_run` and `replace` kwargs that
-#    Folder.scan (models/folder.py:284) does not accept -> TypeError on the
-#    first folder processed.
-# 2. The "found ... clips" log line reads result keys (`ingested`, `skipped`,
-#    `replaced`) that only Folder.ingest produces, not Folder.scan ->
-#    KeyError if execution ever got that far.
-# Both are kept verbatim per this versioning story and are slated for the
-# Epic 2 rebuild on the shared pipeline (FR-37). Do not "fix" them here.
+# This command was ported verbatim from /opt/cantemo/scripts/
+# check_clips_in_folder.py (prod copy, fetched 2026-08-20) and carried two
+# fatal defects that meant it had NEVER completed a run: it called
+# folder.scan(...) with `dry_run`/`replace` kwargs that method does not
+# accept (TypeError on the first folder), and its log line read
+# ingest-only result keys off a scan response (KeyError if it ever got
+# that far). Neither is patched here — both are structurally gone. There
+# is no folder.scan(dry_run=..., replace=...) call left anywhere, and all
+# eight AD-13 counters always exist on a WorkerResult, so no ingest-only
+# key can be missing.
+#
+# What is left is the difference that matters: this command is READ-ONLY
+# BY CONSTRUCTION. `FORCE_DRY_RUN = True` below is the only source
+# difference from its sibling scan_tapeless_dir; `handle()` is
+# byte-identical in both files (pinned by
+# tests/tier1/test_commands_in_sync.py) and reads that constant, so this
+# command runs the very same pipeline with ctx.options.dry_run forced on.
+# It cannot write a row, submit an ingest or resolve a collection whatever
+# flags it is given — the two write-side flags it keeps for sibling
+# symmetry announce themselves as inert at the start of every run.
+#
+# The header comment and the description/epilog strings are the parts the
+# two commands are allowed to differ in; nothing else is.
 description = """
 Ingest found tapeless clips in all subdirectories.
 """
@@ -27,7 +30,6 @@ epilog = """
 Example: Ingest all tapeless clips in folder 2022, in subfolders starting with AH_, with admin user:
 ./check_clips_in_folder.py --storage VX-41 --path 2022 --userId 1 --startWith AH_ --dryrun
 """
-import os
 import re
 from datetime import datetime, timedelta
 from dateutil.relativedelta import relativedelta
@@ -42,12 +44,15 @@ from django.core.management.base import BaseCommand, CommandError
 from configparser import ConfigParser
 
 from portal.plugins.TapelessIngest.models.folder import Folder
-from portal.plugins.TapelessIngest.helpers import TapelessIngestException
 from portal.plugins.TapelessIngest.providers import PROVIDER_NAMES
 from portal.plugins.TapelessIngest.scan import adapters
-from portal.plugins.TapelessIngest.scan.verification import FolderListings
 
 SLACK_ACCESS_TOKEN = None
+
+# FR-37: the ONE source difference between this command and its writing
+# sibling. `handle()` below is byte-identical in both files and reads this
+# constant; nothing else may diverge.
+FORCE_DRY_RUN = True
 
 # Slack chat.postMessage limits (docs.slack.dev, fetched 2026-08-20): the
 # `text` field should be limited to 4,000 characters for readability, and
@@ -202,187 +207,6 @@ def format_window_log(date_window):
     )
 
 
-def should_scan_entry(name, skip=None, only=None, startwith=None, date_window=None):
-    """Do this subdirectory's filters allow it to be scanned?
-
-    The legacy substring semantics verbatim (``str.find(...) != -1``, not
-    ``in``) in the legacy order, extracted so the two commands cannot
-    drift apart (FR-37; pinned by tests/tier1/test_commands_in_sync.py).
-
-    Two deltas from the pre-2.6 inline block:
-
-    * the byte-identical DUPLICATE ``skip`` check that followed
-      ``startwith`` is gone — it could never change the outcome;
-    * ``--skip``/``--only`` are the OPERATOR's filters and are evaluated
-      at EVERY depth (FR-20 — the pre-2.6 recursive call forwarded
-      neither), while ``startwith`` and ``date_window`` select shoot
-      folders at depth 1 only and are simply not passed further down.
-
-    ``date_window`` is its own parameter since story 2.6. Story 1.4
-    synthesized it into ``only`` with an in-place ``+=`` that aliased
-    ``args.only``, which made the two indistinguishable; they
-    are independent now, so a run given both must satisfy both.
-    """
-    if skip:
-        # search in skip if name contains one of the values
-        for skip_entry in skip:
-            if name.find(skip_entry) != -1:
-                return False
-    if only:
-        # search in only if name contains one of the values
-        if not any(name.find(only_entry) != -1 for only_entry in only):
-            return False
-    if startwith:
-        # search in startwith if name begins with one of the values
-        if not any(name.startswith(prefix) for prefix in startwith):
-            return False
-    if date_window:
-        # one YYYYMMDD value per window day, same substring semantics
-        if not any(name.find(day) != -1 for day in date_window):
-            return False
-    return True
-
-
-def consumed_subdirs_from_results(results):
-    """The descent authorization carried by a scan/ingest response.
-
-    Three states, three representations (story 2.6, NFR-1):
-
-    * a ``frozenset`` — descend into every child EXCEPT these names;
-    * ``None`` — DOUBT: descent is not authorized for this folder at all,
-      and the recursion skips it entirely;
-    * no key — treated as ``None``, because a response that cannot say
-      what it consumed must never be trusted to authorize a descent.
-
-    ``None`` and ``frozenset()`` are NEVER interchangeable: the empty set
-    is "nothing consumed, descend into everything", the opposite call.
-    """
-    return results.get("consumed_subdirs")
-
-
-def scan_tapeless_dir(
-    parent_folder,
-    storage=None,
-    ingest=False,
-    user=None,
-    startwith=None,
-    count=0,
-    skip=None,
-    only=None,
-    first=0,
-    number=0,
-    providers=None,
-    replace=True,
-    *,
-    context=None,
-    date_window=None,
-    consumed=frozenset(),
-):
-    """Scan every subdirectory of ``parent_folder``, depth-first.
-
-    ``consumed`` holds the immediate child names ``parent_folder``'s own
-    clips already covered; they are skipped. The default is
-    ``frozenset()`` — "nothing consumed" — so the root call from
-    ``handle()`` descends into every child. Doubt is NEVER expressed here
-    (that is what ``response["consumed_subdirs"] is None`` is for): an
-    empty set means descend, and under-consuming is the one direction
-    that produces an unrecoverable duplicate ingest (NFR-1).
-    """
-    if user is None:
-        logger.log("User has to be provided")
-    absolute_path = parent_folder.absolute_path
-    if not absolute_path:
-        # FR-28: an unresolvable storage is reported and the walk stops
-        # here, instead of os.scandir(False) raising out of the run.
-        logger.log(
-            f"Cannot get full path from storage {parent_folder.storage_id}, "
-            f"path {parent_folder.path}"
-        )
-        return count
-    # Its own FolderListings (story 2.2's class-level reuse ruling): one
-    # extra scandir per folder directory, consolidated by story 2.8.
-    listings = FolderListings()
-    listing = listings.get(absolute_path)
-    # FR-22: a scandir failure is surfaced, never silently empty.
-    for listing_path, listing_error in sorted(listings.errors().items()):
-        logger.log(f"Error listing directory {listing_path}: {listing_error}")
-    if listing.error is not None:
-        return count
-    # sorted(): deterministic cron logs, no hash-seed flakiness. `dirs`
-    # excludes symlinked directories (FR-24's cycle guard, story 2.2).
-    for name in sorted(listing.dirs):
-        # NFR-1: a child this folder's own clips already covered is never
-        # scanned again as a folder of its own — that IS the duplicate.
-        if name in consumed:
-            continue
-        if not should_scan_entry(
-            name, skip=skip, only=only, startwith=startwith, date_window=date_window
-        ):
-            continue
-        folder_path = os.path.join(parent_folder.path, name)
-        try:
-            folder, is_new = Folder.get_or_new(storage_id=storage, path=folder_path)
-            if context is not None:
-                # Seed the memoized root from the run context BEFORE any
-                # property access, so neither this folder's scan nor the
-                # recursion's own listing re-resolves the storage (real
-                # once-per-run, FR-7).
-                child_root = context.root_path_for(storage)
-                if child_root:
-                    folder._root_path = child_root
-            # print(f"Scanning {folder.path}...")
-            ingest_message = ""
-            results = folder.scan(
-                first=first,
-                number=number,
-                cursor=None,
-                user=user,
-                providers=providers,
-                legacy_storages=LEGACY_STORAGES,
-                dry_run=not ingest,
-                replace=replace,
-                context=context,
-            )
-            count += 1
-            error_message = ""
-            if len(results["errors"]):
-                error_string = "\n".join(results["errors"])
-                error_message += f": {error_string}"
-            # FR-22: log whenever there is anything to report. Before 2.6
-            # the whole line was gated on hits > 0, so a zero-hit folder's
-            # errors were swallowed together with it.
-            if results["hits"] > 0 or len(results["errors"]):
-                logger.log(
-                    f"found {results['hits']} clips in {folder.path}, {results['already_ingested']} already ingested, {results['created']} created, providers are {folder.provider_names}, {results['ingested']} ingested, {results['skipped']} skipped, {results['replaced']} replaced, {len(results['errors'])} errors encountered{error_message}",
-                )
-            child_consumed = consumed_subdirs_from_results(results)
-            if child_consumed is not None:
-                # FR-19/FR-20: descend into every NON-consumed child, at
-                # every depth, carrying the operator's filters down with
-                # it. `startwith` and the date window select depth-1 shoot
-                # folders and deliberately stop here.
-                count = scan_tapeless_dir(
-                    parent_folder=folder,
-                    storage=storage,
-                    ingest=ingest,
-                    user=user,
-                    count=count,
-                    skip=skip,
-                    only=only,
-                    startwith=None,
-                    providers=providers,
-                    replace=replace,
-                    context=context,
-                    date_window=None,
-                    consumed=child_consumed,
-                )
-        except FileNotFoundError:
-            logger.log(f"Path doesn't exists anymore: {folder.path}")
-        except TapelessIngestException as e:
-            logger.log(f"Error ingesting {folder_path}: {e}")
-    return count
-
-
 class Command(BaseCommand):
     help = description + epilog
 
@@ -482,29 +306,54 @@ class Command(BaseCommand):
 
         only = args.only
 
+        if FORCE_DRY_RUN:
+            # FR-37: this command is read-only BY CONSTRUCTION, so the two
+            # write-side flags it keeps for sibling symmetry are inert.
+            # Said once, at the start, rather than left for the operator to
+            # infer from a summary that is labelled a rehearsal whatever
+            # flags they passed.
+            if args.dryrun:
+                logger.log(
+                    "--dryrun has no effect here: this command is read-only "
+                    "by construction and always runs as a dry run"
+                )
+            if args.replace:
+                # NOT "no effect": since story 2.7 the ladder runs in dry
+                # mode too, so --replace still moves the would-be counters.
+                logger.log(
+                    "--replace performs no writes here: this command is "
+                    "read-only by construction, but the flag still changes "
+                    "the would-be counters this run reports"
+                )
+
         if date_window is not None:
-            # Story 2.6: the window is its OWN depth-1 filter, passed as
-            # date_window= below. It is no longer synthesized into `only`
-            # (the in-place append aliased args.only itself), because
-            # --only is an operator filter that applies at every depth
-            # while the window selects shoot folders at depth 1 only.
+            # Story 2.6: the window is its OWN depth-1 filter, carried on
+            # the run context below. It is no longer synthesized into
+            # `only` (the in-place append aliased args.only itself),
+            # because --only is an operator filter that applies at every
+            # depth while the window selects shoot folders at depth 1 only.
             logger.log(format_window_log(date_window))
 
         # One context per run (story 2.1): the storage is resolved exactly
-        # once here via the adapters, then threaded through the recursion as
-        # an ADDITIONAL kwarg — every existing kwarg still passes unchanged.
+        # once here via the adapters. Since story 2.8 it also carries the
+        # four folder filters, which used to be loose kwargs threaded
+        # through a recursion that lived in this file.
         context = adapters.build_context(
             [args.storage],
             user=user,
-            dry_run=args.dryrun,
+            dry_run=args.dryrun or FORCE_DRY_RUN,
             providers=args.providers,
             legacy_storages=LEGACY_STORAGES,
             replace=args.replace,
+            skip=args.skip,
+            only=args.only,
+            startwith=args.startWith,
+            date_window=date_window,
         )
 
         folder, is_new = Folder.get_or_new(storage_id=storage, path=path)
         # Seed the memoized root from the run context so the top-level
-        # os.scandir(folder.absolute_path) never re-resolves the storage.
+        # directory listing never re-resolves the storage.
         root_path = context.root_path_for(storage)
         if root_path:
             folder._root_path = root_path
@@ -516,26 +365,11 @@ class Command(BaseCommand):
             f"Scanning folder {folder.path} on storage {storage_label}, with user {user}, starting with {' or '.join(args.startWith)} using only {only}, skipping {args.skip}",
         )
         try:
-            count = scan_tapeless_dir(
-                folder,
-                ingest=not args.dryrun,
-                user=user,
-                startwith=args.startWith,
-                storage=storage,
-                providers=args.providers,
-                replace=args.replace,
-                skip=args.skip,
-                only=args.only,
-                context=context,
-                date_window=date_window,
-            )
-            # Story 2.7: a dry run rehearses every phase and reports the
-            # would-be counters, so the end-of-run summary must say which
-            # kind of run produced them — the same line reaches Slack.
-            if args.dryrun:
-                logger.log(f"DRY-RUN: {count} folders scanned — no changes were made")
-            else:
-                logger.log(f"{count} folders scanned")
+            # Story 2.8: the walk, the per-folder emission, the timing fold
+            # and the end-of-run summary all live in the coordinator now.
+            # This command owns exactly two things: building the context
+            # and flushing Slack once.
+            folder.scan_tree(context, emit=logger.log)
         except Exception as e:
             logger.log(f"Error scanning {folder.path}: {e}")
         logger.send_messages_to_slack()

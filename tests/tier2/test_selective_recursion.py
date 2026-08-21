@@ -16,9 +16,13 @@ the fixture files whose parent directory matches one — the way the real
 index behaves. A scripted queue would make the zero-duplicate assertion a
 property of the page script; routed, it is a property of consumption.
 
-The scan module's own ``logger`` global is monkeypatched with a recorder
-(sanctioned — our module, not portal mocking), and ``scan_tapeless_dir()``
-is driven directly so no User row, portal.conf or Slack client is needed.
+Story 2.8 rebound the driver onto the seam that replaced the two
+command-level recursions: ``Folder.scan_tree(ctx, emit=…)``. The filters
+travel on the run context now, and the emission sink is a parameter, so
+the module-global ``logger`` injection 2.6 needed is gone — a plain
+recorder is passed in. Every assertion below is 2.6's, unchanged: the
+claim is still that each umid is extracted exactly once while the
+independent subtrees ARE reached.
 """
 
 import importlib
@@ -161,7 +165,7 @@ def _install_router(es_fake, indexed, ghosts=()):
 
 
 def _run(module, monkeypatch, tmp_path, storage_fake, root_rel="2026", **kwargs):
-    """Drive the real scan_tapeless_dir over the tmp tree, dry-run."""
+    """Drive the real tree walk over the tmp tree, dry-run."""
     storage_fake.set_root(STORAGE_ID, str(tmp_path))
     context = build_context(
         [STORAGE_ID],
@@ -170,26 +174,17 @@ def _run(module, monkeypatch, tmp_path, storage_fake, root_rel="2026", **kwargs)
         providers=[CARD_PROVIDER_NAME],
         legacy_storages=[],
         replace=False,
-    )
-    logger = RecordingLogger()
-    monkeypatch.setattr(module, "logger", logger)
-
-    parent = Folder(storage_id=STORAGE_ID, path=root_rel)
-    # handle() seeds the top-level folder's root from the ctx; the
-    # recursion seeds every child itself.
-    parent._root_path = context.root_path_for(STORAGE_ID)
-
-    count = module.scan_tapeless_dir(
-        parent,
-        storage=STORAGE_ID,
-        ingest=False,
-        user=object(),
-        providers=[CARD_PROVIDER_NAME],
-        replace=False,
-        context=context,
         **kwargs,
     )
-    return count, logger
+    logger = RecordingLogger()
+
+    parent = Folder(storage_id=STORAGE_ID, path=root_rel)
+    # handle() seeds the top-level folder's root from the ctx; the walk's
+    # worker seeds every child itself.
+    parent._root_path = context.root_path_for(STORAGE_ID)
+
+    run_result = parent.scan_tree(context, emit=logger.log)
+    return run_result.folders_scanned, logger
 
 
 def _write(tmp_path, *rel_paths):

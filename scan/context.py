@@ -12,7 +12,7 @@ a read-only mapping proxy at construction.
 import os
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any, List, Mapping, Optional
+from typing import Any, List, Mapping, Optional, Tuple
 
 
 def browse_root_path(storage) -> Optional[str]:
@@ -46,20 +46,41 @@ class StorageInfo:
 
 @dataclass(frozen=True)
 class RunOptions:
-    """The run-scoped options a passed context carries authoritatively."""
+    """The run-scoped options a passed context carries authoritatively.
+
+    The four folder filters are AD-4 run options, not loose kwargs: they
+    were an argparse artifact threaded through the old recursion by hand.
+    They are TUPLES so a frozen context really is frozen — a list on a
+    "frozen" dataclass is a mutable field with a promise on it — and they
+    default to ``()`` so every pre-2.8 construction site still compiles.
+
+    The LEVEL at which each applies is not expressed here: a run-scoped
+    object cannot say "depth 1 only". ``scan.coordinator.walk_tree`` owns
+    that, through its explicit ``depth`` parameter — ``skip``/``only``
+    apply at every depth, ``startwith``/``date_window`` only at depth 1.
+    """
 
     dry_run: bool = False
     providers: Optional[List[str]] = None
     legacy_storages: Optional[List[str]] = None
     replace: bool = False
     user: Any = None
+    skip: Tuple[str, ...] = ()
+    only: Tuple[str, ...] = ()
+    startwith: Tuple[str, ...] = ()
+    date_window: Tuple[str, ...] = ()
 
 
 @dataclass
 class PhaseTimings:
     """Mutable accumulator for per-phase durations (seconds).
 
-    Structure only in 2.1 — story 2.8 is the writer.
+    Structure only in 2.1; story 2.8 made it real. It has exactly ONE
+    writer: ``Folder.scan_tree`` folds the run's merged ``FolderTimings``
+    into it once, through ``scan.coordinator.fold_timings``. Workers time
+    themselves into their own per-folder ``FolderTimings`` value and never
+    touch this instance — which is what keeps it safe when Epic 3 turns
+    the workers into a pool.
     """
 
     discovery: float = 0.0

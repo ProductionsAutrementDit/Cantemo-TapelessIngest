@@ -22,14 +22,17 @@ SHARED_HELPERS = [
     "parse_from",
     "compute_date_window",
     "format_window_log",
-    # Story 2.6: the recursion's drift-prone halves. check_clips_in_folder's
-    # own recursion lands unexecuted and uncompared (the sync test compares
-    # helpers and handle(), never scan_tapeless_dir itself, and the command
-    # still carries its two fatal preserved defects), so the filter decision
-    # and the descent-authorization read are extracted into helpers this
-    # test DOES cover, until 2.8/FR-37 rebuilds the surrounding call site.
-    "should_scan_entry",
-    "consumed_subdirs_from_results",
+    # Story 2.6 added `should_scan_entry` and `consumed_subdirs_from_results`
+    # here as a stopgap: each command carried its own copy of the recursion,
+    # and check_clips_in_folder's copy landed unexecuted and uncompared, so
+    # the two drift-prone halves were extracted into helpers this test DOES
+    # cover — explicitly "until 2.8/FR-37 rebuilds the surrounding call
+    # site". That is this story. There is now exactly ONE walk, in
+    # scan/coordinator.py, and neither command has a recursion to drift.
+    # `should_scan_entry` moved there with it; the descent-authorization
+    # read became `FolderOutcome.consumed_subdirs`. What is left here is
+    # 1.4's four validators — plus `handle()` below, which is now the whole
+    # of both commands' behavior and is compared in full.
 ]
 
 

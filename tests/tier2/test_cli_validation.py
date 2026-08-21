@@ -16,6 +16,7 @@ from django.contrib.auth.models import User
 from django.core.management import call_command
 from django.core.management.base import CommandError
 
+from portal.plugins.TapelessIngest.models.folder import Folder
 from portal.plugins.TapelessIngest.scan.context import ScanContext
 
 COMMANDS = ["scan_tapeless_dir", "check_clips_in_folder"]
@@ -107,15 +108,20 @@ def test_since_window_reaches_scan_date_window_filter(
     """End-to-end wiring: the computed window must reach the scan.
 
     Same intent as the story-1.4 test this replaces (the window computed
-    in handle() must actually reach the recursion, or the cron's --since
-    filter is silently dead while every pure-helper test stays green).
-    Story 2.6 changed only the CHANNEL: the window is its own depth-1
-    `date_window=` parameter instead of being appended in place onto
-    `args.only`, which is an operator filter applying at every depth.
-    `only` must therefore now arrive UNTOUCHED. The command module's OWN
-    `scan_tapeless_dir` and `CustomLogger` attributes are minimally
-    monkeypatched (our module, sanctioned — not portal mocking; since story
-    1.5 the real config read tolerates an absent portal.conf via
+    in handle() must actually reach the walk, or the cron's --since filter
+    is silently dead while every pure-helper test stays green).
+
+    Story 2.6 changed the SEMANTICS: the window became its own depth-1
+    filter instead of being appended in place onto `args.only`, which is
+    an operator filter applying at every depth, so `only` must arrive
+    UNTOUCHED. Story 2.8 changed only the CHANNEL again — both now travel
+    on the run context as `RunOptions` fields (tuples, because the context
+    is frozen) instead of as loose kwargs of a recursion that lived in the
+    command module. `Folder.scan_tree` is where they arrive.
+
+    `Folder.scan_tree` (PLUGIN code, not Portal) and the command module's
+    OWN `CustomLogger` are minimally monkeypatched (sanctioned — since
+    story 1.5 the real config read tolerates an absent portal.conf via
     fallback=None, so no ConfigParser stub is needed); since story 2.1 the
     storage resolves through the counting StorageHelper fake, so no storage
     cache preset is needed.
@@ -125,12 +131,14 @@ def test_since_window_reaches_scan_date_window_filter(
     )
     captured = {}
 
-    def fake_scan(parent_folder, **kwargs):
-        captured["parent_folder"] = parent_folder
-        captured.update(kwargs)
-        return 0
+    def fake_scan_tree(self, ctx, *, emit):
+        captured["parent_folder"] = self
+        captured["context"] = ctx
+        captured["date_window"] = list(ctx.options.date_window)
+        captured["only"] = list(ctx.options.only)
+        return None
 
-    monkeypatch.setattr(module, "scan_tapeless_dir", fake_scan)
+    monkeypatch.setattr(Folder, "scan_tree", fake_scan_tree)
     monkeypatch.setattr(module, "CustomLogger", _CapturingLogger)
     # No cache.set("storage:VX-41", ...) preset any more (story 2.1): tree
     # mode resolves the storage through the counting StorageHelper fake in

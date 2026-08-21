@@ -1,4 +1,5 @@
 import logging
+import time
 import traceback
 import uuid
 import os
@@ -34,6 +35,20 @@ from portal.plugins.TapelessIngest.scan.adapters import (
     build_provider_registry,
 )
 from portal.plugins.TapelessIngest.scan.context import browse_root_path
+from portal.plugins.TapelessIngest.scan.coordinator import (
+    FolderOutcome,
+    PhaseTimer,
+    SequentialDispatcher,
+    WorkerCounters,
+    WorkerResult,
+    assert_mode_options,
+    build_ingest_response,
+    build_scan_response,
+    fold_timings,
+    merge_results,
+    summary_lines,
+    walk_tree,
+)
 from portal.plugins.TapelessIngest.scan.extraction import (
     applicable_providers,
     consumed_subdirs,
@@ -175,6 +190,172 @@ def _persist_recovered_item_ids(recovered_item_ids):
                 default=F("item_id"),
             )
         )
+
+
+def providers_for_worker(ctx):
+    """The provider registry THIS worker must use (AD-7).
+
+    A function, not an injected callable and not a parameter of any
+    signature: today every worker shares the run's registry, and Epic 3
+    redefines this one function to hand out per-worker instances. The
+    deferred-work entry about shared mutable provider state
+    (``self.folder``, ``self.base_path``, ``self.index_xml`` on cached
+    provider instances) is what it exists for; this story ships only the
+    seam.
+    """
+    return ctx.provider_registry
+
+
+def _folder_worker(folder, ctx, *, first, number, cursor, count_only, ingest):
+    """Run one folder's pipeline and freeze it into a ``FolderOutcome``.
+
+    The body BOTH entry modes execute: tree mode reaches it through
+    ``process_folder`` (which opens its own ``Folder`` first), the paged
+    façades call it with the instance they were invoked on, so a
+    Portal/UI caller keeps every side effect the pre-2.8 ``scan()`` left
+    on it (``provider_names``, ``scanned_on``, ``clips_total``,
+    ``collection_id`` — ``views.py`` serializes the folder afterwards).
+
+    It may RAISE: the paged façades must keep failing where they always
+    failed, and it is ``process_folder`` — the tree-mode wrapper — that
+    owns the never-raising contract.
+    """
+    timer = PhaseTimer()
+    if ingest:
+        response = folder._ingest_pass(
+            ctx, first=first, number=number, cursor=cursor, timer=timer
+        )
+    else:
+        response = folder._scan_pass(
+            ctx,
+            first=first,
+            number=number,
+            cursor=cursor,
+            count_only=count_only,
+            timer=timer,
+        )
+    errors = tuple(response["errors"])
+    counters = WorkerCounters(
+        hits=response["hits"],
+        created=response["created"],
+        already_ingested=response["already_ingested"],
+        processed=response["processed"],
+        ingested=response.get("ingested", 0),
+        skipped=response.get("skipped", 0),
+        failed=response.get("failed", 0),
+        replaced=response.get("replaced", 0),
+    )
+    log_lines = ()
+    # FR-22: log whenever there is anything to report. Before 2.6 the whole
+    # line was gated on hits > 0, so a zero-hit folder's errors were
+    # swallowed together with it. The line is BUILT here and EMITTED by the
+    # coordinator (AD-12), which is what makes ordered draining possible.
+    if counters.hits > 0 or errors:
+        error_message = ""
+        if errors:
+            error_string = "\n".join(errors)
+            error_message += f": {error_string}"
+        log_lines = (
+            f"found {counters.hits} clips in {folder.path}, "
+            f"{counters.already_ingested} already ingested, "
+            f"{counters.created} created, providers are {folder.provider_names}, "
+            f"{counters.ingested} ingested, {counters.skipped} skipped, "
+            f"{counters.replaced} replaced, {len(errors)} errors "
+            f"encountered{error_message}",
+        )
+    return FolderOutcome(
+        result=WorkerResult(
+            folder_path=folder.path,
+            clips=tuple(response["clips"]),
+            counters=counters,
+            errors=errors,
+            timings=timer.freeze(),
+            log_lines=log_lines,
+        ),
+        # `.get()`, not `[...]`: a response that cannot say what it
+        # consumed must never be trusted to authorize a descent (2.6).
+        consumed_subdirs=response.get("consumed_subdirs"),
+        # Per-file errors never fail a FOLDER — today's `count += 1` counted
+        # a zero-hit folder with two unreadable files as scanned.
+        failed=False,
+    )
+
+
+def _failed_folder_outcome(path, message):
+    """The zero-counter outcome a caught folder-boundary exception yields.
+
+    The template lands in BOTH ``errors`` and ``log_lines``: the operator's
+    cron/Slack report is built from log lines, the error accounting from
+    errors, and before 2.8 the same string served both. ``log.error(...,
+    exc_info=True)`` is ADDITIONAL — a traceback in portal.log is not a
+    substitute for the line the operator actually reads.
+    """
+    log.error(message, exc_info=True)
+    return FolderOutcome(
+        result=WorkerResult(
+            folder_path=path,
+            errors=(message,),
+            log_lines=(message,),
+        ),
+        # DOUBT: a folder that died can say nothing about what it consumed.
+        consumed_subdirs=None,
+        failed=True,
+    )
+
+
+def process_folder(
+    storage_id,
+    path,
+    ctx,
+    *,
+    first=0,
+    number=25,
+    cursor=None,
+    count_only=False,
+    ingest=False,
+):
+    """One folder, end to end — and it NEVER raises.
+
+    Module-level rather than a bound method because the coordinator that
+    calls it is ORM-free by contract: it hands over a ``(storage_id,
+    path)`` pair and this function opens the ``Folder`` on the model side
+    of the boundary. Epic 3 wraps exactly this call with per-worker
+    connection hygiene, which is why the ORM must not cross it.
+
+    ``ingest`` selects the scan or ingest SHAPE; whether ingestion writes
+    anything stays governed by ``ctx.options.dry_run``.
+
+    Only ``Exception`` is caught. ``BaseException`` — ``KeyboardInterrupt``,
+    ``SystemExit`` — deliberately propagates, so an operator can still
+    stop a run that is doing the wrong thing to 8,000 folders.
+    """
+    try:
+        folder, _is_new = Folder.get_or_new(storage_id=storage_id, path=path)
+        # Seed the memoized root from the run context BEFORE any property
+        # access, so neither this folder's scan nor the walk's own listing
+        # re-resolves the storage (real once-per-run, FR-7).
+        root_path = ctx.root_path_for(storage_id)
+        if root_path:
+            folder._root_path = root_path
+        return _folder_worker(
+            folder,
+            ctx,
+            first=first,
+            number=number,
+            cursor=cursor,
+            count_only=count_only,
+            ingest=ingest,
+        )
+    except FileNotFoundError:
+        # Formatted from the (storage_id, path) this worker was HANDED.
+        # The pre-2.8 handler read `folder.path` from a name that is
+        # unbound whenever get_or_new itself was what raised — one folder
+        # taking the run down with a NameError inside the error path.
+        return _failed_folder_outcome(path, f"Path doesn't exists anymore: {path}")
+    except TapelessIngestException as e:
+        return _failed_folder_outcome(path, f"Error ingesting {path}: {e}")
+    except Exception as e:
+        return _failed_folder_outcome(path, f"Error scanning {path}: {e}")
 
 
 class Folder(models.Model):
@@ -555,6 +736,13 @@ class Folder(models.Model):
         *,
         context=None,
     ):
+        """Paged mode (AD-14): today's signature, today's response.
+
+        A thin rebuilder since story 2.8 — resolve the context, run the one
+        shared worker body, rebuild the frozen NFR-5 response from its
+        ``WorkerResult``. Keys, templates and types are unchanged, and the
+        values are LISTS in order, exactly as the story-1.3 pins assert.
+        """
         scan_context = context
         if scan_context is None:
             # Paged callers keep today's signature: a default context is
@@ -565,17 +753,40 @@ class Folder(models.Model):
                 providers=providers,
                 legacy_storages=legacy_storages,
             )
-        else:
-            # A passed context's options are authoritative (the commands
-            # pass the same values as kwargs — equal by construction; if a
-            # caller's kwargs ever diverge, the context wins by design).
-            user = scan_context.options.user
-            providers = scan_context.options.providers
-            legacy_storages = scan_context.options.legacy_storages
+        # AD-14's policeable half, immediately after ctx resolution.
+        try:
+            assert_mode_options(scan_context.options, "paged")
+        except ValueError as e:
+            raise TapelessIngestException(str(e)) from e
+        return build_scan_response(
+            _folder_worker(
+                self,
+                scan_context,
+                first=first,
+                number=number,
+                cursor=cursor,
+                count_only=count_only,
+                ingest=False,
+            )
+        )
+
+    def _scan_pass(self, scan_context, *, first, number, cursor, count_only, timer):
+        """The scan pipeline over one folder, timed. Raises.
+
+        A passed context's options are AUTHORITATIVE. Before 2.8 the
+        commands passed the same values as kwargs as well (equal by
+        construction); with the walk relocated into the coordinator the
+        context is the only channel left, so there is nothing to diverge.
+
+        ``timer`` is this folder's own accumulator — never the run's shared
+        ``ctx.timings``, which has exactly one writer.
+        """
+        providers = scan_context.options.providers
+        legacy_storages = scan_context.options.legacy_storages
         # The context carries the registry and its extension map. When the
         # registry could not be built (an unresolvable provider name), this
         # fallback is where that name raises, as it always has.
-        provider_list = scan_context.provider_registry
+        provider_list = providers_for_worker(scan_context)
         if provider_list is None:
             provider_list = Clip._get_provider_list(providers)
         extension_map = scan_context.extension_map
@@ -640,12 +851,15 @@ class Folder(models.Model):
                 result_number = number
                 if number == 0:
                     result_number = 100
-                search_result = query_elastic(
-                    search_doc,
-                    doc_type=["file"],
-                    first=first,
-                    number=result_number,
-                )
+                # The `discovery` phase, ACCUMULATING across every page of
+                # this folder — Epic 4 replaces what happens inside it.
+                with timer("discovery"):
+                    search_result = query_elastic(
+                        search_doc,
+                        doc_type=["file"],
+                        first=first,
+                        number=result_number,
+                    )
                 hits = search_result["hits"]["hits"]
                 response["hits"] = search_result["hits"]["total"]["value"]
                 self.clips_total = response["hits"]
@@ -680,7 +894,9 @@ class Folder(models.Model):
                             # — the one residual TOCTOU direction,
                             # deliberate under AD-4.
                             file_absolute_path = os.path.join(root_path, file.getPath())
-                            if not listings.exists(file_absolute_path):
+                            with timer("verification"):
+                                verified = listings.exists(file_absolute_path)
+                            if not verified:
                                 raise TapelessIngestException(
                                     f"File {file} does not exist ({file_absolute_path})"
                                 )
@@ -695,11 +911,12 @@ class Folder(models.Model):
                                 file_providers = applicable_providers(
                                     file.getFileName(), extension_map
                                 )
-                            metadatas = Clip.extract_file_metadatas(
-                                file,
-                                file_providers,
-                                provider_context,
-                            )
+                            with timer("extraction"):
+                                metadatas = Clip.extract_file_metadatas(
+                                    file,
+                                    file_providers,
+                                    provider_context,
+                                )
                             record["file"] = file
                             record["metadatas"] = metadatas
                         except Exception as e:
@@ -788,19 +1005,20 @@ class Folder(models.Model):
             # clips, one transaction, a bounded number of statements —
             # and the Folder row written at most once per invocation.
             try:
-                persist_scan_results(
-                    self,
-                    build_persistence_plan(
-                        candidates,
-                        folder_fields={
-                            field_name: getattr(self, field_name)
-                            for field_name in FOLDER_SCAN_FIELDS
-                        },
-                        provider_hits=len(providers),
-                        recovered_item_ids=recovered_item_ids,
-                    ),
-                    dry_run=scan_context.options.dry_run,
-                )
+                with timer("persistence"):
+                    persist_scan_results(
+                        self,
+                        build_persistence_plan(
+                            candidates,
+                            folder_fields={
+                                field_name: getattr(self, field_name)
+                                for field_name in FOLDER_SCAN_FIELDS
+                            },
+                            provider_hits=len(providers),
+                            recovered_item_ids=recovered_item_ids,
+                        ),
+                        dry_run=scan_context.options.dry_run,
+                    )
             except DatabaseError as e:
                 # The transaction rolled back: this folder wrote nothing.
                 # Reporting it is the whole point — an escaping exception
@@ -870,16 +1088,11 @@ class Folder(models.Model):
         *,
         context=None,
     ):
-        if context is not None:
-            # A passed context's options are authoritative (the commands
-            # pass the same values as kwargs — equal by construction; if a
-            # caller's kwargs ever diverge, the context wins by design).
-            user = context.options.user
-            providers = context.options.providers
-            legacy_storages = context.options.legacy_storages
-            replace = context.options.replace
-            dry_run = context.options.dry_run
-        else:
+        """Paged mode (AD-14): the scan keys plus the four ingest counters.
+
+        A thin rebuilder since story 2.8, like ``scan``.
+        """
+        if context is None:
             # Paged mode: build the default context HERE so it carries this
             # call's actual dry_run/replace/user/providers — scan's own
             # default build could not know them and would misreport the
@@ -892,83 +1105,164 @@ class Folder(models.Model):
                 legacy_storages=legacy_storages,
                 replace=replace,
             )
-        response = self.scan(
+        # AD-14's policeable half, immediately after ctx resolution.
+        try:
+            assert_mode_options(context.options, "paged")
+        except ValueError as e:
+            raise TapelessIngestException(str(e)) from e
+        return build_ingest_response(
+            _folder_worker(
+                self,
+                context,
+                first=first,
+                number=number,
+                cursor=cursor,
+                count_only=False,
+                ingest=True,
+            )
+        )
+
+    def _ingest_pass(self, context, *, first, number, cursor, timer):
+        """The scan pipeline plus the 2.5 ladder and the submission leg.
+
+        A passed context's options are authoritative — see ``_scan_pass``.
+        """
+        user = context.options.user
+        providers = context.options.providers
+        legacy_storages = context.options.legacy_storages
+        replace = context.options.replace
+        dry_run = context.options.dry_run
+        response = self._scan_pass(
+            context,
             first=first,
             number=number,
             cursor=cursor,
-            user=user,
-            providers=providers,
-            legacy_storages=legacy_storages,
-            context=context,
+            count_only=False,
+            timer=timer,
         )
         # scan()'s own dict is returned, so `consumed_subdirs` (story 2.6)
         # reaches the recursion through ingest() unchanged — the ingest
         # counters are added ON TOP of the scan keys, none is replaced.
         for key in ["ingested", "skipped", "failed", "replaced"]:
             response[key] = 0
-        # The ladder (AD-15): decide who is worth a Vidispine call
-        # BEFORE spending any. `has_hash` comes from the scan-cached
-        # file only — Clip.file would buy one getFileById per clip.
-        #
-        # Story 2.7: the ladder is PURE, so it runs in both modes and its
-        # verdict is counted in both. A dry run is a rehearsal that
-        # reports what a real run would do, not a mute one.
-        to_ingest, skipped_reasons = select_clips_to_ingest(
-            (_ingest_state(clip) for clip in response["clips"]),
-            providers=providers,
-            replace=replace,
-        )
-        for clip, reason in skipped_reasons:
-            # An item_id-bearing clip counted `skipped` before too —
-            # import_file's early return did it, several HTTP calls
-            # later. The hash-less one is new (NFR-1): no exception,
-            # no legacy match, no ingest, retried next run.
-            response["skipped"] += 1
-            log.info(f"Skipping clip {clip}: {_skip_reason_message(clip, reason)}")
-        if dry_run:
-            # WOULD-BE ingests. Every ladder-selected clip is one this run
-            # would have submitted — replacements included, because under
-            # dry-run there is no replacement OUTCOME to report: nothing
-            # was replaced. `failed`/`replaced` and the share of `skipped`
-            # that `Clip.import_file` decides on its own stay 0 for the
-            # same structural reason — no submission occurred. So dry-run
-            # `ingested` is an UPPER bound on a real run's and dry-run
-            # `skipped` a LOWER bound; they coincide exactly when every
-            # submission succeeds.
-            response["ingested"] += len(to_ingest)
-        else:
-            if to_ingest:
-                # Collection resolution (a VS search/create per path level)
-                # is worth its calls only once a clip will actually ingest.
-                self.collection_id = self.getCollection(user)
-                # The row exists: the scan's write unit wrote it before
-                # this point. Targeted update, not a full save (AD-6).
-                self.save(update_fields=["collection_id"])
-            for clip in to_ingest:
-                try:
-                    result = clip.ingest(
-                        user=user,
-                        collection_id=self.collection_id,
-                        folder=self,
-                        replace=replace,
-                        legacy_storages=legacy_storages,
-                        # A clip whose previous import left a placeholder
-                        # and no job would otherwise hit import_file's
-                        # "item already exists" early return and be
-                        # skipped forever. This lifts THAT return only —
-                        # an item holding real files is still skipped.
-                        retry_incomplete=_incomplete_import(clip),
-                    )
-                    for key, value in result.items():
-                        if key not in response.keys():
-                            response[key] = 0
-                        if value is True:
-                            response[key] += 1
-                except Exception as e:
-                    log.error(
-                        f"Error ingesting clip {clip}: {e}",
-                        exc_info=True,
-                    )
-                    response["errors"].append(f"Error ingesting clip {clip}: {e}")
+        # The `ingest` phase: the ladder, the collection resolution it
+        # gates, and the submission leg. The ladder is timed with them
+        # deliberately — it is what a dry run's ingest phase CONSISTS of,
+        # and a rehearsal reporting 0.0s would be lying about its cost.
+        with timer("ingest"):
+            # The ladder (AD-15): decide who is worth a Vidispine call
+            # BEFORE spending any. `has_hash` comes from the scan-cached
+            # file only — Clip.file would buy one getFileById per clip.
+            #
+            # Story 2.7: the ladder is PURE, so it runs in both modes and
+            # its verdict is counted in both. A dry run is a rehearsal that
+            # reports what a real run would do, not a mute one.
+            to_ingest, skipped_reasons = select_clips_to_ingest(
+                (_ingest_state(clip) for clip in response["clips"]),
+                providers=providers,
+                replace=replace,
+            )
+            for clip, reason in skipped_reasons:
+                # An item_id-bearing clip counted `skipped` before too —
+                # import_file's early return did it, several HTTP calls
+                # later. The hash-less one is new (NFR-1): no exception,
+                # no legacy match, no ingest, retried next run.
+                response["skipped"] += 1
+                log.info(f"Skipping clip {clip}: {_skip_reason_message(clip, reason)}")
+            if dry_run:
+                # WOULD-BE ingests. Every ladder-selected clip is one this
+                # run would have submitted — replacements included, because
+                # under dry-run there is no replacement OUTCOME to report:
+                # nothing was replaced. `failed`/`replaced` and the share of
+                # `skipped` that `Clip.import_file` decides on its own stay
+                # 0 for the same structural reason — no submission occurred.
+                # So dry-run `ingested` is an UPPER bound on a real run's
+                # and dry-run `skipped` a LOWER bound; they coincide exactly
+                # when every submission succeeds.
+                response["ingested"] += len(to_ingest)
+            else:
+                if to_ingest:
+                    # Collection resolution (a VS search/create per path
+                    # level) is worth its calls only once a clip will
+                    # actually ingest.
+                    self.collection_id = self.getCollection(user)
+                    # The row exists: the scan's write unit wrote it before
+                    # this point. Targeted update, not a full save (AD-6).
+                    self.save(update_fields=["collection_id"])
+                for clip in to_ingest:
+                    try:
+                        result = clip.ingest(
+                            user=user,
+                            collection_id=self.collection_id,
+                            folder=self,
+                            replace=replace,
+                            legacy_storages=legacy_storages,
+                            # A clip whose previous import left a placeholder
+                            # and no job would otherwise hit import_file's
+                            # "item already exists" early return and be
+                            # skipped forever. This lifts THAT return only —
+                            # an item holding real files is still skipped.
+                            retry_incomplete=_incomplete_import(clip),
+                        )
+                        for key, value in result.items():
+                            if key not in response.keys():
+                                response[key] = 0
+                            if value is True:
+                                response[key] += 1
+                    except Exception as e:
+                        log.error(
+                            f"Error ingesting clip {clip}: {e}",
+                            exc_info=True,
+                        )
+                        response["errors"].append(f"Error ingesting clip {clip}: {e}")
 
         return response
+
+    def scan_tree(self, ctx, *, emit):
+        """Tree mode's entry point — and the coordinator's (AD-12/AD-14).
+
+        This IS the coordinator: it brackets the run with
+        ``time.monotonic()``, runs the walk, drains every folder's log
+        lines through ``emit`` in merge-key order, folds the merged
+        timings into ``ctx.timings`` (the only writer of that slot) and
+        emits the summary. ``handle()`` does none of it — it calls this
+        and then makes its single Slack call.
+
+        ``emit`` is keyword-only and deliberately NOT a field on
+        ``ScanContext``: workers receive ``ctx``, so keeping the sink off
+        it makes worker emission structurally impossible rather than
+        merely forbidden.
+
+        There is no pagination surface here, which is the structural form
+        of AD-14's "pagination params are illegal in tree mode" —
+        ``number=0`` inside the walk is the loop-all-pages sentinel, not a
+        pagination argument.
+
+        Returns the merged ``RunResult``, never a tuple.
+        """
+        try:
+            assert_mode_options(ctx.options, "tree")
+        except ValueError as e:
+            raise TapelessIngestException(str(e)) from e
+        started = time.monotonic()
+        # The sequential fan-out. Epic 3 substitutes executor.submit /
+        # as_completed for these two bound methods and changes nothing
+        # else: the tree-derived merge key already makes the output
+        # independent of completion order.
+        dispatcher = SequentialDispatcher()
+        outcomes = walk_tree(
+            self.storage_id,
+            self.path,
+            ctx=ctx,
+            process_folder=process_folder,
+            dispatch=dispatcher.dispatch,
+            gather=dispatcher.gather,
+            emit=emit,
+        )
+        run_result = merge_results(outcomes)
+        for line in run_result.log_lines:
+            emit(line)
+        fold_timings(ctx, run_result.timings)
+        for line in summary_lines(run_result, ctx, time.monotonic() - started):
+            emit(line)
+        return run_result

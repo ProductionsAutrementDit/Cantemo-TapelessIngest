@@ -114,11 +114,21 @@ def build_context(
     providers: Optional[List[str]],
     legacy_storages: Optional[List[str]],
     replace: bool,
+    skip: Optional[Iterable[str]] = None,
+    only: Optional[Iterable[str]] = None,
+    startwith: Optional[Iterable[str]] = None,
+    date_window: Optional[Iterable[str]] = None,
 ) -> ScanContext:
     """Build the one per-run context for tree mode (commands' ``handle()``).
 
     The provider registry and its extension map are built once here and
     reused by every folder of the run.
+
+    The four folder filters arrive as argparse lists (or ``None``) and are
+    converted to tuples: ``RunOptions`` is frozen, and a list field would
+    let a caller mutate a "frozen" run option under the walk's feet — the
+    exact aliasing bug story 2.6 removed from the date window. They default
+    to ``None`` so every pre-2.8 call site compiles untouched.
     """
     registry, extension_map = _build_registry_and_map(providers)
     return ScanContext(
@@ -129,6 +139,10 @@ def build_context(
             legacy_storages=legacy_storages,
             replace=replace,
             user=user,
+            skip=tuple(skip or ()),
+            only=tuple(only or ()),
+            startwith=tuple(startwith or ()),
+            date_window=tuple(date_window or ()),
         ),
         provider_registry=registry,
         extension_map=extension_map,
