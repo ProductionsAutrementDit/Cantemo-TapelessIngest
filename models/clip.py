@@ -1195,6 +1195,12 @@ class Clip(models.Model):
         all_files = extra_files + [main_file]
         audio_count, video_count = self._count_media_components(all_files)
 
+        # Codemill declares the component count first, then imports every extra
+        # component, and imports the main file LAST — the main import is what
+        # closes the placeholder, so it must see a complete component set. Keep
+        # that order. It differs on the count itself: Codemill only ever handles
+        # spanned video (``video=len(extra) + 1``), whereas an extra here can be
+        # a P2 audio track, so the count is taken per type.
         if shape_id:
             log.info(
                 f"Importing {self.item_id}: Found shape {shape_id}, updating components count to {video_count} video components and {audio_count} audio component"
@@ -1214,9 +1220,17 @@ class Clip(models.Model):
             query=query,
         )
 
+        # Components carry no shape tag and no ingest profile, matching
+        # Codemill's ``ItemHelper.importFileToPlaceholder``, which sends a bare
+        # ``{'fileId': ...}`` for every extra component and puts the tag and the
+        # ``jobmetadata`` groups on the main import alone. A tag here asks
+        # Vidispine to derive a shape from one component in isolation — for a P2
+        # clip that means transcoding a single audio track to a video preset.
+        # ``ignore_sidecars`` has no Codemill counterpart: it postdates 2.2.0 and
+        # is what the single-component path already passes.
         for extra_file in extra_files:
             if extra_file["type"] in ["audio", "video"]:
-                q = {"fileId": extra_file["file_id"], "tag": "lowres"}
+                q = {"fileId": extra_file["file_id"]}
                 log.info(
                     f"Importing {self.item_id}: Import file {extra_file['file_id']}:{extra_file['path']} to component {extra_file['type']}..."
                 )
@@ -1226,7 +1240,6 @@ class Clip(models.Model):
                     component=extra_file["type"],
                     runasuser=user,
                     ignore_sidecars=True,
-                    ingestprofile_groups=user_groups,
                 )
                 component_job_id = job_id_from_response(component_res)
                 if component_job_id:

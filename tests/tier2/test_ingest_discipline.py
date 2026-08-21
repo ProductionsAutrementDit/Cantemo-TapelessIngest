@@ -513,12 +513,20 @@ class _ItemAPIFake:
     def __init__(self, response):
         self.response = response
         self.calls = []
+        self.imports = []
 
     def updatePlaceholderComponentCount(self, item_id, shape_id, **kwargs):
         self.calls.append(("count", item_id, shape_id))
 
     def doImportToPlaceholder(self, item_id=None, **kwargs):
         self.calls.append(("import", item_id, kwargs.get("component", "container")))
+        self.imports.append(
+            {
+                "component": kwargs.get("component", "container"),
+                "query": dict(kwargs.get("query") or {}),
+                "kwargs": kwargs,
+            }
+        )
         return self.response
 
 
@@ -607,6 +615,75 @@ def test_multi_component_import_with_a_job_id_is_an_ingest(migrated_db):
 
     assert imported is True
     assert clip.job_id == "VX-77"
+
+
+def _multi_component_import(item_helper, extras):
+    """Drive ``_import_multi_component`` with a P2-shaped clip."""
+    clip = Clip(umid="CODEMILL-ORDER", item_id="VX-100")
+    clip._import_multi_component(
+        {"file_id": "VX-41-MAIN", "path": "main.mxf", "type": "video"},
+        extras,
+        "VX-100-SHAPE",
+        ["Admin"],
+        None,
+        None,
+        item_helper,
+        _JobHelperFake(),
+    )
+    return item_helper.itemapi
+
+
+def test_components_are_declared_then_imported_before_the_main_file(migrated_db):
+    """Codemill's order: declare the count, import components, main file LAST.
+
+    The main import closes the placeholder, so it has to see a complete
+    component set. Reversing this leaves Vidispine deriving a shape from a
+    partial set.
+    """
+    api = _multi_component_import(
+        _ItemHelperFake({"jobId": "VX-77"}),
+        [
+            {"file_id": "VX-41-A0", "path": "a0.wav", "type": "audio"},
+            {"file_id": "VX-41-A1", "path": "a1.wav", "type": "audio"},
+        ],
+    )
+
+    assert api.calls == [
+        ("count", "VX-100", "VX-100-SHAPE"),
+        ("import", "VX-100", "audio"),
+        ("import", "VX-100", "audio"),
+        ("import", "VX-100", "container"),
+    ]
+
+
+def test_extra_components_carry_a_bare_file_id(migrated_db):
+    """Codemill sends ``{'fileId': ...}`` per component — no tag, no profile.
+
+    A shape tag on a component asks Vidispine to derive a shape from that
+    component alone; for a P2 clip that is one audio track against a video
+    preset. The tag and the ingest profile belong to the main import.
+    """
+    api = _multi_component_import(
+        _ItemHelperFake({"jobId": "VX-77"}),
+        [{"file_id": "VX-41-A0", "path": "a0.wav", "type": "audio"}],
+    )
+
+    component = next(i for i in api.imports if i["component"] == "audio")
+    assert component["query"] == {"fileId": "VX-41-A0"}
+    assert "ingestprofile_groups" not in component["kwargs"]
+
+
+def test_the_main_import_still_carries_the_tag_and_the_ingest_groups(migrated_db):
+    """The counterpart: stripping the components must not strip the main file."""
+    api = _multi_component_import(
+        _ItemHelperFake({"jobId": "VX-77"}),
+        [{"file_id": "VX-41-A0", "path": "a0.wav", "type": "audio"}],
+    )
+
+    main = next(i for i in api.imports if i["component"] == "container")
+    assert main["query"]["fileId"] == "VX-41-MAIN"
+    assert main["query"]["tag"] == "lowres"
+    assert main["kwargs"]["ingestprofile_groups"] == ["Admin"]
 
 
 def test_a_failed_import_counts_failed_and_never_ingested(
