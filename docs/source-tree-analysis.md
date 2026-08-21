@@ -11,7 +11,6 @@ TapelessIngest/
 ├── serializers.py              # 📦 DRF serializers - API data formatting
 ├── forms.py                    # 📝 Django forms - Admin forms
 ├── helpers.py                  # 🔧 Utility functions
-├── helpers_bk.py               # 📁 Backup of helpers (legacy)
 ├── utilities.py                # 🔧 Additional utilities
 ├── metadatas.py                # 📋 XML metadata parsing
 ├── errors.py                   # ❌ Custom exceptions

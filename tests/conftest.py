@@ -75,11 +75,12 @@ class FakeProvider:
     """Deterministic provider double, injected via the Clip._PROVIDER_CACHE seam.
 
     Real providers are unusable off-server (`file` shells out to ffprobe, the
-    others parse card structures). Like real providers, getMetadatasFromFile
-    mutates the shared `metadatas` dict in place and returns it with the
-    context; the umid is derived deterministically from the full storage path
-    (extension stripped) so same-named files in different directories never
-    collide.
+    others parse card structures). Like real providers under AD-7 (story
+    2.3), getMetadatasFromFile mutates the shared `metadatas` dict in place
+    and returns THE METADATAS ONLY — `context` stays an argument and stays
+    mutable in place. The umid is derived deterministically from the full
+    storage path (extension stripped) so same-named files in different
+    directories never collide.
 
     Every getMetadatasFromFile call records `context.get("scan_context")`
     in `seen_scan_contexts` and `context.get("listings")` in
@@ -110,7 +111,7 @@ class FakeProvider:
         self.seen_listings.append(context.get("listings"))
         metadatas["provider"] = self.machine_name
         metadatas["umid"] = os.path.splitext(media_file.getPath())[0]
-        return metadatas, context
+        return metadatas
 
 
 @pytest.fixture(autouse=True)

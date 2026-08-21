@@ -38,7 +38,16 @@ class Provider(BaseProvider):
         self.clips_file_extension = ".RDC"
 
     def getExtensions(self):
-        return ["_001.r3d"]
+        # BOTH suffixes are declared on purpose (story 2.3, BLOCKER ruling):
+        # `_001.r3d` is the ES-wildcard narrow form this provider has always
+        # advertised, `.r3d` makes the pre-filter a SUPERSET of the runtime
+        # guard below (`file_extension == ".R3D"`), which is what actually
+        # decides. Without `.r3d`, an uppercase non-`_001` file such as
+        # `X_002.R3D` would stop reaching red and flip to the `file`
+        # provider — a different UMID, a different primary key.
+        # Golden-doc-inert: `.r3d` is already declared by providers/file.py,
+        # and build_search_doc de-duplicates extensions through `set()`.
+        return ["_001.r3d", ".r3d"]
 
     def getFilters(self, escaped_path):
         return [
@@ -89,7 +98,10 @@ class Provider(BaseProvider):
             metadatas["extension"] = file_extension
             media_absolute_path = self.get_file_absolute_path(media_file, context)
             metadatas = self.getAllClipMetadatas(media_absolute_path, metadatas)
-        return metadatas, context
+        # AD-7 (story 2.3): metadatas only; `context` stays an argument.
+        # The `== ".R3D"` guard above is what decides — the pre-filter only
+        # has to be a superset of it.
+        return metadatas
 
     def getClipMainMediaFile(self, clip, rebuild=False):
         if clip.file is None or rebuild:

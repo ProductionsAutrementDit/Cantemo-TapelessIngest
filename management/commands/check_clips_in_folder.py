@@ -40,6 +40,7 @@ from configparser import ConfigParser
 
 from portal.plugins.TapelessIngest.models.folder import Folder
 from portal.plugins.TapelessIngest.helpers import TapelessIngestException
+from portal.plugins.TapelessIngest.providers import PROVIDER_NAMES
 from portal.plugins.TapelessIngest.scan import adapters
 
 SLACK_ACCESS_TOKEN = None
@@ -133,16 +134,10 @@ class CustomLogger:
 logger = None
 
 
-PROVIDERS = [
-    "panasonicP2",
-    "xdcam",
-    "hdslr",
-    "zoom",
-    "red",
-    "avchd",
-    "atomos",
-    "file",
-]
+# Module-level alias over the ONE canonical membership tuple (story
+# 2.3). Kept, not removed: it is this command's --providers default AND
+# the golden-doc recorder (tests/tier1/build_golden_doc.py) imports it.
+PROVIDERS = list(PROVIDER_NAMES)
 
 LEGACY_STORAGES = ["VX-2", "VX-26", "VX-11"]
 

@@ -26,16 +26,6 @@ from portal.plugins.TapelessIngest.models.settings import Settings  # type: igno
 from portal.plugins.TapelessIngest.scan.context import browse_root_path
 
 log = logging.getLogger(__name__)
-PROVIDERS_LIST = [
-    "panasonicP2",
-    "xdcam",
-    "hdslr",
-    "zoom",
-    "red",
-    "avchd",
-    "atomos",
-    "file",
-]
 
 
 class TapelessIngestException(Exception):

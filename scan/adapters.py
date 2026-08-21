@@ -12,12 +12,14 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from portal.vidispine.istorage import StorageHelper
 
+from portal.plugins.TapelessIngest.providers import PROVIDER_NAMES
 from portal.plugins.TapelessIngest.scan.context import (
     RunOptions,
     ScanContext,
     StorageInfo,
     browse_root_path,
 )
+from portal.plugins.TapelessIngest.scan.extraction import build_extension_map
 
 log = logging.getLogger(__name__)
 
@@ -54,6 +56,49 @@ def resolve_storages(storage_ids: Iterable[str]) -> Dict[str, StorageInfo]:
     return storages
 
 
+def build_provider_registry(names: Optional[Iterable[str]] = None) -> tuple:
+    """Instantiate the provider registry for ``names`` (AD-1: adapter-side).
+
+    ``None`` means the canonical ``PROVIDER_NAMES`` tuple. Instantiation
+    goes through ``Clip.get_provider_by_name`` so the ``_PROVIDER_CACHE``
+    test seam (and its process-wide instance reuse) is preserved — the
+    registry holds exactly the same instances ``Clip._get_provider_list``
+    hands out. Order follows ``names``; duplicates are kept, exactly as
+    ``_get_provider_list`` keeps them today.
+
+    Imported lazily: ``models.clip`` pulls in Django models and Portal,
+    and ``models.folder`` imports this module.
+    """
+    from portal.plugins.TapelessIngest.models.clip import Clip
+
+    if names is None:
+        names = PROVIDER_NAMES
+    return tuple(Clip.get_provider_by_name(name) for name in names)
+
+
+def _build_registry_and_map(providers: Optional[List[str]]):
+    """Registry + extension map for a context, or ``(None, None)``.
+
+    A name that does not resolve (today: ``ImportError`` from
+    ``get_provider_by_name``'s ``__import__``) must keep failing where it
+    fails TODAY — inside ``Folder.scan``'s ``Clip._get_provider_list``
+    call, not at context-construction time, which no caller expects to
+    validate provider names. So the build degrades to ``(None, None)``
+    here and ``Folder.scan``'s documented fallback re-raises the very
+    same error at the very same site.
+    """
+    try:
+        registry = build_provider_registry(providers)
+        return registry, build_extension_map(registry)
+    except Exception:
+        log.warning(
+            f"build_provider_registry({providers!r}) failed; the scan will "
+            f"resolve providers the legacy way and surface the error there",
+            exc_info=True,
+        )
+        return None, None
+
+
 def build_context(
     storage_ids: Iterable[str],
     *,
@@ -63,7 +108,13 @@ def build_context(
     legacy_storages: Optional[List[str]],
     replace: bool,
 ) -> ScanContext:
-    """Build the one per-run context for tree mode (commands' ``handle()``)."""
+    """Build the one per-run context for tree mode (commands' ``handle()``).
+
+    The provider registry and its extension map are built ONCE here, from
+    ``providers`` (story 2.3) — the same instantiation cost the old
+    per-call ``_get_provider_list`` paid, now paid once per run.
+    """
+    registry, extension_map = _build_registry_and_map(providers)
     return ScanContext(
         storages=resolve_storages(storage_ids),
         options=RunOptions(
@@ -73,6 +124,8 @@ def build_context(
             replace=replace,
             user=user,
         ),
+        provider_registry=registry,
+        extension_map=extension_map,
     )
 
 
@@ -96,6 +149,7 @@ def build_default_context(
         root_path = folder._root_path
     else:
         root_path = folder.root_path
+    registry, extension_map = _build_registry_and_map(providers)
     return ScanContext(
         storages={
             folder.storage_id: StorageInfo(
@@ -111,4 +165,6 @@ def build_default_context(
             replace=replace,
             user=user,
         ),
+        provider_registry=registry,
+        extension_map=extension_map,
     )

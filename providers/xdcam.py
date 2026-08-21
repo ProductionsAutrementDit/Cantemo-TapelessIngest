@@ -126,8 +126,13 @@ class Provider(BaseProvider):
         media_absolute_path = self.get_file_absolute_path(media_file, context)
         media_dirname = os.path.dirname(media_absolute_path)
         clip_xml = None
-        # Get Metadata File
-        if os.path.isfile(os.path.join(media_dirname, filename + "M01.XML")):
+        # Get Metadata File — FR-16: the sidecar probe is answered from the
+        # scan's batched listings when the context carries them (the media
+        # directory was already scandir'd for verification), else it is
+        # today's os.path.isfile.
+        if self.probe_is_file(
+            os.path.join(media_dirname, filename + "M01.XML"), context
+        ):
             metadatas["clipname"] = filename
             metadatas["clip_xml_file"] = f"./Clip/{filename}M01.XML"
             clip_xml = XMLParser(os.path.join(media_dirname, filename + "M01.XML"))
@@ -137,9 +142,13 @@ class Provider(BaseProvider):
             # So the mediapro_xml context is an dict, keyed by mediapro paths
             if "mediapro_xml" not in context.keys():
                 context["mediapro_xml"] = {}
+            # Deliberately NOT normpath'd: this string is also the
+            # mediapro_xml cache key and the XMLParser argument, both
+            # unchanged. FolderListings normalizes internally, so the
+            # parent-directory probe still shares one lazy scandir.
             mediaproxml_path = os.path.join(media_dirname, "../MEDIAPRO.XML")
             if mediaproxml_path not in context["mediapro_xml"].keys():
-                if os.path.isfile(mediaproxml_path):
+                if self.probe_is_file(mediaproxml_path, context):
                     context["mediapro_xml"][mediaproxml_path] = XMLParser(
                         mediaproxml_path
                     )
@@ -148,7 +157,9 @@ class Provider(BaseProvider):
                     metadatas, context["mediapro_xml"][mediaproxml_path]
                 )
 
-        return metadatas, context
+        # AD-7 (story 2.3): metadatas only; `context` stays an argument and
+        # stays mutable in place (the mediapro_xml cache above).
+        return metadatas
 
         # TODO: add PD-EDL handling
         """"

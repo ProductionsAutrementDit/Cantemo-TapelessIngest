@@ -155,9 +155,13 @@ class Provider(BaseProvider):
         metadata_file_path = os.path.normpath(
             os.path.join(media_dirname, "../CLIPINF/CLIP" + clipname + ".XML")
         )
-        if os.path.isfile(metadata_file_path):
+        # FR-16: parent-directory sidecar probe through the scan's batched
+        # listings when available (one lazy scandir of ../CLIPINF, cached),
+        # else today's os.path.isfile.
+        if self.probe_is_file(metadata_file_path, context):
             metadatas["clipname"] = clipname
             metadatas["clip_xml_file"] = metadata_file_path
             clip_xml = XMLParser(metadata_file_path)
             metadatas = self.getAllClipMetadatas(metadatas, clip_xml)
-        return metadatas, context
+        # AD-7 (story 2.3): metadatas only; `context` stays an argument.
+        return metadatas

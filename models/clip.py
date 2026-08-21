@@ -46,20 +46,17 @@ from portal.plugins.TapelessIngest.models.settings import (
     Settings,
     MetadataMapping,
 )
+from portal.plugins.TapelessIngest.providers import PROVIDER_NAMES
 from portal.plugins.TapelessIngest.scan.context import browse_root_path
+from portal.plugins.TapelessIngest.scan.extraction import extract_metadatas
 
 log = logging.getLogger(__name__)
 
-PROVIDERS_LIST = [
-    "red",
-    "panasonicP2",
-    "xdcam",
-    "hdslr",
-    "zoom",
-    "avchd",
-    "atomos",
-    "file",
-]
+# Back-compat alias over the ONE canonical membership tuple (story 2.3).
+# Pre-2.3 this was a divergent red-first copy; the canonical order is the
+# production cron order and the swap is behaviorally inert (red guards on
+# ``.R3D``, ``file`` stays last, no other key overlap).
+PROVIDERS_LIST = list(PROVIDER_NAMES)
 
 
 class ItemAPIEnhanced(ItemAPI):
@@ -284,16 +281,12 @@ class Clip(models.Model):
             provider_list = cls._get_provider_list()
         if context is None:
             context = {}
-        metadatas = {}
-        for provider in provider_list:
-            provider_metadatas, context = provider.getMetadatasFromFile(
-                file, metadatas, context
-            )
-            if "provider" not in metadatas.keys():
-                continue
-            if "umid" not in metadatas.keys():
-                continue
-            metadatas = provider_metadatas
+        # AD-7 merge loop (story 2.3): every provider in `provider_list`
+        # runs — the list is already pre-filtered to the applicable ones by
+        # the caller — and each contribution is merged. No break on first
+        # match; a provider returning a FRESH dict now contributes, where
+        # before it was silently dropped.
+        metadatas = extract_metadatas(file, provider_list, {}, context)
         if "umid" not in metadatas.keys():
             raise TapelessIngestException("No UMID found in file %s" % file.getPath())
         umid = metadatas["umid"]

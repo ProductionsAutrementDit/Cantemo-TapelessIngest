@@ -26,6 +26,7 @@ from portal.plugins.TapelessIngest.helpers import (
 )
 from portal.plugins.TapelessIngest.scan.adapters import build_default_context
 from portal.plugins.TapelessIngest.scan.context import browse_root_path
+from portal.plugins.TapelessIngest.scan.extraction import applicable_providers
 from portal.plugins.TapelessIngest.scan.verification import FolderListings
 
 log = logging.getLogger(__name__)
@@ -265,14 +266,6 @@ class Folder(models.Model):
         self._tih = TapelessIngestHelper()
         return self._tih
 
-    def get_metadatas_from_file(self, file, context, provider_list):
-        metadatas = {}
-        for provider in provider_list:
-            metadatas, context = provider.getMetadatasFromFile(file, metadatas, context)
-            if "provider" in metadatas.keys():
-                break
-        return metadatas
-
     def build_search_doc(self, provider_list):
         extensions = []
         subpaths = []
@@ -336,7 +329,10 @@ class Folder(models.Model):
         return search_doc
 
     def count(self, user=None, providers=None):
-        provider_list = Clip._get_provider_list()
+        # Story 2.3: the stray `Clip._get_provider_list()` that used to sit
+        # here ignored this method's own `providers` argument and threw its
+        # result away, instantiating every provider as a pure side effect.
+        # `scan` below forwards `providers` and builds the registry once.
         response = self.scan(
             first=0, number=0, user=user, providers=providers, count_only=True
         )
@@ -398,7 +394,14 @@ class Folder(models.Model):
             user = scan_context.options.user
             providers = scan_context.options.providers
             legacy_storages = scan_context.options.legacy_storages
-        provider_list = Clip._get_provider_list(providers)
+        # Registry v2 (story 2.3): the context carries the ONE registry and
+        # its extension map, built once per run (tree) / per paged call.
+        # The legacy resolution is the documented fallback — and the site
+        # where an unknown provider name raises today's ImportError.
+        provider_list = scan_context.provider_registry
+        if provider_list is None:
+            provider_list = Clip._get_provider_list(providers)
+        extension_map = scan_context.extension_map
         providers = []
         response = {
             "clips": [],
@@ -419,6 +422,17 @@ class Folder(models.Model):
             # verification, one os.scandir per unique directory.
             listings = FolderListings()
             search_doc = self.build_search_doc(provider_list)
+            # Named provider_context (not `context`) so the mutable provider
+            # dict never shadows the ScanContext kwarg. Built ONCE per
+            # scan() invocation (story 2.3 — it used to be rebuilt per page,
+            # throwing away xdcam's MEDIAPRO cache at every page boundary);
+            # it never escapes the invocation (AD-4).
+            provider_context = {
+                "folder": self,
+                "clips": [],
+                "scan_context": scan_context,
+                "listings": listings,
+            }
             has_next = True
             while has_next:
                 has_next = False
@@ -431,22 +445,18 @@ class Folder(models.Model):
                     first=first,
                     number=result_number,
                 )
+                hits = search_result["hits"]["hits"]
                 response["hits"] = search_result["hits"]["total"]["value"]
                 self.clips_total = response["hits"]
-                if number == 0 and len(search_result["hits"]["hits"]) == result_number:
+                if number == 0 and len(hits) == result_number:
                     has_next = True
                     first += result_number
-                # Named provider_context (not `context`) so the mutable
-                # provider dict never shadows the ScanContext kwarg — 2.3
-                # builds on this dict.
-                provider_context = {
-                    "folder": self,
-                    "clips": [],
-                    "scan_context": scan_context,
-                    "listings": listings,
-                }
                 if not count_only:
-                    for result in search_result["hits"]["hits"]:
+                    # Deterministic per-page iteration order (FR-4). Sorting
+                    # lives INSIDE the `not count_only` branch on purpose:
+                    # count-only pagination fixtures carry `_source`-less
+                    # hits, which the key would KeyError on.
+                    for result in sorted(hits, key=lambda hit: hit["_source"]["path"]):
                         try:
                             file = VSFile(
                                 result["_source"], settings.VIDISPINE_REPLACE_URLS
@@ -464,13 +474,25 @@ class Folder(models.Model):
                                 raise TapelessIngestException(
                                     f"File {file} does not exist ({file_absolute_path})"
                                 )
+                            # FR-13 pre-filter (story 2.3): only providers
+                            # whose declared suffixes match this filename
+                            # are invoked. Applicability is a SUPERSET of
+                            # each provider's own runtime guard — the guard
+                            # still decides. No map (legacy/degraded
+                            # context) => today's full provider list.
+                            if extension_map is None:
+                                file_providers = provider_list
+                            else:
+                                file_providers = applicable_providers(
+                                    file.getFileName(), extension_map
+                                )
                             (
                                 clip,
                                 provider_context,
                                 created,
                             ) = Clip.get_clip_from_file(
                                 file,
-                                provider_list,
+                                file_providers,
                                 provider_context,
                                 legacy_storages=legacy_storages,
                             )

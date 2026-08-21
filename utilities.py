@@ -5,8 +5,6 @@ import logging
 
 log = logging.getLogger(__name__)
 
-PROVIDERS_LIST = ["panasonicP2", "xdcam", "jvcprohd", "video_file"]
-
 TAGS_FIELD = "portal_mf245404"
 COLLECTION_TAGS_FIELD = "portal_mf423577"
 

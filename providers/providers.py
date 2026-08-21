@@ -122,6 +122,29 @@ class Provider:
             )
         return os.path.join(root_path, file.getPath())
 
+    def probe_is_file(self, path, context=None):
+        """Sidecar existence probe, answered from the scan's listings (FR-16).
+
+        Story 2.3: when the provider context carries the scan's
+        ``FolderListings`` (``context["listings"]``, story 2.2), a sidecar
+        probe costs zero extra ``stat`` calls — the directory was already
+        scandir'd for verification, and a probe into an unlisted directory
+        (xdcam's ``../MEDIAPRO.XML``, panasonicP2's ``../CLIP/…``,
+        ikegami's ``../CLIPINF/…``) lazily scandirs THAT directory once and
+        caches it. ``FolderListings`` normalizes the path internally, so
+        callers keep passing their un-normalized path (it is also a cache
+        key in xdcam) and still hit the same listing.
+
+        Without listings — a legacy/context-less caller, or a relative
+        path, which the verification API refuses by contract — this is
+        exactly today's ``os.path.isfile``.
+        """
+        if context:
+            listings = context.get("listings")
+            if listings is not None and os.path.isabs(path):
+                return listings.is_file(path)
+        return os.path.isfile(path)
+
     def _createDictFromMetadataMapping(self, clip):
         metadata_dict = {}
         clip_metadatas = clip.metadatas
