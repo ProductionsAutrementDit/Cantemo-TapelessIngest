@@ -4,12 +4,13 @@ import logging
 
 import subprocess as sp
 import urllib
-import shlex
+import shutil
 import sys
 import os
 import csv
 from datetime import datetime
 from io import StringIO
+from portal.plugins.TapelessIngest.helpers import TapelessIngestException
 from portal.plugins.TapelessIngest.metadatas import XMLParser
 from portal.plugins.TapelessIngest.models.clip import (
     Clip,
@@ -23,6 +24,73 @@ from portal.plugins.TapelessIngest.providers.providers import (
 )
 
 log = logging.getLogger(__name__)
+
+
+REDLINE_BINARY = "REDline"
+
+# Where REDline is installed when it is NOT on the caller's PATH. Cron is
+# the case that matters: /etc/crontab declares
+# PATH=/sbin:/bin:/usr/sbin:/usr/bin, which does not carry /usr/local/bin,
+# so the nightly scan could not run the binary an interactive shell finds
+# instantly. Every R3D in the run then failed with "No UMID found in file".
+REDLINE_FALLBACK_PATHS = (
+    "/usr/local/bin/REDline",
+    "/usr/bin/REDline",
+    "/opt/red/REDline",
+)
+
+# The columns getAllClipMetadatas reads out of --printMeta 3.
+REDLINE_REQUIRED_COLUMNS = (
+    "Clip Name",
+    "UUID",
+    "Abs TC",
+    "Date",
+    "Timestamp",
+    "Camera Model",
+    "Camera PIN",
+)
+
+
+def configured_redline_path():
+    """The operator's ``Settings.redline_path``, or ``""``.
+
+    Every failure — no settings row, no DB, an older schema without the
+    column — degrades to "not configured" so resolution falls through to
+    discovery. Resolving a binary must never be what breaks a scan.
+    """
+    try:
+        return (Settings.objects.get(pk=1).redline_path or "").strip()
+    except Exception:
+        log.debug("No configured REDline path available", exc_info=True)
+        return ""
+
+
+def _is_executable(path):
+    return bool(path) and os.path.isfile(path) and os.access(path, os.X_OK)
+
+
+def resolve_redline_path():
+    """The REDline to run: configured, then PATH, then known locations.
+
+    Raises:
+        TapelessIngestException: naming the binary and the setting to fill
+            in, so an operator reading the scan report knows where to act.
+    """
+    configured = configured_redline_path()
+    if configured:
+        return configured
+    found = shutil.which(REDLINE_BINARY)
+    if found:
+        return found
+    for candidate in REDLINE_FALLBACK_PATHS:
+        if _is_executable(candidate):
+            return candidate
+    raise TapelessIngestException(
+        f"{REDLINE_BINARY} not found: it is not on PATH "
+        f"({os.environ.get('PATH', '')!r}), not at any of "
+        f"{', '.join(REDLINE_FALLBACK_PATHS)}, and no redline_path is set in "
+        f"the TapelessIngest settings"
+    )
 
 
 # Classe ProviderP2: Récupère les clips à partir des fichiers XML du dossier CLIP
@@ -64,15 +132,44 @@ class Provider(BaseProvider):
         ]
 
     def getAllClipMetadatas(self, media_absolute_path, metadatas):
+        """Read a clip's metadata off REDline's ``--printMeta 3`` CSV.
+
+        No shell: the resolved binary is argv[0] and the media path is its
+        own argument, so a storage root containing spaces
+        (``AA - RUSHES TAPELESS``) needs no quoting round-trip.
+
+        A run that yields no data row RAISES. It used to return
+        ``metadatas`` untouched, which the caller two frames up rewrote
+        into ``No UMID found in file <path>`` — a message that blames the
+        media for what was really a missing binary, an unreadable file or
+        a licence problem, and which cost a full production shoot before
+        anyone could tell those apart.
+        """
+        redline = resolve_redline_path()
         cmd = [
-            "REDline --i "
-            + shlex.quote(media_absolute_path)
-            + " --printMeta 3 --useMeta",
+            redline,
+            "--i",
+            media_absolute_path,
+            "--printMeta",
+            "3",
+            "--useMeta",
         ]
-        p = sp.run(cmd, shell=True, capture_output=True, text=True)
-        csvfile = p.stdout
-        reader = csv.DictReader(StringIO(csvfile), delimiter=",")
-        for row in reader:
+        p = sp.run(cmd, capture_output=True, text=True)
+        rows = list(csv.DictReader(StringIO(p.stdout or ""), delimiter=","))
+        # REDline exits 1 on SUCCESS — a real KOMODO 6K .R3D that prints a
+        # full CSV row still returns 1 — so the exit status cannot gate
+        # parsing. Emptiness of the output is the only usable signal; the
+        # status is kept only to put in the error message.
+        if not rows:
+            raise TapelessIngestException(self._redline_failure(redline, p))
+        for row in rows:
+            missing = [c for c in REDLINE_REQUIRED_COLUMNS if row.get(c) is None]
+            if missing:
+                raise TapelessIngestException(
+                    f"{redline} returned a CSV without {', '.join(missing)} for "
+                    f"{media_absolute_path} (exit {p.returncode}); its output "
+                    f"shape is not the one this provider reads"
+                )
             metadatas["clipname"] = row["Clip Name"]
             metadatas["umid"] = row["UUID"]
             metadatas["timecode"] = row["Abs TC"]
@@ -83,6 +180,23 @@ class Provider(BaseProvider):
             metadatas["device_model"] = row["Camera Model"]
             metadatas["device_serial"] = row["Camera PIN"]
         return metadatas
+
+    @staticmethod
+    def _redline_failure(redline, completed):
+        """The message for a REDline run that produced no metadata row.
+
+        Carries the three things the exit status alone cannot give an
+        operator reading the nightly report: which binary ran, what it
+        exited with, and what it said on stderr.
+        """
+        stderr = (completed.stderr or "").strip()
+        if len(stderr) > 500:
+            stderr = stderr[:500] + "..."
+        detail = f"; stderr: {stderr}" if stderr else " and said nothing on stderr"
+        return (
+            f"{redline} returned no metadata row "
+            f"(exit {completed.returncode}){detail}"
+        )
 
     def getMetadatasFromFile(self, media_file, metadatas, context):
         filename, file_extension = os.path.splitext(media_file.getFileName())

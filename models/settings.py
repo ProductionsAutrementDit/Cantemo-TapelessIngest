@@ -14,6 +14,10 @@ class Settings(models.Model):
     bmxtranswrap = models.CharField(max_length=255, blank=True, default="")
     mxf2raw = models.CharField(max_length=255, blank=True, default="")
     ffmpeg_path = models.CharField(max_length=255, blank=True, default="")
+    # Read by providers/red.py. Empty means "discover it": PATH first,
+    # then the known install locations. Fill it in only when REDline
+    # lives somewhere unusual.
+    redline_path = models.CharField(max_length=255, blank=True, default="")
     base_folder = models.CharField(max_length=255, blank=True, default="")
 
     collections_ignore_folder_str = models.TextField(
