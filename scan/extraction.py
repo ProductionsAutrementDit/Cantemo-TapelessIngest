@@ -77,6 +77,7 @@ __all__ = [
     "consumed_subdirs",
     "extract_metadatas",
     "subpath_prefix_patterns",
+    "unclaimed_hits_doubt",
 ]
 
 # The keys that decide a clip's primary key and its metadata-mapping
@@ -543,3 +544,47 @@ def consumed_subdirs(found_clips, provider_matches, folder_path, *, reasons=None
                         reasons.append(f"{subpath!r} does not compile ({error})")
                     return None
     return ConsumedSubdirs(names, patterns)
+
+
+def unclaimed_hits_doubt(verified_hits, clip_count, error_count):
+    """Descent doubt for a folder that found media and claimed none of it.
+
+    ``consumed_subdirs`` answers "what did these clips consume". This
+    answers the question that comes BEFORE it, and that the three-state
+    gate had no way to ask: did this folder produce a result worth
+    trusting at all?
+
+    Zero clips reaches the gate from two places that look identical and
+    are not. An intermediate shoot folder has zero HITS — discovery is
+    scoped to ``parent == folder`` plus each provider's declared
+    sub-paths — consumed nothing, and must be descended into; that is how
+    the walk finds cards. A card folder whose extractor broke has hits it
+    failed to claim, and descending into it walks the card's internals as
+    if they were folders of their own (measured on the REDline outage:
+    118 folders where a correct run reports 49).
+
+    ``verified_hits`` counts files that PASSED the real-filesystem guard
+    and reached extraction — not rows the index returned. The difference
+    is the index/filesystem desync (DC-2): a ghost entry with no file
+    behind it yields a hit row and an error while there was never any
+    media to claim, and the guard absorbing it is FR-22 working as
+    designed, not a folder whose contents are unknown.
+
+    The rule is therefore about UNCLAIMED HITS, and it is deliberately
+    NARROW: doubt also requires a recorded error. A stray file that every
+    provider's guard legitimately declines is an unclaimed hit with
+    nothing wrong, and must not stop the walk above real cards. The wider
+    rule — doubt on any unclaimed hit — was considered and rejected;
+    ``tests/tier1/test_unclaimed_hits_doubt.py`` pins both halves.
+
+    Returns the reason for the caller's ``response["errors"]``, or
+    ``None`` when there is no doubt. Like every other doubt in this
+    module, the caller turns a reason into ``consumed_subdirs = None``,
+    never into an empty frozenset.
+    """
+    if verified_hits and not clip_count and error_count:
+        return (
+            f"{verified_hits} verified file(s) found, none became a clip, "
+            f"{error_count} error(s) — what this folder holds is unknown"
+        )
+    return None

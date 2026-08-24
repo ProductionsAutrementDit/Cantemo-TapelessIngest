@@ -52,6 +52,7 @@ from portal.plugins.TapelessIngest.scan.coordinator import (
 from portal.plugins.TapelessIngest.scan.extraction import (
     applicable_providers,
     consumed_subdirs,
+    unclaimed_hits_doubt,
 )
 from portal.plugins.TapelessIngest.scan.ingestion import (
     SKIP_ALREADY_INGESTED,
@@ -839,6 +840,12 @@ class Folder(models.Model):
         # counts what was actually consumed and the check moves to the end.
         may_be_complete = not count_only and number == 0 and first == 0
         seen_hits = 0
+        # Files that PASSED the real-filesystem guard and reached
+        # extraction. Deliberately not `seen_hits`: a ghost row (index
+        # entry, no file behind it) is a hit the DC-2 guard absorbs by
+        # design, and counting it would make an ordinary desync look like
+        # a folder whose contents are unknown. See unclaimed_hits_doubt.
+        verified_hits = 0
         root_path = scan_context.root_path_for(self.storage_id)
         if not root_path:
             # Context miss / falsy root falls back to today's property
@@ -929,6 +936,7 @@ class Folder(models.Model):
                                 raise TapelessIngestException(
                                     f"File {file} does not exist ({file_absolute_path})"
                                 )
+                            verified_hits += 1
                             # Pre-filter: only providers that may claim this
                             # filename are invoked; each provider's own guard
                             # still decides. A missing or unusable map must
@@ -1131,33 +1139,54 @@ class Folder(models.Model):
                 # Loop exit alone is not completeness (a SHORT page ends the
                 # loop too); this folder authorized descent only after
                 # actually consuming every hit the index reported.
-                reasons = []
-                try:
-                    with timer("extraction"):
-                        consumed = consumed_subdirs(
-                            response["clips"],
-                            # The per-clip matched provider INSTANCES, not
-                            # the last-writer-wins names: several providers
-                            # legitimately claim one file (AD-7/FR-14).
-                            matched_providers,
-                            # STORAGE-ROOT-RELATIVE, never absolute_path: the
-                            # same coordinate system as Clip.path and
-                            # VSFile.getPath(). See consumed_subdirs.
-                            self.path,
-                            reasons=reasons,
-                        )
-                except Exception as e:
-                    # NFR-1 tie-break: anything unexpected here is DOUBT —
-                    # never a partial set, and never a crashed folder.
-                    traceback.print_exc()
-                    consumed = None
-                    reasons.append(str(e))
-                if consumed is None:
-                    reason = reasons[0] if reasons else "unknown reason"
+                #
+                # Before asking WHAT the clips consumed, ask whether this
+                # folder produced an answer worth trusting. A card folder
+                # whose extractor broke reaches here with hits it failed to
+                # claim and zero clips, which `consumed_subdirs` would
+                # answer with an empty set — "descend into everything" —
+                # and the walk would go through the card's internals.
+                # Measured on the REDline outage: 118 folders where a
+                # correct run reports 49.
+                doubt = unclaimed_hits_doubt(
+                    verified_hits, len(response["clips"]), len(response["errors"])
+                )
+                if doubt:
+                    response["consumed_subdirs"] = None
                     response["errors"].append(
-                        f"Cannot compute consumed subdirs for {self.path}: {reason}"
+                        f"Not descending into {self.path}: {doubt}"
                     )
-                response["consumed_subdirs"] = consumed
+                else:
+                    reasons = []
+                    try:
+                        with timer("extraction"):
+                            consumed = consumed_subdirs(
+                                response["clips"],
+                                # The per-clip matched provider INSTANCES,
+                                # not the last-writer-wins names: several
+                                # providers legitimately claim one file
+                                # (AD-7/FR-14).
+                                matched_providers,
+                                # STORAGE-ROOT-RELATIVE, never
+                                # absolute_path: the same coordinate system
+                                # as Clip.path and VSFile.getPath(). See
+                                # consumed_subdirs.
+                                self.path,
+                                reasons=reasons,
+                            )
+                    except Exception as e:
+                        # NFR-1 tie-break: anything unexpected here is
+                        # DOUBT — never a partial set, and never a crashed
+                        # folder.
+                        traceback.print_exc()
+                        consumed = None
+                        reasons.append(str(e))
+                    if consumed is None:
+                        reason = reasons[0] if reasons else "unknown reason"
+                        response["errors"].append(
+                            f"Cannot compute consumed subdirs for {self.path}: {reason}"
+                        )
+                    response["consumed_subdirs"] = consumed
             elif may_be_complete:
                 # The pages stopped short of the reported total.
                 response["errors"].append(
