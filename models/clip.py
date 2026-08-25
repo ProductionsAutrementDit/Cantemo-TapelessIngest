@@ -771,7 +771,10 @@ class Clip(models.Model):
     @property
     def item(self):
         if not hasattr(self, "_item"):
-            if self.item_id is None:
+            # Falsiness, not `is None`: the item-deletion listener writes
+            # `""`, which must answer None here rather than reach
+            # `getItem("")`.
+            if not self.item_id:
                 return None
 
             # Try to get from cache first
@@ -800,7 +803,10 @@ class Clip(models.Model):
     @property
     def job(self):
         if not hasattr(self, "_job"):
-            if self.job_id is None:
+            # Falsiness, not `is None`: the item-deletion listener writes
+            # `""`, which must answer None here rather than reach
+            # `getJob("")` — the same rule as `Clip.item`.
+            if not self.job_id:
                 return None
             _ijh = JobHelper()
             try:
@@ -949,6 +955,23 @@ class Clip(models.Model):
         """
         created = False
 
+        if self.item_id and self.item is None:
+            # The row NAMES an item Vidispine cannot resolve — `Clip.item`
+            # answers None on NotFoundError too (the accident commit
+            # 632bd4c closed), so falling through would take the create
+            # branch and make a SECOND placeholder beside the one the row
+            # already names. Refuse instead, BEFORE the preparatory round
+            # trips (a wedged row recurs every run by design, and should
+            # cost one getItem, not the full ingest-group/settings/metadata
+            # preamble): the per-clip handler counts this clip failed with
+            # the reason below, every run, until the row is healed
+            # (operator tooling is the maintenance story's).
+            raise TapelessIngestException(
+                f"clip {self.umid} names item {self.item_id}, which "
+                f"Vidispine cannot resolve — refusing to create a "
+                f"second placeholder for it; heal or reset the row"
+            )
+
         ingestgroups, default_ingest_group = gh.getUserIngestGroups()
         ingestgroupname = default_ingest_group.name
 
@@ -965,6 +988,48 @@ class Clip(models.Model):
             created = True
             log.info("Creating placeholder...")
             self.item = ith.createPlaceholder(md, settingsprofile_id=settingsprofile_id)
+            if not self.item_id:
+                # The `item` setter silently no-ops on a falsy return, so
+                # without this guard the combined write below would stamp
+                # PLACEHOLDER_CREATED beside an EMPTY item_id — fabricating
+                # the one cell the ladder refuses to act on — and execution
+                # would carry on into setItemMetadataFieldGroup(None).
+                raise TapelessIngestException(
+                    f"createPlaceholder returned no item for {self.umid}"
+                )
+            # NFR-1 (story 3.0): make the placeholder durable NOW — one
+            # targeted UPDATE writing `item_id` and `status` TOGETHER,
+            # before any further Vidispine call. A death anywhere after
+            # this statement leaves exactly the FR-36 incomplete-import
+            # cell (item_id, no job_id, PLACEHOLDER_CREATED), which the
+            # existing retry rung recovers into this same placeholder next
+            # run. By pk, and never a save() fallback, which would INSERT
+            # a partial row before the import ran. The OTHER writer of
+            # these columns is `persist_ingest_state` (INGEST_STATE_FIELDS),
+            # which runs after `import_file` returns and re-writes both
+            # along with the job id. Deliberate side effect of `.update()`:
+            # it bypasses `created_on`'s `auto_now` (a misnamed
+            # last-modified column), so the FR-36 cell keeps its scan-time
+            # timestamp.
+            self.status = self.STATUS_PLACHOLDER_CREATED
+            updated = (
+                type(self)
+                .objects.filter(pk=self.pk)
+                .update(item_id=self.item_id, status=self.status)
+            )
+            if not updated and not self._state.adding:
+                # Two different absences: an UNSAVED clip (the REST path)
+                # legitimately has no row and stays a silent no-op, but a
+                # PERSISTED clip whose row vanished mid-run means the
+                # placeholder's name was just lost — a death before
+                # persist_ingest_state re-inserts it would orphan it.
+                log.error(
+                    f"clip {self.umid}: the combined item_id/status UPDATE "
+                    f"matched no row — a persisted clip's row was deleted "
+                    f"concurrently, so placeholder {self.item_id} is not "
+                    f"durably recorded until persist_ingest_state re-inserts "
+                    f"the row"
+                )
         else:
             # If item already exists, we check if we have to replace it
             if replace:
@@ -1477,7 +1542,10 @@ class Clip(models.Model):
     def persist_ingest_state(self, expect_persisted: bool = True) -> None:
         """Write back what the import decided, and nothing else (AD-6).
 
-        ONE targeted UPDATE of ``INGEST_STATE_FIELDS``. A full ``save()``
+        ONE targeted UPDATE of ``INGEST_STATE_FIELDS``. Second writer of
+        ``item_id``/``status``: ``create_item``'s combined write already
+        made the placeholder durable mid-import (story 3.0); this one
+        re-writes both alongside the job id. A full ``save()``
         would rewrite every column of a row the scan just wrote,
         including the location columns the scan deliberately leaves alone
         (``scan.persistence.CLIP_UPDATE_FIELDS``).

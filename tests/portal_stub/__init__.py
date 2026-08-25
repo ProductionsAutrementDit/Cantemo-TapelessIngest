@@ -19,7 +19,7 @@ import re
 import sys
 from pathlib import Path
 from types import ModuleType
-from urllib.parse import urlencode
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 log = logging.getLogger(__name__)
 
@@ -328,6 +328,15 @@ class StorageHelperFake:
         )
 
 
+class InjectedVidispineFault(Exception):
+    """The default fault ``VidispineFake.fail_next`` raises.
+
+    Its own type, so a test can tell "the fault I armed" from "the plugin
+    raised something of its own" — a distinction a bare ``Exception``
+    cannot make.
+    """
+
+
 class VidispineFake:
     """Shared configuration and call log for the ingest-side helper doubles.
 
@@ -346,11 +355,16 @@ class VidispineFake:
     - ``set_import_response(response)`` — what the next
       ``importFileToPlaceholder`` / ``doImportToPlaceholder`` returns
       (queue; ``default_import_response`` once it is empty);
-    - ``set_original_shape(item_id, shape_id, files)`` — the "original"
-      shapes ``getItemShapesFromNames`` reports for an item, and the
-      files on each; an unconfigured item has none, i.e. a bare
-      placeholder;
-    - ``set_item(item_id, item)`` — an item ``getItem`` finds.
+    - ``set_original_shape(item_id, shape_id, files, placeholder=False)``
+      — the "original" shapes ``getItemShapesFromNames`` reports for an
+      item, the files on each, and whether the shape is a PLACEHOLDER
+      shape; an unconfigured item has none, i.e. a bare placeholder;
+    - ``set_item(item_id, item)`` — an item ``getItem`` finds;
+    - ``fail_next(call_name, error=None)`` — arm a fault: the named call
+      records itself, applies its effect, and then RAISES. Raising after
+      the effect is the honest half — it models a process that died with
+      the Vidispine write already committed and nothing written back,
+      which is the only half that can orphan anything.
 
     Read ``calls`` for what was asked, in order.
     """
@@ -360,6 +374,7 @@ class VidispineFake:
     items = {}
     item_shapes = {}
     calls = []
+    faults = []
     _placeholder_counter = 0
 
     @classmethod
@@ -368,11 +383,36 @@ class VidispineFake:
         cls.items.clear()
         cls.item_shapes.clear()
         cls.calls.clear()
+        cls.faults.clear()
         cls._placeholder_counter = 0
+
+    @classmethod
+    def fail_next(cls, call_name, error=None):
+        """Queue a fault for the next call of ``call_name``.
+
+        One entry, one call: a two-run crash test arms the fault for run
+        one and leaves run two clean without having to disarm anything.
+        """
+        cls.faults.append((call_name, error))
 
     @classmethod
     def record(cls, name, **details):
         cls.calls.append((name, details))
+
+    @classmethod
+    def fault_point(cls, name):
+        """Raise here if a fault is armed for ``name``.
+
+        Called at the END of the modelled call, once its effect is in
+        ``VidispineFake``'s state: the interesting failure is the one
+        where Vidispine DID the thing and the caller never learned it.
+        """
+        for index, (call_name, error) in enumerate(cls.faults):
+            if call_name == name:
+                cls.faults.pop(index)
+                raise error or InjectedVidispineFault(
+                    f"injected fault: the process died inside {name}"
+                )
 
     @classmethod
     def call_names(cls):
@@ -394,10 +434,58 @@ class VidispineFake:
         return cls.items[item_id]
 
     @classmethod
-    def set_original_shape(cls, item_id, shape_id, files=()):
+    def set_original_shape(cls, item_id, shape_id, files=(), placeholder=False):
         cls.item_shapes.setdefault(item_id, []).append(
-            {"id": shape_id, "files": list(files)}
+            {"id": shape_id, "files": list(files), "placeholder": bool(placeholder)}
         )
+
+    @classmethod
+    def fill_placeholder_shapes(cls, item_id, files):
+        """What a SUCCESSFUL import does to an item's placeholder shape.
+
+        Vidispine attaches the file and the shape stops being a
+        placeholder. Without this, every "second run after a genuine
+        success" scenario is exercised against a state production never
+        reaches: an item holding a placeholder shape forever, which the
+        un-parameterized shape query cannot see and the FR-35 rung
+        therefore never gets to judge.
+        """
+        for shape in cls.item_shapes.get(item_id, []):
+            if shape.get("placeholder"):
+                shape["placeholder"] = False
+                shape["files"] = list(files)
+
+    @classmethod
+    def shapes_for(cls, item_id, placeholder=None):
+        """The shape-LIST endpoint's three-state ``placeholder`` FILTER.
+
+        Vidispine 25.4.11 (``ref/item/shape.html``) on
+        ``GET /item/(id)/shape``: "``true`` - Only return placeholder
+        shapes. ``false`` (default) - Only return non-placeholder shapes.
+        ``all`` - Return all shapes."
+
+        A filter, NOT an include flag — the two are the opposite mental
+        model for the ``false`` case, and the plugin's retry path depends
+        on the real one: the un-parameterized query at
+        ``Clip.import_file`` must NOT see the placeholder shape an
+        interrupted submission left, or the retry diverts into
+        ``_should_replace_original_files`` and strips the item.
+
+        (``includePlaceholder`` is a different parameter on a different
+        endpoint — the single-shape retrieve — and governs which
+        COMPONENTS appear inside one shape. Not modelled: nothing calls
+        it.)
+        """
+        assert placeholder in (None, "true", "false", "all"), (
+            f"unmodelled placeholder filter value {placeholder!r} — the real "
+            f"endpoint defines true/false/all; silently treating anything "
+            f"else as 'false' would hide a caller-side encoding bug"
+        )
+        shapes = cls.item_shapes.get(item_id, [])
+        if placeholder == "all":
+            return list(shapes)
+        wanted = placeholder == "true"
+        return [shape for shape in shapes if bool(shape.get("placeholder")) is wanted]
 
     @classmethod
     def new_placeholder_id(cls):
@@ -510,7 +598,12 @@ class RestTransportFake:
         cls.calls.append(url)
         match = re.search(r"/item/([^/?]+)/shape", url or "")
         if match:
-            shapes = VidispineFake.item_shapes.get(match.group(1), [])
+            # The query string is READ, not ignored: `placeholder` is a
+            # three-state filter on this endpoint and the plugin's retry
+            # path turns on its exclusivity (see VidispineFake.shapes_for).
+            query = parse_qs(urlsplit(url or "").query)
+            placeholder = query.get("placeholder", [None])[0]
+            shapes = VidispineFake.shapes_for(match.group(1), placeholder)
             return json.dumps({"uri": [shape["id"] for shape in shapes]})
         raise AssertionError(
             f"RestTransportFake.perform called for an unmodelled URL {url!r} — "
@@ -550,8 +643,11 @@ class ItemAPIFake:
         return {"id": shape_id, "files": []}
 
     def createPlaceholderShape(self, item_id, runasuser=None):
+        shape_id = f"{item_id}-SHAPE"
         VidispineFake.record("createPlaceholderShape", item_id=item_id)
-        return f"{item_id}-SHAPE".encode("UTF-8")
+        VidispineFake.set_original_shape(item_id, shape_id, placeholder=True)
+        VidispineFake.fault_point("createPlaceholderShape")
+        return shape_id.encode("UTF-8")
 
     def removeItemShape(self, item_id, shape_id, runasuser=None):
         VidispineFake.record("removeItemShape", item_id=item_id, shape_id=shape_id)
@@ -584,7 +680,13 @@ class ItemAPIFake:
             component=component,
             query=query,
         )
-        return VidispineFake.next_import_response()
+        response = VidispineFake.next_import_response()
+        if response.get("jobId") and component == "container":
+            VidispineFake.fill_placeholder_shapes(
+                item_id, [{"id": "VX-IMPORTED-FILE", "storage": "VX-41"}]
+            )
+        VidispineFake.fault_point("doImportToPlaceholder")
+        return response
 
 
 class ItemHelperFake(_HelperFake):
@@ -600,7 +702,12 @@ class ItemHelperFake(_HelperFake):
     def createPlaceholder(self, metadata_document=None, settingsprofile_id=None):
         item_id = VidispineFake.new_placeholder_id()
         VidispineFake.record("createPlaceholder", item_id=item_id)
-        return VidispineFake.set_item(item_id)
+        item = VidispineFake.set_item(item_id)
+        # The item EXISTS before the fault fires: that is what makes an
+        # orphan possible at all. A fault raised first would model
+        # "Vidispine created nothing", the harmless half.
+        VidispineFake.fault_point("createPlaceholder")
+        return item
 
     def setItemMetadata(self, item_id, metadata_document=None):
         VidispineFake.record("setItemMetadata", item_id=item_id)
@@ -609,6 +716,7 @@ class ItemHelperFake(_HelperFake):
         VidispineFake.record(
             "setItemMetadataFieldGroup", item_id=item_id, group=group_name
         )
+        VidispineFake.fault_point("setItemMetadataFieldGroup")
 
 
 class IngestHelperFake(_HelperFake):
@@ -626,7 +734,17 @@ class IngestHelperFake(_HelperFake):
         VidispineFake.record(
             "importFileToPlaceholder", item_id=item_id, file_id=file_id
         )
-        return VidispineFake.next_import_response()
+        response = VidispineFake.next_import_response()
+        if response.get("jobId"):
+            # A successful import attaches the file and the placeholder
+            # shape becomes a real one. Modelling that is what lets a
+            # SECOND run be exercised against the state production really
+            # reaches (see VidispineFake.fill_placeholder_shapes).
+            VidispineFake.fill_placeholder_shapes(
+                item_id, [{"id": file_id, "storage": "VX-41"}]
+            )
+        VidispineFake.fault_point("importFileToPlaceholder")
+        return response
 
 
 class JobHelperFake(_HelperFake):
@@ -668,6 +786,7 @@ class CollectionHelperFake(_HelperFake):
         VidispineFake.record(
             "addItemToCollection", collection_id=collection_id, item_id=item_id
         )
+        VidispineFake.fault_point("addItemToCollection")
 
 
 def create_metadata_document_fake(metadata, groups=None):

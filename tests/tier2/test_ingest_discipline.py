@@ -39,7 +39,7 @@ from portal.plugins.TapelessIngest.models.folder import Folder, persist_scan_res
 from portal.plugins.TapelessIngest.providers.providers import Provider as BaseProvider
 from portal.plugins.TapelessIngest.scan.persistence import build_persistence_plan
 
-from tests.portal_stub import VidispineFake
+from tests.portal_stub import InjectedVidispineFault, VidispineFake
 
 STORAGE_ID = "VX-41"
 LEGACY_STORAGE = "VX-LEGACY"
@@ -1156,3 +1156,354 @@ def test_an_item_that_already_holds_the_file_is_not_re_imported(
     assert (response["skipped"], response["ingested"], response["failed"]) == (1, 0, 0)
     assert "importFileToPlaceholder" not in VidispineFake.call_names()
     assert "doImportToPlaceholder" not in VidispineFake.call_names()
+
+
+# --------------------------------------------------------------------------
+# (3.0) The combined write: no orphaned placeholders after createPlaceholder
+# --------------------------------------------------------------------------
+#
+# The death model needs no special fixture: `Clip.ingest` runs
+# `persist_ingest_state` only after `import_file` RETURNS, so an exception
+# raised by a fault leaves the row holding exactly what the database held
+# at that moment — the same state a killed process leaves. A caught
+# in-process exception and a process death are therefore ONE cell here,
+# which is the whole point of the design: every post-write interruption
+# lands on the FR-36 incomplete-import cell the existing retry rung
+# already recovers.
+
+
+def _fr36_cell(umid):
+    """The row the combined write leaves: named, job-less, at PLACEHOLDER."""
+    stored = Clip.objects.get(pk=umid)
+    assert stored.item_id, "the combined write should have named the placeholder"
+    assert not stored.job_id
+    assert stored.status == Clip.STATUS_PLACHOLDER_CREATED
+    return stored
+
+
+@pytest.mark.parametrize(
+    "window",
+    ["setItemMetadataFieldGroup", "addItemToCollection", "createPlaceholderShape"],
+)
+def test_a_death_after_the_combined_write_retries_into_the_same_placeholder(
+    migrated_db,
+    es_fake,
+    es_page,
+    ingestable_provider,
+    tmp_path,
+    collection_seam,
+    window,
+):
+    """The story's promise, at every window between the combined write and
+    the import call.
+
+    Each of these is a Vidispine call the old code performed with the row
+    still reading `item_id` empty / NOT_IMPORTED, so the next run
+    concluded "not ingested" and created a SECOND placeholder, orphaning
+    the first. Now the row is already the FR-36 cell when the fault
+    fires, and the next run's retry rung imports into the SAME
+    placeholder. Both halves are asserted: exactly one `createPlaceholder`
+    across the two runs (the negative) AND run 2 really ingesting into it
+    (the positive) — a fix that merely refused everything would pass the
+    negative alone.
+    """
+    rel = f"2026/AH_20260101_death_{window.lower()}"
+    sources = _ingestable_page(tmp_path, rel, ["CLIPDEAD"])
+    umid = f"{rel}/CLIPDEAD"
+
+    es_fake.push(es_page(sources, total=1))
+    VidispineFake.fail_next(window)
+    first = _folder(tmp_path, rel).ingest(providers=[INGESTABLE_NAME])
+
+    # Today's catch: the per-clip handler logged it, counted it failed
+    # and carried on.
+    assert (first["failed"], first["ingested"]) == (1, 0)
+    assert len(first["errors"]) == 1
+    assert VidispineFake.call_names().count("createPlaceholder") == 1
+    placeholder_id = _fr36_cell(umid).item_id
+
+    es_fake.push(es_page(sources, total=1))
+    VidispineFake.set_import_response({"jobId": "VX-JOB-RECOVERED"})
+    second = _rescanned_folder(tmp_path, rel).ingest(providers=[INGESTABLE_NAME])
+
+    assert (second["ingested"], second["skipped"], second["failed"]) == (1, 0, 0)
+    # Still ONE placeholder in Vidispine, across both runs.
+    assert VidispineFake.call_names().count("createPlaceholder") == 1
+    stored = Clip.objects.get(pk=umid)
+    assert stored.item_id == placeholder_id
+    assert stored.job_id == "VX-JOB-RECOVERED"
+    assert stored.status == Clip.STATUS_PLACHOLDER_CREATED
+
+
+def test_a_death_at_the_import_call_itself_comes_back_skipped_not_doubled(
+    migrated_db, es_fake, es_page, ingestable_provider, tmp_path, collection_seam
+):
+    """The last window, whose honest answer is `skipped`, not `ingested`.
+
+    Vidispine attached the file and turned the placeholder shape into a
+    real one; the process died before the row learned the job id. The
+    next run finds an item whose original shape already holds files and
+    refuses to touch it — no second placeholder, no second import. The
+    job id is lost for good (the row keeps reading job-less), which is
+    accepted: NFR-1 is about duplicate ITEMS, not about job bookkeeping.
+    """
+    rel = "2026/AH_20260101_deathatimport"
+    sources = _ingestable_page(tmp_path, rel, ["CLIPDONEDEAD"])
+    umid = f"{rel}/CLIPDONEDEAD"
+
+    es_fake.push(es_page(sources, total=1))
+    VidispineFake.set_import_response({"jobId": "VX-JOB-LOST"})
+    VidispineFake.fail_next("importFileToPlaceholder")
+    first = _folder(tmp_path, rel).ingest(providers=[INGESTABLE_NAME])
+
+    assert (first["failed"], first["ingested"]) == (1, 0)
+    placeholder_id = _fr36_cell(umid).item_id
+
+    es_fake.push(es_page(sources, total=1))
+    second = _rescanned_folder(tmp_path, rel).ingest(providers=[INGESTABLE_NAME])
+
+    assert (second["skipped"], second["ingested"], second["failed"]) == (1, 0, 0)
+    assert VidispineFake.call_names().count("createPlaceholder") == 1
+    assert VidispineFake.call_names().count("importFileToPlaceholder") == 1
+    stored = Clip.objects.get(pk=umid)
+    assert stored.item_id == placeholder_id
+
+
+def test_a_recovered_submission_reuses_the_placeholder_shape_it_left(
+    migrated_db, es_fake, es_page, ingestable_provider, tmp_path, collection_seam
+):
+    """RULED: the un-parameterized shape query at `import_file` must NOT
+    see the placeholder shape the interrupted run created.
+
+    `placeholder` is a three-state FILTER on the shape-list endpoint and
+    its default returns only NON-placeholder shapes, so the replace loop
+    never runs and `_get_or_create_placeholder_shape` — which asks for
+    placeholder shapes only — finds the file-less shape and reuses it.
+    Making that shape visible to the first query is the one change that
+    would divert the retry into `_should_replace_original_files`, which
+    for an empty file list falls through to `return True`: the item would
+    be stripped and the recovered clip would lose its proxy.
+    """
+    rel = "2026/AH_20260101_shapereuse"
+    sources = _ingestable_page(tmp_path, rel, ["CLIPSHAPE"])
+
+    es_fake.push(es_page(sources, total=1))
+    VidispineFake.fail_next("createPlaceholderShape")
+    _folder(tmp_path, rel).ingest(providers=[INGESTABLE_NAME])
+    assert VidispineFake.call_names().count("createPlaceholderShape") == 1
+
+    es_fake.push(es_page(sources, total=1))
+    VidispineFake.set_import_response({"jobId": "VX-JOB-SHAPE"})
+    second = _rescanned_folder(tmp_path, rel).ingest(providers=[INGESTABLE_NAME])
+
+    assert second["ingested"] == 1
+    # The shape was REUSED, not re-created...
+    assert VidispineFake.call_names().count("createPlaceholderShape") == 1
+    # ...and the item was never stripped: nothing was replaced, so the
+    # `no_transcode` override that costs the clip its proxy never fired.
+    assert second["replaced"] == 0
+    assert "removeItemShape" not in VidispineFake.call_names()
+
+
+def test_a_death_inside_create_placeholder_is_the_accepted_residual(
+    migrated_db, es_fake, es_page, ingestable_provider, tmp_path, collection_seam
+):
+    """THE RESIDUAL, pinned as a document, not as a promise.
+
+    The item was created server-side and the response was lost, so the
+    combined write never ran and the row is exactly as the scan wrote it.
+    The next run cannot know, and creates a second placeholder — the
+    unnamed-orphan window is ONE statement wide, not zero. Accepted by
+    the spec; the orphan itself is owned by the dedicated maintenance
+    story. If this test ever fails because the second run stopped making
+    a second placeholder, the residual has been closed — retire this pin
+    alongside that story, do not paper over it.
+    """
+    rel = "2026/AH_20260101_deathinside"
+    sources = _ingestable_page(tmp_path, rel, ["CLIPLOST"])
+    umid = f"{rel}/CLIPLOST"
+
+    es_fake.push(es_page(sources, total=1))
+    VidispineFake.fail_next("createPlaceholder")
+    first = _folder(tmp_path, rel).ingest(providers=[INGESTABLE_NAME])
+
+    assert (first["failed"], len(first["errors"])) == (1, 1)
+    # The row never learned anything: no name, no status move.
+    untouched = Clip.objects.get(pk=umid)
+    assert not untouched.item_id
+    assert untouched.status == Clip.STATUS_NOT_IMPORTED
+
+    es_fake.push(es_page(sources, total=1))
+    VidispineFake.set_import_response({"jobId": "VX-JOB-SECOND"})
+    second = _rescanned_folder(tmp_path, rel).ingest(providers=[INGESTABLE_NAME])
+
+    # The clip ingests — into a SECOND placeholder. The first is orphaned.
+    assert second["ingested"] == 1
+    assert VidispineFake.call_names().count("createPlaceholder") == 2
+
+
+def test_a_death_before_create_placeholder_retries_cleanly(
+    migrated_db,
+    es_fake,
+    es_page,
+    ingestable_provider,
+    tmp_path,
+    collection_seam,
+    monkeypatch,
+):
+    """Preparatory round trips create nothing, so a death there must
+    leave a clip that retries normally next run — no name, no status
+    move, no refusal."""
+    from tests.portal_stub import UserHelperFake
+
+    original = UserHelperFake.getUserSettingsProfile
+    died = []
+
+    def boom_once(self, basegroup=None):
+        if not died:
+            died.append(True)
+            raise RuntimeError("the process died resolving the settings profile")
+        return original(self, basegroup=basegroup)
+
+    monkeypatch.setattr(UserHelperFake, "getUserSettingsProfile", boom_once)
+    rel = "2026/AH_20260101_earlydeath"
+    sources = _ingestable_page(tmp_path, rel, ["CLIPEARLY"])
+    umid = f"{rel}/CLIPEARLY"
+
+    es_fake.push(es_page(sources, total=1))
+    first = _folder(tmp_path, rel).ingest(providers=[INGESTABLE_NAME])
+
+    assert (first["failed"], len(first["errors"])) == (1, 1)
+    assert "createPlaceholder" not in VidispineFake.call_names()
+    untouched = Clip.objects.get(pk=umid)
+    assert not untouched.item_id
+    assert untouched.status == Clip.STATUS_NOT_IMPORTED
+
+    es_fake.push(es_page(sources, total=1))
+    VidispineFake.set_import_response({"jobId": "VX-JOB-EARLY"})
+    second = _rescanned_folder(tmp_path, rel).ingest(providers=[INGESTABLE_NAME])
+
+    assert (second["ingested"], second["failed"]) == (1, 0)
+    assert VidispineFake.call_names().count("createPlaceholder") == 1
+
+
+def test_a_row_naming_an_unresolvable_item_is_refused_not_recreated(
+    migrated_db, es_fake, es_page, ingestable_provider, tmp_path, collection_seam
+):
+    """A deleted item must not fall into the create branch.
+
+    `Clip.item` answers None on NotFoundError too (the accident commit
+    632bd4c closed), so a row at the incomplete-import cell whose item
+    was deleted OUTSIDE the listener would otherwise be "recovered" into
+    a brand-new placeholder — the exact second item this story exists to
+    prevent. It is refused instead: `TapelessIngestException`, counted
+    failed with the reason in `errors`, recurring every run until the row
+    is healed (the maintenance story owns the tooling). `--replace`, the
+    operator's biggest hammer, must not break the refusal either.
+    """
+    rel = "2026/AH_20260101_gone"
+    sources = _ingestable_page(tmp_path, rel, ["CLIPGONE"])
+    umid = f"{rel}/CLIPGONE"
+    Clip(
+        umid=umid,
+        path=rel,
+        storage_id=STORAGE_ID,
+        item_id="VX-GONE",
+        status=Clip.STATUS_PLACHOLDER_CREATED,
+    ).save()
+    # VX-GONE is deliberately unconfigured: getItem raises NotFoundError.
+
+    for run, replace in enumerate((False, True)):
+        folder = (
+            _folder(tmp_path, rel) if run == 0 else _rescanned_folder(tmp_path, rel)
+        )
+        es_fake.push(es_page(sources, total=1))
+        response = folder.ingest(providers=[INGESTABLE_NAME], replace=replace)
+
+        assert (response["failed"], response["ingested"]) == (1, 0)
+        [error] = response["errors"]
+        assert "VX-GONE" in error and umid in error
+        assert "createPlaceholder" not in VidispineFake.call_names()
+        # The row is untouched: it waits for a human, it does not heal
+        # itself and it does not get worse.
+        stored = Clip.objects.get(pk=umid)
+        assert (stored.item_id, stored.status) == (
+            "VX-GONE",
+            Clip.STATUS_PLACHOLDER_CREATED,
+        )
+
+
+def test_an_empty_item_id_never_reaches_getitem(migrated_db, ingestable_provider):
+    """Falsiness, not `is None`: the deletion listener writes `""`.
+
+    Under the old `is None` test an emptied row sent `getItem("")` down
+    the wire on every `.item` read.
+    """
+    clip = Clip(umid="EMPTY-ID", path="a", provider_name=INGESTABLE_NAME, item_id="")
+
+    assert clip.item is None
+    assert VidispineFake.calls == []
+
+
+def test_a_rest_ingest_of_a_new_clip_never_inserts_before_the_import(
+    migrated_db, ingestable_provider
+):
+    """The combined write NO-OPS when there is no row.
+
+    The REST endpoint (views.py) builds an UNSAVED Clip from the request
+    body and calls `ingest(expect_persisted=False)`. A `save()` fallback
+    in the combined write would INSERT a partial row before the import
+    ran — so a death mid-import must leave NO row at all.
+    """
+    clip = Clip(
+        umid="REST-DEAD",
+        path="2026/X",
+        storage_id=STORAGE_ID,
+        provider_name=INGESTABLE_NAME,
+        file_id="VX-41-RESTDEAD",
+    )
+    clip._file = _vsfile("2026/X/RESTDEAD.ing", "VX-41-RESTDEAD")
+    VidispineFake.fail_next("setItemMetadataFieldGroup")
+
+    # The ARMED fault specifically: a bare `Exception` would let a
+    # TypeError thrown before the fault window pass this test.
+    with pytest.raises(InjectedVidispineFault):
+        clip.ingest(expect_persisted=False)
+
+    assert VidispineFake.call_names().count("createPlaceholder") == 1
+    assert Clip.objects.filter(pk="REST-DEAD").count() == 0
+
+
+def test_a_rest_ingest_of_a_new_clip_proceeds_without_crying_wolf(
+    migrated_db, ingestable_provider, caplog
+):
+    """The happy REST half: the no-op write is silent and the ingest
+    lands — one placeholder, the row written once at the end, no
+    "reached ingest unsaved" ERROR."""
+    clip = Clip(
+        umid="REST-NEW",
+        path="2026/X",
+        storage_id=STORAGE_ID,
+        provider_name=INGESTABLE_NAME,
+        file_id="VX-41-RESTNEW",
+    )
+    clip._file = _vsfile("2026/X/RESTNEW.ing", "VX-41-RESTNEW")
+    VidispineFake.set_import_response({"jobId": "VX-JOB-REST"})
+
+    result = clip.ingest(expect_persisted=False)
+
+    assert result["ingested"] is True
+    assert VidispineFake.call_names().count("createPlaceholder") == 1
+    stored = Clip.objects.get(pk="REST-NEW")
+    assert (stored.job_id, stored.status) == (
+        "VX-JOB-REST",
+        Clip.STATUS_PLACHOLDER_CREATED,
+    )
+    assert not [r for r in caplog.records if r.levelname == "ERROR"], caplog.text
+
+
+def test_makemigrations_sees_no_model_change(migrated_db):
+    """Story 3.0 changes no model shape — verified, not asserted."""
+    from django.core.management import call_command
+
+    call_command("makemigrations", "TapelessIngest", check=True, dry_run=True)

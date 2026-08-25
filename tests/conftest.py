@@ -44,6 +44,7 @@ import django  # noqa: E402
 django.setup()
 
 import pytest  # noqa: E402
+from django.core.cache import cache  # noqa: E402
 from django.core.management import call_command  # noqa: E402
 
 from tests.portal_stub import (  # noqa: E402
@@ -147,6 +148,23 @@ def _reset_storage_helper_fake():
 
 
 @pytest.fixture(autouse=True)
+def _clear_django_cache():
+    """Autouse, and it belongs beside ``_reset_vidispine_fakes``.
+
+    ``Clip.item`` memoizes the fetched item in Django's cache under
+    ``item:{item_id}`` for 180 s, and the Tier 2 ``LocMemCache`` is
+    process-global — while ``VidispineFake._placeholder_counter`` resets
+    per test, so EVERY test's first placeholder is ``VX-PLACEHOLDER-1``.
+    Without this, one test's ``FakeItem`` answers another test's
+    ``Clip.item`` lookup and decides the outcome of a crash-recovery
+    assertion.
+    """
+    cache.clear()
+    yield
+    cache.clear()
+
+
+@pytest.fixture(autouse=True)
 def _reset_vidispine_fakes():
     """Autouse: the ingest-side doubles are module-level singletons.
 
@@ -155,8 +173,13 @@ def _reset_vidispine_fakes():
     exactly the cross-test leak the query_elastic fixture prevents.
     """
     yield
+    # An armed fault whose call name never fired (misspelled window, or a
+    # code path that stopped making the call) would otherwise turn a
+    # crash test into a vacuous happy-path pass.
+    unfired = list(VidispineFake.faults)
     VidispineFake.reset()
     RestTransportFake.reset()
+    assert not unfired, f"armed Vidispine fault(s) never fired: {unfired}"
     vidispine_pre_ingest.calls.clear()
     vidispine_post_ingest.calls.clear()
     invalidate_item_cache_fake.calls.clear()

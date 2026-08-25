@@ -122,3 +122,31 @@ def test_only_the_deleted_item_is_reset(migrated_db):
     bystander.refresh_from_db()
     assert target.item_id == ""
     assert bystander.item_id == "VX-2093830"
+
+
+def test_deleting_the_item_also_resets_the_status(migrated_db):
+    """The reset the log line has always claimed, and never performed.
+
+    Deleting the orphaned item in Portal is the natural manual repair for
+    a clip whose submission was interrupted — since story 3.0's combined
+    write, such a clip sits at PLACEHOLDER_CREATED. Without the status
+    reset the repair left PLACEHOLDER_CREATED beside an empty ``item_id``:
+    the ladder re-ingests it anyway (the id columns are cleared), but the
+    UI keeps displaying an import that never happened.
+    """
+    Clip.objects.create(
+        umid="PLACEHOLDER-THEN-DELETED",
+        item_id="VX-209383",
+        job_id="VX-777",
+        path="2026/AA_20260804/K003.RDC/K003_001.R3D",
+        provider_name="red",
+        status=Clip.STATUS_PLACHOLDER_CREATED,
+    )
+
+    plistner.item_post_delete_handler(instance="VX-209383", method="removeItem")
+
+    repaired = Clip.objects.get(pk="PLACEHOLDER-THEN-DELETED")
+    assert repaired.status == Clip.STATUS_NOT_IMPORTED
+    assert repaired.item_id == ""
+    # ...and the ladder sees an ordinary clip again.
+    assert will_ingest(item_id=repaired.item_id, replace=False, has_hash=True) is True

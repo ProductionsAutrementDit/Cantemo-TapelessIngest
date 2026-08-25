@@ -35,9 +35,7 @@ from portal.plugins.TapelessIngest.providers import red as red_module
 
 # A trimmed REDline --printMeta 3 CSV: only the columns the provider reads,
 # in REDline's own order, with the trailing comma real output carries.
-REDLINE_HEADER = (
-    "Clip Name,Camera Model,Camera PIN,UUID,Date,Timestamp,Abs TC,"
-)
+REDLINE_HEADER = "Clip Name,Camera Model,Camera PIN,UUID,Date,Timestamp,Abs TC,"
 REDLINE_ROW = (
     "K001_K001_0804TX,KOMODO 6K,KMDBK006080,"
     "42B681D6-2AB5-46A2-8DEA-B1C05BD0CA54,20260804,103910,10:39:10:00,"
@@ -106,9 +104,7 @@ def test_cron_path_without_usr_local_bin_still_resolves(
     assert red_module.resolve_redline_path() == installed
 
 
-def test_unresolvable_redline_raises_naming_the_binary(
-    monkeypatch, no_configured_path
-):
+def test_unresolvable_redline_raises_naming_the_binary(monkeypatch, no_configured_path):
     monkeypatch.setattr(red_module.shutil, "which", lambda _: None)
     monkeypatch.setattr(red_module, "REDLINE_FALLBACK_PATHS", ())
 

@@ -22,11 +22,13 @@ def build_nested_helper(path, text, container, value):
             container["groups"][head] = [{"fields": {}}]
         build_nested_helper(":".join(tail), text, container["groups"][head][0], value)
 
+
 def build_nested(paths):
     container = {"fields": {}, "groups": {}}
     for path, value in paths.items():
         build_nested_helper(path, path, container, value)
     return container
+
 
 def ClipResetWithItemDeletion(_deleted_resource_name):
     from portal.plugins.TapelessIngest.models.clip import Clip
@@ -38,10 +40,22 @@ def ClipResetWithItemDeletion(_deleted_resource_name):
     try:
         clips = Clip.objects.filter(item_id=_deleted_resource_name)
         for clip in clips:
+            # `Clip.item` memoizes the fetched item under this key for
+            # 180 s and nothing else invalidates it — without this, for
+            # 3 minutes after an in-Portal deletion the cache keeps
+            # answering with the dead item and defeats the unresolvable-
+            # item refusal.
+            cache.delete(f"item:{clip.item_id}")
             clip.file_id = None
             clip.item_id = ""
             clip.job_id = ""
             clip.output_file = None
+            # The reset the log line below has always claimed, and never
+            # performed. Deleting the orphaned item is the natural manual
+            # repair for an interrupted submission, and without this the
+            # repair left PLACEHOLDER_CREATED beside an empty `item_id` —
+            # a status the UI displays as an import that never happened.
+            clip.status = Clip.STATUS_NOT_IMPORTED
             clip.save()
             log.info(f"Put clip {clip.umid} status as Not Imported")
     except Exception as e:

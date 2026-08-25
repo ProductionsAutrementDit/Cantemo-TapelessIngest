@@ -1340,6 +1340,13 @@ class Folder(models.Model):
                             f"Error ingesting clip {clip}: {e}",
                             exc_info=True,
                         )
+                        # A clip whose submission raised is a FAILED clip
+                        # (story 3.0): before, it was counted nowhere —
+                        # not ingested, not skipped, not failed — so the
+                        # summary's arithmetic quietly lost it. The
+                        # unresolvable-item refusal (TapelessIngestException
+                        # from create_item) lands here too, by design.
+                        response["failed"] += 1
                         response["errors"].append(f"Error ingesting clip {clip}: {e}")
 
         return response
