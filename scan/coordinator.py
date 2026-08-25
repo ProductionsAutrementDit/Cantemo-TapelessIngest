@@ -45,14 +45,18 @@ merge key already guarantees byte-identical output under out-of-order
 completion. No ``WorkerResult`` change is required for any of it.
 """
 
+import logging
 import os
 import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from dataclasses import dataclass, fields, replace
 from heapq import heappop, heappush
 from typing import Any, Callable, Dict, FrozenSet, List, Optional, Tuple
 
 from .verification import FolderListings
+
+log = logging.getLogger(__name__)
 
 __all__ = [
     "AD13_COUNTER_KEYS",
@@ -63,6 +67,7 @@ __all__ = [
     "FolderOutcome",
     "FolderTimings",
     "PhaseTimer",
+    "PoolDispatcher",
     "RunResult",
     "SequentialDispatcher",
     "WorkItem",
@@ -112,8 +117,11 @@ TIMING_PHASES = (
 # Options that only tree mode may carry. The four folder filters are
 # genuinely meaningless in paged mode — a paged call scans ONE folder and
 # never walks, so a `--skip`/`--only`/`--startWith`/date-window narrowing
-# could only mislead a caller into thinking it had been applied. Epic 3
-# adds `workers` and Epic 4 adds `discovery` to this tuple.
+# could only mislead a caller into thinking it had been applied. Epic 4
+# adds `discovery` to this tuple. Story 3.1's `workers` is tree-only too,
+# but NOT via this tuple: the tuple's "in use" test is truthiness, and
+# `workers` carries its default as the truthy scalar 1 — its rejection is
+# the explicit `> 1` check in `assert_mode_options`.
 TREE_ONLY_OPTIONS = ("skip", "only", "startwith", "date_window")
 
 # Safety valve for the fan-out seam (E29). A `gather()` that never reports
@@ -515,6 +523,16 @@ def assert_mode_options(options, mode: str) -> None:
             f"tree-only option(s) {', '.join(sorted(offending))} cannot be "
             f"used in paged mode"
         )
+    # `workers` is tree-only too, but its default (1) is truthy, so the
+    # tuple's truthiness test cannot police it: a paged call on one folder
+    # has nothing to fan out, and a caller asking for a pool there has
+    # confused the modes (AD-14, story 3.1).
+    workers = getattr(options, "workers", 1)
+    if workers is not None and workers > 1:
+        raise ValueError(
+            f"workers={workers} cannot be used in paged mode: the worker "
+            f"pool is tree mode's"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -580,6 +598,111 @@ class SequentialDispatcher:
         """Every ``(item, outcome)`` pair completed since the last call."""
         done, self._done = self._done, []
         return done
+
+
+class PoolDispatcher:
+    """The story-3.1 fan-out: ``dispatch`` submits, ``gather`` drains.
+
+    ``SequentialDispatcher``'s shape over a ``ThreadPoolExecutor``, and the
+    ONLY thing Epic 3 substitutes — ``walk_tree`` and everything it calls
+    are untouched. The contract, from ``walk_tree``'s own loop:
+
+    * ``dispatch(fn, item)`` submits and returns. A raising submission
+      (a shut-down executor) propagates: ``walk_tree`` catches exactly
+      ``dispatch`` and books the item as a ``_walk_failure``.
+    * ``gather()`` returns completed ``(item, outcome)`` pairs. It is
+      NON-blocking while the walk is still feeding work (a ``dispatch``
+      happened since the last ``gather``), so the pool actually fills;
+      once the stack is empty the walk calls ``gather`` back-to-back, and
+      then it BLOCKS until at least one future completes — an empty
+      non-blocking answer there would idle-spin the walk into
+      ``MAX_IDLE_ROUNDS`` and kill a healthy run.
+    * a worker exception becomes a ``_walk_failure``-shaped OUTCOME, never
+      an exception out of ``gather``: ``process_folder`` never raises by
+      contract, so anything a future holds is the pool-side wrapper (or a
+      contract violation), and one folder's death must not cost the run.
+      ``BaseException`` — ``KeyboardInterrupt``, ``SystemExit`` — still
+      propagates, exactly as it does through ``process_folder``.
+
+    Completion order is whatever the pool produced; output order is the
+    merge key's job and is proven byte-identical either way.
+
+    A blocking wait is a LOOP at ``warn_interval`` (default 300 s), not a
+    bare ``wait(timeout=None)``: a genuinely slow folder keeps its
+    sequential-parity semantics — the run waits, exactly as a sequential
+    run would sit inside that folder — but a HUNG one becomes diagnosable,
+    a warning naming the outstanding folder paths every interval instead
+    of a silent nightly run an operator cannot tell from a dead one.
+    """
+
+    __slots__ = ("_executor", "_pending", "_fed", "_warn_interval")
+
+    def __init__(self, max_workers, warn_interval=300.0):
+        self._executor = ThreadPoolExecutor(
+            max_workers=max_workers, thread_name_prefix="tapeless-scan"
+        )
+        self._pending = {}
+        self._fed = False
+        self._warn_interval = warn_interval
+
+    def dispatch(self, fn: Callable[["WorkItem"], "FolderOutcome"], item) -> None:
+        self._pending[self._executor.submit(fn, item)] = item
+        self._fed = True
+
+    def _wait_for_completion(self):
+        """Block until >= 1 future is done, warning every ``warn_interval``."""
+        while True:
+            done, _ = wait(
+                list(self._pending),
+                timeout=self._warn_interval,
+                return_when=FIRST_COMPLETED,
+            )
+            if done:
+                return done
+            outstanding = sorted(item.path for item in self._pending.values())
+            log.warning(
+                f"scan pool: no folder completed in "
+                f"{self._warn_interval:.0f}s; still running: "
+                f"{', '.join(outstanding)}"
+            )
+
+    def gather(self):
+        """Completed ``(item, outcome)`` pairs; blocks once the feed stops."""
+        if not self._pending:
+            return []
+        if self._fed:
+            self._fed = False
+            done, _ = wait(list(self._pending), timeout=0, return_when=FIRST_COMPLETED)
+        else:
+            done = self._wait_for_completion()
+        batch = []
+        for future in done:
+            item = self._pending[future]
+            try:
+                outcome = future.result()
+            except Exception as e:
+                # The AD-12 folder-boundary shape: counted failed, its
+                # lines in both errors and log_lines, the run continues.
+                outcome = _walk_failure(
+                    item.path,
+                    item.merge_key,
+                    [f"Error scanning {item.path}: {e}"],
+                )
+            batch.append((item, outcome))
+            # Un-book the future only AFTER its pair is appended: a
+            # BaseException out of result() (the operator's Ctrl-C) must
+            # not discard pairs this batch already gathered — they stay
+            # pending and nothing is lost, whichever way the run ends.
+            del self._pending[future]
+        return batch
+
+    def shutdown(self, wait: bool = True) -> None:
+        """Release the pool's threads; queued never-gathered work is dropped.
+
+        ``wait=False`` is the dying run's path (a raising ``emit``,
+        Ctrl-C): do not stall the exception behind in-flight folders.
+        """
+        self._executor.shutdown(wait=wait, cancel_futures=True)
 
 
 def _child_items(

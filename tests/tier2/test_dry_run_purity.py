@@ -54,12 +54,10 @@ agree. Against the real leg it cannot.
 
 import os
 import re
-from contextlib import contextmanager
 
 import pytest
 from django.contrib.auth.models import User
 from django.core.management import call_command
-from django.db import connection
 
 from portal.plugins.TapelessIngest.models.clip import Clip, ClipMetadata
 from portal.plugins.TapelessIngest.models.folder import Folder
@@ -73,6 +71,7 @@ from portal.plugins.TapelessIngest.scan.coordinator import (
 )
 
 from tests.portal_stub import VidispineFake
+from tests.sql_capture import captured_sql
 
 STORAGE_ID = "VX-41"
 PROVIDER_NAME = "fakedryrun"
@@ -206,32 +205,14 @@ def _write_clips(tmp_path, rel, names, hashes=None):
     return sources
 
 
-@contextmanager
-def _captured_sql():
-    """Every statement executed on this connection, in order.
-
-    ``connection.execute_wrapper`` rather than ``CaptureQueriesContext``:
-    the wrapper sits under the cursor, so it sees ``bulk_create`` and
-    ``queryset.update`` whatever the DEBUG setting and whatever the
-    query-log truncation does.
-
-    THREAD-LOCAL, and that matters for Epic 3. ``django.db.connection`` is
-    a per-thread proxy, so this watches only the statements the CALLING
-    thread issues. The moment the coordinator runs `process_folder` on a
-    worker pool, every write those workers make happens on a different
-    connection and this wrapper sees NOTHING — the purity assertions would
-    keep passing while proving nothing at all. When that lands, this has
-    to move to a ``connection_created`` signal handler that installs the
-    wrapper on each new connection as it appears.
-    """
-    statements = []
-
-    def recorder(execute, sql, params, many, context):
-        statements.append(sql)
-        return execute(sql, params, many, context)
-
-    with connection.execute_wrapper(recorder):
-        yield statements
+# Every statement executed on ANY connection, in order. The former local
+# copy registered on ``django.db.connection`` — the calling thread's
+# proxy — so under the story-3.1 worker pool it would have watched none
+# of the workers' statements and the purity assertions would have kept
+# passing while proving nothing. The shared helper installs the wrapper
+# through the ``connection_created`` signal, so every worker's connection
+# is seen the moment it appears (D24, discharged in 3.1).
+_captured_sql = captured_sql
 
 
 def _assert_read_only(statements):

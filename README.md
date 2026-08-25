@@ -59,8 +59,27 @@ the command modules themselves are import-side-effect-free):
 Flags, defaults, output, and failure modes are identical to the old scripts
 (`--storage`, `--path`, `--userId` required; `--startWith`, `--providers`,
 `--skip`, `--only` accept multiple values; plus `--from`, `--since`,
-`--dryrun`, `--replace`). Check with
+`--dryrun`, `--replace`, and since story 3.1 `--workers`). Check with
 `/opt/cantemo/python/bin/python /opt/cantemo/portal/manage.py scan_tapeless_dir --help`.
+
+### Parallel scanning (`--workers`, story 3.1)
+
+The tree walk processes folders on a worker pool. `--workers N` sets the
+pool width, validated at parse time to `1..16`; **the default is 4** — the
+report (counters, log lines, Slack, DB rows) is byte-identical to a
+sequential run, proven by the `--workers 4` ≡ `--workers 1` equivalence
+tests.
+
+Two operational facts worth knowing:
+
+* **The default changed behavior on deploy**: the first nightly cron run
+  after deploying story 3.1 becomes 4-way concurrent with **no crontab
+  change and no operator action**. Watch the first run's duration and the
+  Vidispine/NFS load once.
+* **`--workers 1` is the rollback lever**: it takes the exact pre-3.1
+  sequential code path (no executor is even constructed). If a pooled run
+  misbehaves, append `--workers 1` to the cron line and the scan behaves
+  as it did before the story, byte for byte.
 
 **Dependency note:** the command modules import `slack_sdk` at module level,
 and Django imports every management command module on *any* `manage.py`

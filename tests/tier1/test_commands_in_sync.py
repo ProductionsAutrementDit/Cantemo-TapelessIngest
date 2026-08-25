@@ -22,6 +22,8 @@ SHARED_HELPERS = [
     "parse_from",
     "compute_date_window",
     "format_window_log",
+    # Story 3.1: the --workers parse-time validator ([1, MAX_WORKERS]).
+    "positive_worker_count",
     # Story 2.6 added `should_scan_entry` and `consumed_subdirs_from_results`
     # here as a stopgap: each command carried its own copy of the recursion,
     # and check_clips_in_folder's copy landed unexecuted and uncompared, so

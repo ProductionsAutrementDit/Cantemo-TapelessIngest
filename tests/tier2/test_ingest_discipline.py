@@ -1507,3 +1507,36 @@ def test_makemigrations_sees_no_model_change(migrated_db):
     from django.core.management import call_command
 
     call_command("makemigrations", "TapelessIngest", check=True, dry_run=True)
+
+
+def test_the_settings_profile_is_resolved_as_the_runs_user(
+    migrated_db, es_fake, es_page, ingestable_provider, tmp_path, collection_seam
+):
+    """`import_file` builds a PER-CALL UserHelper(runas=user) (story 3.1).
+
+    `create_item`'s old default was ONE UserHelper built at
+    class-definition time — with runas=None — shared by every caller in
+    the process: cross-thread shared state under the pool, and the
+    settings profile silently resolved as nobody. The stub records
+    `runas` on getUserSettingsProfile precisely so this run can prove the
+    profile was resolved AS THE RUN'S USER.
+    """
+    from django.contrib.auth.models import User
+
+    rel = "2026/AH_20260101_runas"
+    es_fake.push(es_page(_ingestable_page(tmp_path, rel, ["CLIPUH"]), total=1))
+    VidispineFake.set_import_response({"jobId": "VX-JOB-UH"})
+    user = User.objects.create(pk=4245, username="story31-runas")
+    try:
+        response = _folder(tmp_path, rel).ingest(user=user, providers=[INGESTABLE_NAME])
+
+        assert response["ingested"] == 1
+        profile_calls = [
+            details
+            for name, details in VidispineFake.calls
+            if name == "getUserSettingsProfile"
+        ]
+        assert profile_calls, VidispineFake.call_names()
+        assert all(details["runas"] is user for details in profile_calls)
+    finally:
+        user.delete()  # keep the auth table empty for the unknown-user tests

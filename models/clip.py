@@ -234,9 +234,13 @@ class Clip(models.Model):
         module = __import__(moduleName, {}, {}, className)
         Provider = getattr(module, className)()
 
-        # Cache the instance
-        cls._PROVIDER_CACHE[provider_name] = Provider
-        return Provider
+        # setdefault, not a plain assignment (story 3.1): two worker
+        # threads can both miss the check above and both instantiate, and
+        # the old check-then-set handed each its own instance. Instance
+        # identity is load-bearing — ExtensionMap ranks providers by
+        # id(provider) — so whichever write lands first wins for BOTH
+        # callers; the loser's instance is discarded, never handed out.
+        return cls._PROVIDER_CACHE.setdefault(provider_name, Provider)
 
     @classmethod
     def _get_provider_list(cls, providers: Optional[List[str]] = None) -> List[Any]:
@@ -934,7 +938,7 @@ class Clip(models.Model):
         replace: bool = False,
         metadatagroupname: str = "Film",
         gh: Any = GroupHelper(),
-        uh: Any = UserHelper(),
+        uh: Any = None,
         ith: Any = ItemHelper(),
         ch: Any = CollectionHelper(),
     ) -> Tuple[Any, bool]:
@@ -954,6 +958,14 @@ class Clip(models.Model):
             Tuple of (item object, created flag) where created is True if new item was created
         """
         created = False
+
+        # Story 3.1 review: `uh` defaults to None and is built PER CALL,
+        # as the run's user. The old class-definition-time
+        # ``UserHelper()`` default was one shared instance — with
+        # ``runas=None`` — for every caller in the process; a future
+        # caller omitting ``uh`` must not silently inherit it back.
+        if uh is None:
+            uh = UserHelper(runas=user)
 
         if self.item_id and self.item is None:
             # The row NAMES an item Vidispine cannot resolve — `Clip.item`
@@ -1396,6 +1408,13 @@ class Clip(models.Model):
         _gh = GroupHelper(runas=user)
         _ch = CollectionHelper(runas=user)
         _sh = StorageHelper(runas=user)
+        # Per-call, like every helper above (story 3.1): create_item's
+        # `uh` default is a single UserHelper built at class-definition
+        # time — with runas=None — shared by every caller in the process.
+        # Under the worker pool that is cross-thread shared state, and it
+        # ignores the run's user; the other helper defaults were already
+        # overridden here, uh was the one that slipped through.
+        _uh = UserHelper(runas=user)
 
         # Create item if it doesn't exist
         _, created = self.create_item(
@@ -1404,6 +1423,7 @@ class Clip(models.Model):
             replace=replace,
             ith=_ith,
             gh=_gh,
+            uh=_uh,
             ch=_ch,
         )
         if not replace and not created and not retry_incomplete:

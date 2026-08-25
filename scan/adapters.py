@@ -132,6 +132,7 @@ def build_context(
     only: Optional[Iterable[str]] = None,
     startwith: Optional[Iterable[str]] = None,
     date_window: Optional[Iterable[str]] = None,
+    workers: int = 1,
 ) -> ScanContext:
     """Build the one per-run context for tree mode (commands' ``handle()``).
 
@@ -144,6 +145,12 @@ def build_context(
     exact aliasing bug story 2.6 removed from the date window. They default
     to ``None`` so every pre-2.8 call site compiles untouched.
     """
+    # Story 3.1 review: the CLI validates --workers at parse time, but a
+    # PROGRAMMATIC caller could smuggle 0, a negative, or a string into
+    # the frozen options and only fail deep inside the run (or silently
+    # take the sequential path off a truthy "0"). Same fail-fast here.
+    if not isinstance(workers, int) or isinstance(workers, bool) or workers < 1:
+        raise ValueError(f"workers must be an int >= 1 (got {workers!r})")
     registry, extension_map = _build_registry_and_map(providers)
     return ScanContext(
         storages=resolve_storages(storage_ids),
@@ -157,6 +164,7 @@ def build_context(
             only=tuple(only or ()),
             startwith=tuple(startwith or ()),
             date_window=tuple(date_window or ()),
+            workers=workers,
         ),
         provider_registry=registry,
         extension_map=extension_map,

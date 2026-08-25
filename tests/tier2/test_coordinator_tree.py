@@ -27,12 +27,17 @@ import re
 
 import pytest
 from django.contrib.auth.models import User
+from django.core.cache import cache
+from django.core.management import call_command
 
 from portal.plugins.TapelessIngest.helpers import TapelessIngestException
-from portal.plugins.TapelessIngest.models.clip import Clip
+from portal.plugins.TapelessIngest.models.clip import Clip, ClipMetadata
 from portal.plugins.TapelessIngest.models.folder import Folder
 from portal.plugins.TapelessIngest.scan.adapters import build_context
 from portal.plugins.TapelessIngest.scan.coordinator import RunResult, TIMING_PHASES
+
+from tests.portal_stub import RestTransportFake, VidispineFake
+from tests.sql_capture import captured_sql
 
 STORAGE_ID = "VX-41"
 ROOT = "2026"
@@ -386,3 +391,147 @@ def test_a_dry_tree_run_writes_no_rows(migrated_db, tree, fake_provider, es_fake
     assert run_result.counters.created == 3
     # ...and wrote none of them.
     assert (Clip.objects.count(), Folder.objects.count()) == before
+
+
+# --------------------------------------------------------------------------
+# Story 3.1: the pool through the whole composition
+# --------------------------------------------------------------------------
+
+READ_ONLY_SQL = re.compile(
+    r"^(SELECT|SAVEPOINT|RELEASE|ROLLBACK|BEGIN|PRAGMA)\b", re.IGNORECASE
+)
+
+
+def _stable_rows():
+    """The run's DB rows, minus pks/timestamps that legitimately differ."""
+    clips = sorted(
+        Clip.objects.values_list(
+            "umid",
+            "folder_path",
+            "path",
+            "storage_id",
+            "status",
+            "provider_name",
+            "reference_file",
+        )
+    )
+    metadatas = sorted(ClipMetadata.objects.values_list("clip_id", "name", "value"))
+    folders = sorted(
+        Folder.objects.values_list(
+            "path", "storage_id", "clips_total", "provider_names"
+        )
+    )
+    return clips, metadatas, folders
+
+
+def _comparable(run_result):
+    """Everything but the timings, which legitimately differ run to run."""
+    return dataclasses.replace(run_result, timings=None)
+
+
+def _normalized_emission(emitted):
+    """The emission with the wall-clock summary line made comparable."""
+    # emitted[-2] is "N folders scanned, M failed in X.Xs — <phases>";
+    # only its timings differ between runs.
+    return emitted[:-2] + [emitted[-2].split(" in ")[0]] + [emitted[-1]]
+
+
+def test_workers_4_is_equivalent_to_workers_1(
+    migrated_db, tree, fake_provider, es_fake, django_user, monkeypatch
+):
+    """The story's headline AC, over the real composition and real rows.
+
+    Same fixture tree, a WRITING run (`dry_run=False`): the sequential
+    run and the 4-worker run must produce identical merged counters,
+    identical emitted lines and identical DB rows. The DB and the fakes
+    are reset between the halves, because the second run must start from
+    the same world the first did.
+    """
+    # The same double every non-dry test here uses: getCollection needs a
+    # Settings row and a live search backend and says nothing about the
+    # equivalence.
+    monkeypatch.setattr(
+        Folder, "getCollection", lambda self, user, dryrun=False: "VX-COLLECTION"
+    )
+
+    sequential_result, sequential_emitted = _run(
+        _context(fake_provider, dry_run=False, user=django_user, workers=1)
+    )
+    sequential_rows = _stable_rows()
+    assert sequential_rows[0], "the writing run wrote no clips — vacuous"
+
+    # Reset the world: rows, django cache, the Vidispine call logs.
+    call_command("flush", interactive=False, verbosity=0)
+    cache.clear()
+    VidispineFake.reset()
+    RestTransportFake.reset()
+
+    pooled_result, pooled_emitted = _run(
+        _context(fake_provider, dry_run=False, user=django_user, workers=4)
+    )
+    pooled_rows = _stable_rows()
+
+    assert _comparable(pooled_result) == _comparable(sequential_result)
+    assert _normalized_emission(pooled_emitted) == _normalized_emission(
+        sequential_emitted
+    )
+    assert pooled_rows == sequential_rows
+
+
+def test_a_pooled_dry_run_writes_nothing_from_any_thread(
+    migrated_db, tree, fake_provider, es_fake
+):
+    """`--dryrun --workers 4`: purity, asserted by the SIGNAL recorder.
+
+    The workers write (or here: must not write) on connections of their
+    own; the old thread-local wrapper would have watched none of them.
+    ``captured_sql`` installs itself through ``connection_created``, so a
+    single worker-thread INSERT would land in ``statements`` and fail the
+    whitelist.
+    """
+    ctx = _context(fake_provider, workers=4)
+    before = _stable_rows()
+
+    with captured_sql() as statements:
+        run_result, _emitted = _run(ctx)
+
+    # The run really worked (three clips planned) and really queried —
+    # otherwise the recorder is watching nothing.
+    assert run_result.counters.created == 3
+    assert statements
+    offending = [s for s in statements if not READ_ONLY_SQL.match(s.lstrip())]
+    assert not offending, offending
+    assert _stable_rows() == before
+
+
+def test_workers_above_one_is_rejected_in_paged_mode(migrated_db, tree, fake_provider):
+    """AD-14: a paged call scans ONE folder; a pool there is a mode confusion.
+
+    Through the model boundary, so the ValueError arrives as the
+    TapelessIngestException the Portal UI/API callers see.
+    """
+    # No startwith: the four folder filters are policed separately, and
+    # this test is about the workers rejection specifically.
+    ctx = _context(fake_provider, workers=4, startwith=())
+    folder = Folder(storage_id=STORAGE_ID, path=HIT_ONE)
+
+    with pytest.raises(TapelessIngestException, match="workers=4"):
+        folder.scan(context=ctx)
+    with pytest.raises(TapelessIngestException, match="workers=4"):
+        folder.ingest(context=ctx)
+
+
+def test_workers_1_takes_the_sequential_path_and_builds_no_executor(
+    migrated_db, tree, fake_provider, es_fake, monkeypatch
+):
+    """`workers=1` IS the pre-3.1 code path, not a one-thread pool."""
+    from portal.plugins.TapelessIngest.models import folder as folder_module
+
+    def no_pool(*args, **kwargs):
+        raise AssertionError("workers=1 constructed a PoolDispatcher")
+
+    monkeypatch.setattr(folder_module, "PoolDispatcher", no_pool)
+
+    run_result, _emitted = _run(_context(fake_provider, workers=1))
+
+    assert run_result.counters.hits == 3

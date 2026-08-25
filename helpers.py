@@ -11,6 +11,7 @@ Ingest helpers for the tapeless clips.
 import os
 import re
 import logging
+import threading
 import urllib.parse
 
 from django.core.cache import cache  # type: ignore
@@ -26,6 +27,21 @@ from portal.plugins.TapelessIngest.models.settings import Settings  # type: igno
 from portal.plugins.TapelessIngest.scan.context import browse_root_path
 
 log = logging.getLogger(__name__)
+
+# Story 3.1: collection resolution is check-then-create over a 60 s cache.
+# Two pool workers resolving overlapping paths could both miss the cache
+# and both create the same Vidispine collection; the lock serializes the
+# whole resolve-or-create walk so the second worker finds what the first
+# cached. IN-PROCESS only, deliberately: the cross-process race (cron run
+# beside a Portal UI ingest) predates the pool and belongs to the
+# deferred mutual-exclusion story (see deferred-work.md).
+_collection_resolution_lock = threading.Lock()
+
+# Bounded acquire (3.1 review): one resolver wedged inside a hung
+# Vidispine call must not block every other worker forever. On timeout
+# the folder fails honestly at its boundary (process_folder catches),
+# instead of the whole pool silently queueing behind one dead call.
+COLLECTION_RESOLUTION_LOCK_TIMEOUT = 300
 
 
 class TapelessIngestException(Exception):
@@ -112,8 +128,38 @@ class TapelessIngestHelper(IngestHelper):
 
         filtered_path = os.sep.join(filtered_path_items)
 
+        # Double-checked fast path (3.1 review): a warm cache answers
+        # WITHOUT touching the lock, so concurrent workers serialize only
+        # on real resolve-or-create work, never on pure cache hits.
+        cache_key = urllib.parse.quote(
+            f"tapelessingest_path_collection_{filtered_path}"
+        )
+        collection_id = cache.get(cache_key)
+        if collection_id is not None:
+            return collection_id
+
         ch = CollectionHelper(runas=user)
 
+        if not _collection_resolution_lock.acquire(
+            timeout=COLLECTION_RESOLUTION_LOCK_TIMEOUT
+        ):
+            raise TapelessIngestException(
+                f"collection resolution for {filtered_path} timed out after "
+                f"{COLLECTION_RESOLUTION_LOCK_TIMEOUT}s waiting for another "
+                f"resolver — is a Vidispine call hung?"
+            )
+        try:
+            return TapelessIngestHelper._resolve_collection(
+                ch, filtered_path_items, filtered_path, user
+            )
+        finally:
+            _collection_resolution_lock.release()
+
+    @staticmethod
+    def _resolve_collection(ch, filtered_path_items, filtered_path, user):
+        """The locked resolve-or-create walk over the collection cache."""
+        # The second half of the double check: a worker that queued on the
+        # lock behind the resolver finds the freshly cached id here.
         cache_key = urllib.parse.quote(
             f"tapelessingest_path_collection_{filtered_path}"
         )

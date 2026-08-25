@@ -16,6 +16,7 @@ portal.pluginbase.core) and crashes at collection before this file runs.
 import logging
 import os
 import sys
+import threading
 import warnings
 from pathlib import Path
 
@@ -48,6 +49,7 @@ from django.core.cache import cache  # noqa: E402
 from django.core.management import call_command  # noqa: E402
 
 from tests.portal_stub import (  # noqa: E402
+    ClientFake,
     RestTransportFake,
     StorageHelperFake,
     VidispineFake,
@@ -97,6 +99,11 @@ class FakeProvider:
     "scan_context" (story 2.1: providers resolve absolute paths through
     it) and "listings" (story 2.2: the scan's FolderListings instance,
     the 2.3 sidecar-probe reuse surface) keys are load-bearing.
+
+    Story 3.1: the `seen_*` recorders are appended from POOL WORKER
+    threads whenever a test runs the tree with `workers > 1`, so the two
+    appends are taken under a lock — the pair recorded by one call can
+    never interleave with another thread's.
     """
 
     name = "Fake Test Provider"
@@ -105,6 +112,7 @@ class FakeProvider:
     def __init__(self):
         self.seen_scan_contexts = []
         self.seen_listings = []
+        self._seen_lock = threading.Lock()
 
     def getExtensions(self):
         return [".fake"]
@@ -116,8 +124,9 @@ class FakeProvider:
         return []
 
     def getMetadatasFromFile(self, media_file, metadatas, context):
-        self.seen_scan_contexts.append(context.get("scan_context"))
-        self.seen_listings.append(context.get("listings"))
+        with self._seen_lock:
+            self.seen_scan_contexts.append(context.get("scan_context"))
+            self.seen_listings.append(context.get("listings"))
         metadatas["provider"] = self.machine_name
         metadatas["umid"] = os.path.splitext(media_file.getPath())[0]
         return metadatas
@@ -138,6 +147,18 @@ def _reset_query_elastic_fake():
         f"{len(leftover)} unused page(s) — the test pushed more responses "
         f"than scan requested"
     )
+
+
+@pytest.fixture(autouse=True)
+def _reset_client_fake():
+    """Autouse: the portal.api.client put-responder is class state.
+
+    Without this, one test's routed search responder would keep answering
+    for every later test, silently defeating the refuse-by-default AD-11
+    placeholder behavior.
+    """
+    yield
+    ClientFake.reset()
 
 
 @pytest.fixture(autouse=True)

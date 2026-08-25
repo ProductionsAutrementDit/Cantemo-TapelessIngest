@@ -765,6 +765,13 @@ class GroupHelperFake(_HelperFake):
 
 class UserHelperFake(_HelperFake):
     def getUserSettingsProfile(self, basegroup=None):
+        # `runas` is recorded so tests can prove the profile was resolved
+        # AS THE RUN'S USER — story 3.1's per-call UserHelper(runas=user)
+        # fix in `import_file` is invisible without it (the shared
+        # class-definition-time default carried runas=None).
+        VidispineFake.record(
+            "getUserSettingsProfile", runas=self.runas, basegroup=basegroup
+        )
         return "VX-6"
 
 
@@ -774,7 +781,11 @@ class CollectionHelperFake(_HelperFake):
         return {"id": collection_id}
 
     def createCollection(self, collection_name=None, settingsprofile_id=None):
-        VidispineFake.record("createCollection", name=collection_name)
+        # `collection_name=`, not `name=`: record()'s first positional IS
+        # `name` (the call name), and the old kwarg collided with it —
+        # a TypeError no test ever hit because nothing executed this
+        # method until story 3.1's collection-lock tests.
+        VidispineFake.record("createCollection", collection_name=collection_name)
         return FakeItem(f"VX-COLLECTION-{collection_name}")
 
     def addCollectionToCollection(self, parent_id, collection_id):
@@ -859,6 +870,46 @@ def _stub_exception(name):
     return type(name, (Exception,), {"__doc__": f"portal_stub placeholder for {name}"})
 
 
+class ClientResponse:
+    """The two attributes plugin code reads off a ``portal.api.client`` answer."""
+
+    def __init__(self, status_code, data):
+        self.status_code = status_code
+        self.data = data
+
+
+class ClientFake:
+    """``portal.api.client`` double — AD-11's sanctioned home for it.
+
+    Default behavior is unchanged from the refusing placeholder: calling
+    ``client.put`` with no responder installed raises, exactly like every
+    other unmodelled Portal surface. A test that needs the v2 search
+    surface (story 3.1: ``get_collection_from_path``'s collection lookup)
+    installs one with ``route_put`` and the conftest autouse reset clears
+    it after every test.
+    """
+
+    put_responder = None
+
+    @classmethod
+    def route_put(cls, responder):
+        cls.put_responder = responder
+
+    @classmethod
+    def reset(cls):
+        cls.put_responder = None
+
+
+def _client_put(*args, **kwargs):
+    if ClientFake.put_responder is None:
+        raise NotImplementedError(
+            "portal.api.client.put is a portal_stub placeholder and must not "
+            "be called in off-server tests (AD-11) — install a responder "
+            "with ClientFake.route_put(...) first"
+        )
+    return ClientFake.put_responder(*args, **kwargs)
+
+
 def _stub_callable(qualname):
     def _stub(*args, **kwargs):
         raise NotImplementedError(
@@ -905,7 +956,7 @@ _MODULES = {
     "portal.api.client": {
         "get": _stub_callable("portal.api.client.get"),
         "post": _stub_callable("portal.api.client.post"),
-        "put": _stub_callable("portal.api.client.put"),
+        "put": _client_put,
         "delete": _stub_callable("portal.api.client.delete"),
     },
     "portal.api.v2": {},

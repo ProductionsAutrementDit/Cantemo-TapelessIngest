@@ -5,7 +5,7 @@ import uuid
 import os
 import re
 from typing import Optional, Dict, List, Any
-from django.db import DatabaseError, models, transaction
+from django.db import DatabaseError, connections, models, transaction
 
 # `Q` in this module is opensearch-dsl's (the search doc); the ORM's is
 # aliased so the two can never be confused at a call site.
@@ -38,6 +38,7 @@ from portal.plugins.TapelessIngest.scan.context import browse_root_path
 from portal.plugins.TapelessIngest.scan.coordinator import (
     FolderOutcome,
     PhaseTimer,
+    PoolDispatcher,
     SequentialDispatcher,
     WorkerCounters,
     WorkerResult,
@@ -196,13 +197,17 @@ def _persist_recovered_item_ids(recovered_item_ids):
 def providers_for_worker(ctx):
     """The provider registry THIS worker must use (AD-7).
 
-    A function, not an injected callable and not a parameter of any
-    signature: today every worker shares the run's registry, and Epic 3
-    redefines this one function to hand out per-worker instances. The
-    deferred-work entry about shared mutable provider state
-    (``self.folder``, ``self.base_path``, ``self.index_xml`` on cached
-    provider instances) is what it exists for; this story ships only the
-    seam.
+    Story 3.1 kept this the SHARED run registry, by proof rather than by
+    per-worker instantiation: Epic 2 moved per-run provider state off
+    ``self`` and into the per-invocation ``provider_context``, and the
+    tier-1 guard (``tests/tier1/test_provider_write_once.py``) AST-scans
+    every registry provider class for a ``self.<attr>`` write outside
+    ``__init__`` and fails on any hit — so the shared instances are
+    write-once and thread-safe. Per-worker instances were rejected for a
+    load-bearing reason: ``ExtensionMap`` ranks providers by
+    ``id(provider)``, so fresh instances would silently require
+    per-worker extension maps too. (``jvcprohd`` really does mutate
+    itself, and is outside the registry; see the guard's docstring.)
     """
     return ctx.provider_registry
 
@@ -324,7 +329,8 @@ def process_folder(
     Module-level rather than a bound method because the coordinator that
     calls it is ORM-free by contract: it hands over a ``(storage_id,
     path)`` pair and this function opens the ``Folder`` on the model side
-    of the boundary. Epic 3 wraps exactly this call with per-worker
+    of the boundary. Story 3.1's pool wraps exactly this call —
+    ``_process_folder_with_connection_hygiene`` below — with per-worker
     connection hygiene, which is why the ORM must not cross it.
 
     ``ingest`` selects the scan or ingest SHAPE; whether ingestion writes
@@ -361,6 +367,64 @@ def process_folder(
         return _failed_folder_outcome(path, f"Error ingesting {path}: {e}")
     except Exception as e:
         return _failed_folder_outcome(path, f"Error scanning {path}: {e}")
+
+
+def _process_folder_with_connection_hygiene(
+    storage_id,
+    path,
+    ctx,
+    *,
+    first,
+    number,
+    cursor,
+    count_only,
+    ingest,
+):
+    """``process_folder`` plus the per-worker connection hygiene (AD-5).
+
+    The pool-mode worker body, and ONLY the pool's: ``workers=1`` keeps
+    calling ``process_folder`` bare, so the sequential path is
+    byte-identical to 2.8's. The parameters are mandatory on purpose —
+    the walk always passes all five (``number=0`` is the loop-all-pages
+    sentinel), and a default here (the first cut carried ``number=25``)
+    could only mislead a reader about what a pool worker actually runs.
+
+    Each pool worker runs on a thread of its own, and Django connections
+    are per-thread — closing them in a ``finally`` (per task, success or
+    failure alike) means no worker thread ever holds a stale connection
+    across folders, and the pool's threads leave nothing open behind
+    them. The main thread's connection is untouched: ``close_all()``
+    only closes the CALLING thread's connections. Trade-off, accepted
+    for the AC's literal wording: per-FOLDER close means per-folder
+    reconnect on the next folder the thread picks up; if that cost ever
+    shows, ``close_old_connections()`` + ``CONN_MAX_AGE`` is the
+    optimization (recorded in deferred-work.md).
+
+    The close itself is guarded: ``process_folder`` never raises, so an
+    exception out of this ``finally`` would CLOBBER a perfectly good
+    folder outcome into a `_walk_failure` — a close hiccup is worth a
+    warning in portal.log, never a failed folder.
+    """
+    try:
+        return process_folder(
+            storage_id,
+            path,
+            ctx,
+            first=first,
+            number=number,
+            cursor=cursor,
+            count_only=count_only,
+            ingest=ingest,
+        )
+    finally:
+        try:
+            connections.close_all()
+        except Exception:
+            log.warning(
+                f"per-worker connection close failed after {path}; the "
+                f"folder's outcome is kept",
+                exc_info=True,
+            )
 
 
 class Folder(models.Model):
@@ -1395,20 +1459,43 @@ class Folder(models.Model):
                     "a collection or submit a clip without one"
                 )
         started = time.monotonic()
-        # The sequential fan-out. Epic 3 substitutes executor.submit /
-        # as_completed for these two bound methods and changes nothing
-        # else: the tree-derived merge key already makes the output
-        # independent of completion order.
-        dispatcher = SequentialDispatcher()
-        outcomes = walk_tree(
-            self.storage_id,
-            self.path,
-            ctx=ctx,
-            process_folder=process_folder,
-            dispatch=dispatcher.dispatch,
-            gather=dispatcher.gather,
-            emit=emit,
-        )
+        # The fan-out seam (story 3.1). `workers > 1` swaps the dispatcher
+        # for a real pool and wraps the worker body with per-thread
+        # connection hygiene — the two bound methods and the worker are
+        # the WHOLE substitution: the walk, the phases and the merge are
+        # identical, and the tree-derived merge key already makes the
+        # output independent of completion order. `workers=1` never
+        # constructs an executor and stays the sequential code path.
+        workers = getattr(ctx.options, "workers", 1) or 1
+        if workers > 1:
+            dispatcher = PoolDispatcher(max_workers=workers)
+            folder_worker = _process_folder_with_connection_hygiene
+        else:
+            dispatcher = SequentialDispatcher()
+            folder_worker = process_folder
+        try:
+            outcomes = walk_tree(
+                self.storage_id,
+                self.path,
+                ctx=ctx,
+                process_folder=folder_worker,
+                dispatch=dispatcher.dispatch,
+                gather=dispatcher.gather,
+                emit=emit,
+            )
+        except BaseException:
+            # The run is dying — a raising emit, or the operator's
+            # Ctrl-C. Release the pool WITHOUT waiting: stalling a
+            # KeyboardInterrupt behind in-flight folders is exactly the
+            # un-stoppable run process_folder's BaseException pass-through
+            # exists to prevent. Queued folders are dropped either way.
+            if workers > 1:
+                dispatcher.shutdown(wait=False)
+            raise
+        if workers > 1:
+            # Normal completion waits: every future was already gathered,
+            # so this only reaps idle threads.
+            dispatcher.shutdown()
         # `walk_tree` already emitted every folder line, incrementally and
         # in merge-key order; `run_result.log_lines` is the same sequence
         # kept for callers that want it as data. Emitting it here too would

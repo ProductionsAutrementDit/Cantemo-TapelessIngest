@@ -248,6 +248,25 @@ Output: Project A > Media Files > CARD_A
 
 ## Advanced Features
 
+### Parallel Nightly Scan (`--workers`)
+
+Since story 3.1 the command-line tree scan (`manage.py scan_tapeless_dir`,
+and its read-only sibling `check_clips_in_folder`) processes folders on a
+worker pool:
+
+- `--workers N` (1..16) sets the pool width; **the default is 4**, so the
+  first nightly cron run after deploying 3.1 is 4-way concurrent with no
+  crontab change.
+- The run's output is byte-identical to a sequential run — same counters,
+  same log lines and Slack report, same database rows — whatever the pool
+  width.
+- **Rollback lever**: `--workers 1` runs strictly sequentially on the
+  exact pre-3.1 code path. Add it to the cron line if a concurrent run
+  ever needs to be ruled out.
+
+This applies to tree (command-line) scans only; UI/API paged scans are
+unaffected and reject `workers > 1`.
+
 ### Spanned Clips
 
 **What are Spanned Clips?**

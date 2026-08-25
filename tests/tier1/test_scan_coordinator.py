@@ -23,6 +23,7 @@ import random
 import re
 import subprocess
 import sys
+import time
 import typing
 from pathlib import Path
 
@@ -43,6 +44,7 @@ from portal.plugins.TapelessIngest.scan.coordinator import (
     FolderOutcome,
     FolderTimings,
     PhaseTimer,
+    PoolDispatcher,
     RunResult,
     SequentialDispatcher,
     WorkerCounters,
@@ -1244,3 +1246,170 @@ def test_a_deduped_root_child_is_a_note_not_a_root_failure(
     # ...and the root produced no error of its own, only the note.
     assert merged.errors == ()
     assert any("Already walked 2026/beta" in line for line in emitted)
+
+
+# --------------------------------------------------------------------------
+# Story 3.1: the REAL pool behind the same seam
+# --------------------------------------------------------------------------
+
+
+def _pooled_walk(tmp_path, root, worker, *, max_workers=4, emit=None):
+    """`_walk` with a real `PoolDispatcher`, always shut down afterwards."""
+    dispatcher = PoolDispatcher(max_workers=max_workers)
+    try:
+        return _walk(tmp_path, root, worker, emit=emit, dispatcher=dispatcher)
+    finally:
+        dispatcher.shutdown()
+
+
+@pytest.mark.parametrize("max_workers", [2, 4])
+def test_the_real_pool_dispatcher_is_byte_identical_to_sequential(
+    tmp_path, max_workers
+):
+    """The out-of-order pin, re-run with the REAL `PoolDispatcher`.
+
+    `_BufferingDispatcher` above proves the property over simulated
+    reorderings; this proves it over genuine thread-pool completion order:
+    same fixture, same worker double, real `ThreadPoolExecutor` — same
+    merged `RunResult` and the same emission sequence, byte for byte.
+    """
+    _tree(tmp_path, *TREE_FIXTURE)
+
+    in_order_emitted = []
+    in_order = merge_results(
+        _walk(
+            tmp_path,
+            "2026",
+            _Worker(hits=TREE_HITS),
+            emit=in_order_emitted.append,
+        )
+    )
+
+    pooled_emitted = []
+    pooled_worker = _Worker(hits=TREE_HITS)
+    pooled = merge_results(
+        _pooled_walk(
+            tmp_path,
+            "2026",
+            pooled_worker,
+            max_workers=max_workers,
+            emit=pooled_emitted.append,
+        )
+    )
+
+    assert pooled == in_order
+    assert pooled_emitted == in_order_emitted
+    # Every folder really was executed (on pool threads), exactly once.
+    assert sorted(path for _, path in pooled_worker.seen) == sorted(TREE_ORDER)
+
+
+class _RaisingWorker(_Worker):
+    """Violates process_folder's never-raise contract for ONE folder.
+
+    `process_folder` never raises by contract, so a raising future stands
+    in for the pool-side wrapper failing — the case `gather` must turn
+    into an outcome rather than an exception.
+    """
+
+    def __init__(self, raise_on, **kwargs):
+        _Worker.__init__(self, **kwargs)
+        self._raise_on = raise_on
+
+    def __call__(self, storage_id, path, ctx, **kwargs):
+        if path == self._raise_on:
+            raise RuntimeError("worker died mid-folder")
+        return _Worker.__call__(self, storage_id, path, ctx, **kwargs)
+
+
+def test_a_raising_future_becomes_a_walk_failure_from_gather(tmp_path):
+    """One folder's future holds an exception; the run keeps everything else.
+
+    The exception surfaces as a `_walk_failure`-shaped outcome FROM
+    `gather` — path-prefixed, counted failed, in both errors and log
+    lines — never as an exception out of `gather` (`walk_tree` catches
+    only `dispatch`).
+    """
+    _tree(tmp_path, "2026/A", "2026/B", "2026/C")
+    emitted = []
+
+    outcomes = _pooled_walk(
+        tmp_path,
+        "2026",
+        _RaisingWorker("2026/B"),
+        max_workers=2,
+        emit=emitted.append,
+    )
+
+    merged = merge_results(outcomes)
+    assert (merged.folders_scanned, merged.folders_failed) == (2, 1)
+    assert "Error scanning 2026/B: worker died mid-folder" in merged.errors
+    # Every other folder's result is intact, in merge-key order.
+    assert emitted == [
+        "visited 2026/A",
+        "Error scanning 2026/B: worker died mid-folder",
+        "visited 2026/C",
+    ]
+
+
+class _SlowWorker(_Worker):
+    def __call__(self, storage_id, path, ctx, **kwargs):
+        time.sleep(0.02)
+        return _Worker.__call__(self, storage_id, path, ctx, **kwargs)
+
+
+def test_pool_gather_blocks_for_outstanding_work_instead_of_idle_spinning(
+    tmp_path, monkeypatch
+):
+    """Stack empty + work outstanding must BLOCK, not spin.
+
+    With `MAX_IDLE_ROUNDS` clamped to 1, a `gather` that answered "nothing
+    yet" twice in a row while a slow worker ran would kill the run. The
+    pool's gather is allowed one non-blocking answer right after a
+    dispatch (that is what lets the walk keep feeding the pool) and must
+    then block until a future completes.
+    """
+    _tree(tmp_path, *TREE_FIXTURE)
+    monkeypatch.setattr(coordinator, "MAX_IDLE_ROUNDS", 1)
+
+    outcomes = _pooled_walk(
+        tmp_path, "2026", _SlowWorker(hits=TREE_HITS), max_workers=2
+    )
+
+    assert tuple(o.result.folder_path for o in outcomes) == TREE_ORDER
+
+
+def test_a_stalled_gather_warns_with_the_outstanding_paths(tmp_path, caplog):
+    """A hung pool is DIAGNOSABLE: the blocking wait warns each interval.
+
+    The wait loop replaces a bare ``wait(timeout=None)``: a slow folder
+    keeps its sequential-parity semantics (the run waits, exactly as a
+    sequential run would sit inside it), but every ``warn_interval`` a
+    warning names the folders still running — so a wedged nightly run
+    reads as wedged in portal.log instead of as silence.
+    """
+    import logging
+
+    _tree(tmp_path, "2026/A")
+
+    class _StallingWorker(_Worker):
+        def __call__(self, storage_id, path, ctx, **kwargs):
+            time.sleep(0.3)
+            return _Worker.__call__(self, storage_id, path, ctx, **kwargs)
+
+    dispatcher = PoolDispatcher(max_workers=1, warn_interval=0.05)
+    with caplog.at_level(logging.WARNING, logger=coordinator.log.name):
+        try:
+            outcomes = _walk(tmp_path, "2026", _StallingWorker(), dispatcher=dispatcher)
+        finally:
+            dispatcher.shutdown()
+
+    # The run still completed correctly...
+    assert [o.result.folder_path for o in outcomes] == ["2026/A"]
+    # ...and while it stalled, the warning named the outstanding folder.
+    warnings = [
+        record.message
+        for record in caplog.records
+        if "no folder completed" in record.message
+    ]
+    assert warnings, caplog.records
+    assert all("2026/A" in message for message in warnings)

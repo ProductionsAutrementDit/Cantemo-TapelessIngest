@@ -76,6 +76,12 @@ class RunOptions:
     only: Tuple[str, ...] = ()
     startwith: Tuple[str, ...] = ()
     date_window: Tuple[str, ...] = ()
+    # Story 3.1: how many pool workers a TREE run may use. A scalar on the
+    # frozen dataclass, defaulting to 1 so every pre-3.1 construction site
+    # (build_default_context included) keeps paged mode inline and never
+    # constructs an executor. Validated >= 1 at the command boundary
+    # (AD-10); rejected > 1 in paged mode by assert_mode_options (AD-14).
+    workers: int = 1
 
 
 @dataclass

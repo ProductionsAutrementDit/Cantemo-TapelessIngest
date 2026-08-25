@@ -30,17 +30,16 @@ counts prove nothing.
 import importlib
 import os
 import re
-from contextlib import contextmanager
 
 import pytest
 from django.contrib.auth.models import User
 from django.core.management import call_command
-from django.db import connection
 
 from portal.plugins.TapelessIngest.models.clip import Clip, ClipMetadata
 from portal.plugins.TapelessIngest.models.folder import Folder
 
 from tests.portal_stub import VidispineFake
+from tests.sql_capture import captured_sql
 
 STORAGE_ID = "VX-41"
 ROOT = "2026"
@@ -64,16 +63,9 @@ READ_ONLY_SQL = re.compile(
 )
 
 
-@contextmanager
-def _captured_sql():
-    statements = []
-
-    def recorder(execute, sql, params, many, context):
-        statements.append(sql)
-        return execute(sql, params, many, context)
-
-    with connection.execute_wrapper(recorder):
-        yield statements
+# Sees every thread's connection via the connection_created signal
+# (story 3.1) — the former local copy watched only the calling thread's.
+_captured_sql = captured_sql
 
 
 def _row_counts():

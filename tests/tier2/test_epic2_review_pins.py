@@ -20,7 +20,7 @@ import pytest
 from django.contrib.auth.models import User
 from django.core.management import call_command
 from django.core.management.base import CommandError
-from django.db import DatabaseError, connection
+from django.db import DatabaseError
 
 from portal.plugins.TapelessIngest.helpers import TapelessIngestException
 from portal.plugins.TapelessIngest.models.clip import Clip
@@ -34,6 +34,7 @@ from portal.plugins.TapelessIngest.scan.coordinator import (
 )
 
 from tests.portal_stub import VidispineFake
+from tests.sql_capture import wrap_every_connection
 
 STORAGE_ID = "VX-41"
 ROOT = "2026"
@@ -256,7 +257,10 @@ def _orm_calls_from_the_coordinator():
                 violations.append((sql, [frame.name for frame in stack[deepest:]]))
         return execute(sql, params, many, context)
 
-    with connection.execute_wrapper(recorder):
+    # Signal-installed (story 3.1): the pool runs process_folder on worker
+    # threads, and a wrapper on the calling thread's connection alone
+    # would exempt every worker-issued statement from this guard.
+    with wrap_every_connection(recorder):
         yield violations
 
 
@@ -732,7 +736,7 @@ def test_persisting_ingest_state_issues_exactly_one_statement(
         statements.append(sql)
         return execute(sql, params, many, context)
 
-    with connection.execute_wrapper(recorder):
+    with wrap_every_connection(recorder):
         clip.persist_ingest_state()
 
     assert len(statements) == 1, statements

@@ -134,6 +134,33 @@ LEGACY_STORAGES = ["VX-2", "VX-26", "VX-11"]
 
 SINCE_RE = re.compile(r"^(\d+)([dwmy])$")
 
+# NFR-3: the pool applies BOUNDED pressure to the shared production
+# server (index, NFS, Vidispine). The bound is deliberately generous —
+# nobody tunes past it on purpose — but it turns a fat-fingered
+# `--workers 500` into a parse-time error instead of a thread stampede.
+MAX_WORKERS = 16
+
+
+def positive_worker_count(value):
+    """argparse type= for --workers: an int in [1, MAX_WORKERS].
+
+    A type= callable rather than a post-parse check: a defective
+    --workers now reports at PARSE time, beside any other argument
+    defect, and the duplicated fail-fast block the first cut of story
+    3.1 carried in both commands' handle() is gone.
+    """
+    try:
+        workers = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid int value: '{value}'") from None
+    if workers < 1:
+        raise argparse.ArgumentTypeError(f"--workers must be >= 1 (got {workers})")
+    if workers > MAX_WORKERS:
+        raise argparse.ArgumentTypeError(
+            f"--workers must be <= {MAX_WORKERS} (got {workers})"
+        )
+    return workers
+
 
 def parse_since(value, now):
     """Parse a --since period (e.g. 10d, 2w, 3m, 1y) into a window start."""
@@ -251,6 +278,15 @@ class Command(BaseCommand):
         )
         parser.add_argument("--dryrun", action="store_true")
         parser.add_argument("--replace", action="store_true")
+        # Story 3.1: pool width for the tree walk. Default 4 (FR-17); 1
+        # keeps the sequential dispatcher and never builds an executor.
+        parser.add_argument(
+            "--workers",
+            type=positive_worker_count,
+            default=4,
+            help=f"Number of folder workers for the tree walk (default 4, "
+            f"max {MAX_WORKERS}; 1 runs strictly sequentially)",
+        )
 
     def handle(self, *cmd_args, **options):
         global SLACK_ACCESS_TOKEN, logger
@@ -334,6 +370,7 @@ class Command(BaseCommand):
             only=args.only,
             startwith=args.startWith,
             date_window=date_window,
+            workers=args.workers,
         )
 
         folder, is_new = Folder.get_or_new(storage_id=storage, path=path)

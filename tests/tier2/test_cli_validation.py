@@ -186,3 +186,75 @@ def test_since_window_reaches_scan_date_window_filter(
     assert not any(
         m.startswith("Scanning from ") for m in _CapturingLogger.last.messages
     )
+
+
+# --------------------------------------------------------------------------
+# Story 3.1: --workers
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("command", COMMANDS)
+@pytest.mark.parametrize("value", ["0", "-2"])
+def test_non_positive_workers_aborts(command, value):
+    """AD-10: a defective --workers dies before any scan work.
+
+    No migrated_db: the check sits in the fail-fast block BEFORE the user
+    lookup, so a valid abort never reaches the DB.
+    """
+    expected = f"--workers must be >= 1 (got {value})"
+    with pytest.raises(CommandError, match=re.escape(expected)):
+        call_command(command, *BASE_ARGS, "--userId", "1", "--workers", value)
+
+
+@pytest.mark.parametrize("command", COMMANDS)
+def test_non_integer_workers_aborts(command):
+    with pytest.raises(CommandError, match="workers"):
+        call_command(command, *BASE_ARGS, "--userId", "1", "--workers", "four")
+
+
+@pytest.mark.parametrize("command", COMMANDS)
+def test_workers_above_the_bound_aborts(command):
+    """NFR-3: the pool's pressure on the shared server is BOUNDED.
+
+    A fat-fingered `--workers 500` must die at parse time, not stampede
+    the index/NFS/Vidispine with hundreds of threads.
+    """
+    expected = "--workers must be <= 16 (got 17)"
+    with pytest.raises(CommandError, match=re.escape(expected)):
+        call_command(command, *BASE_ARGS, "--userId", "1", "--workers", "17")
+
+
+@pytest.mark.parametrize("command", COMMANDS)
+@pytest.mark.parametrize(
+    "flags,expected",
+    [
+        # No flag: the DEFAULT is 4 (FR-17) — the next nightly cron run
+        # after deploy is 4-way concurrent with no operator action.
+        ([], 4),
+        (["--workers", "3"], 3),
+    ],
+)
+def test_workers_reaches_the_run_context(
+    command, flags, expected, migrated_db, monkeypatch, storage_fake
+):
+    """The flag travels on RunOptions, like every other run option."""
+    module = importlib.import_module(
+        f"portal.plugins.TapelessIngest.management.commands.{command}"
+    )
+    captured = {}
+
+    def fake_scan_tree(self, ctx, *, emit):
+        captured["workers"] = ctx.options.workers
+        return None
+
+    monkeypatch.setattr(Folder, "scan_tree", fake_scan_tree)
+    monkeypatch.setattr(module, "CustomLogger", _CapturingLogger)
+    storage_fake.set_root("VX-41", "/wired-root")
+
+    user = User.objects.create(pk=4243, username=f"story31-workers-{command}")
+    try:
+        call_command(command, *BASE_ARGS, "--userId", "4243", *flags)
+    finally:
+        user.delete()  # keep the auth table empty for the unknown-user tests
+
+    assert captured["workers"] == expected
