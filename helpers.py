@@ -143,6 +143,26 @@ class TapelessIngestHelper(IngestHelper):
         if not _collection_resolution_lock.acquire(
             timeout=COLLECTION_RESOLUTION_LOCK_TIMEOUT
         ):
+            # The holder has usually FINISHED by the time a waiter times
+            # out: re-probe the cache once before failing the folder.
+            # This only helps when the timeout was caused by a holder
+            # resolving the SAME path — the lock is global across paths,
+            # so a cross-path miss raises exactly as before. The single
+            # probe also leaves an accepted TOCTOU residual: the holder
+            # may cache milliseconds after we look. A sentinel default
+            # distinguishes a cached None (fully ignore-filtered path,
+            # a completed resolution) from a genuine miss.
+            _miss = object()
+            cached = cache.get(cache_key, _miss)
+            if cached is not _miss:
+                log.warning(
+                    "collection resolution for %s waited the full %ss "
+                    "lock timeout behind a slow holder; serving the "
+                    "result the holder cached",
+                    filtered_path,
+                    COLLECTION_RESOLUTION_LOCK_TIMEOUT,
+                )
+                return cached
             raise TapelessIngestException(
                 f"collection resolution for {filtered_path} timed out after "
                 f"{COLLECTION_RESOLUTION_LOCK_TIMEOUT}s waiting for another "
@@ -224,6 +244,16 @@ class TapelessIngestHelper(IngestHelper):
                     parent_id = collection.getId()
                 cache.set(cache_key_subcollection, parent_id)
             else:
-                break
+                # A partial result cached under the FULL-path key would
+                # send every clip on this path into the wrong (ancestor)
+                # collection for 60s. Fail the folder honestly instead;
+                # the next run retries.
+                raise TapelessIngestException(
+                    f"collection search for segment '{path_item}' of "
+                    f"'{filtered_path}' returned HTTP "
+                    f"{response.status_code} "
+                    f"({getattr(response, 'data', None)!r}) — refusing "
+                    f"to resolve the path to an ancestor collection"
+                )
         cache.set(cache_key, parent_id, 60)
         return parent_id
