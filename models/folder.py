@@ -1,6 +1,5 @@
 import logging
 import time
-import traceback
 import uuid
 import os
 import re
@@ -45,7 +44,9 @@ from portal.plugins.TapelessIngest.scan.coordinator import (
     assert_mode_options,
     build_ingest_response,
     build_scan_response,
+    current_scan_folder,
     fold_timings,
+    folder_log_attribution,
     merge_results,
     summary_lines,
     walk_tree,
@@ -404,7 +405,14 @@ def _process_folder_with_connection_hygiene(
     exception out of this ``finally`` would CLOBBER a perfectly good
     folder outcome into a `_walk_failure` — a close hiccup is worth a
     warning in portal.log, never a failed folder.
+
+    Story 3.2 (FR-18): the wrapper also scopes ``current_scan_folder``
+    to this one folder's work, so that — while ``scan_tree`` has the
+    attribution factory installed — every log record this worker's
+    thread emits from the plugin's logger tree carries its folder path.
+    Reset LAST, so the close warning above is attributed too.
     """
+    token = current_scan_folder.set(path)
     try:
         return process_folder(
             storage_id,
@@ -418,13 +426,19 @@ def _process_folder_with_connection_hygiene(
         )
     finally:
         try:
-            connections.close_all()
-        except Exception:
-            log.warning(
-                f"per-worker connection close failed after {path}; the "
-                f"folder's outcome is kept",
-                exc_info=True,
-            )
+            try:
+                connections.close_all()
+            except Exception:
+                log.warning(
+                    f"per-worker connection close failed after {path}; the "
+                    f"folder's outcome is kept",
+                    exc_info=True,
+                )
+        finally:
+            # Unconditional: even a raising close (or a raising warning
+            # emit) must not leave this pool thread's later records
+            # misattributed to a stale folder path.
+            current_scan_folder.reset(token)
 
 
 class Folder(models.Model):
@@ -1027,7 +1041,15 @@ class Folder(models.Model):
                             record["metadatas"] = metadatas
                             record["matched"] = matched
                         except Exception as e:
-                            traceback.print_exc()
+                            # AD-12: an attributed ERROR in portal.log,
+                            # traceback included — not a raw, unattributed
+                            # print_exc to stderr from whatever thread
+                            # runs this folder.
+                            log.error(
+                                f"Error scanning file "
+                                f"{result['_source']['path']}: {e}",
+                                exc_info=True,
+                            )
                             record["error"] = (
                                 f"Error scanning file {result['_source']['path']}: {e}"
                             )
@@ -1113,7 +1135,12 @@ class Folder(models.Model):
                                 )
                             )
                         except Exception as e:
-                            traceback.print_exc()
+                            # AD-12: see the pass-1 handler above.
+                            log.error(
+                                f"Error scanning file "
+                                f"{record['result']['_source']['path']}: {e}",
+                                exc_info=True,
+                            )
                             response["errors"].append(
                                 f"Error scanning file "
                                 f"{record['result']['_source']['path']}: {e}"
@@ -1151,7 +1178,12 @@ class Folder(models.Model):
                 # would take the folder (and, in tree mode, the run's
                 # remaining work for it) down silently, with the scan's
                 # own counters already claiming success.
-                traceback.print_exc()
+                # AD-12: attributed ERROR + traceback in portal.log, not
+                # a bare stderr print_exc.
+                log.error(
+                    f"Error persisting scan results for {self.path}: {e}",
+                    exc_info=True,
+                )
                 persistence_failed = True
                 response["errors"].append(
                     f"Error persisting scan results for {self.path}: {e}"
@@ -1241,8 +1273,12 @@ class Folder(models.Model):
                     except Exception as e:
                         # NFR-1 tie-break: anything unexpected here is
                         # DOUBT — never a partial set, and never a crashed
-                        # folder.
-                        traceback.print_exc()
+                        # folder. AD-12: attributed ERROR + traceback in
+                        # portal.log, not a bare stderr print_exc.
+                        log.error(
+                            f"Cannot compute consumed subdirs for {self.path}: {e}",
+                            exc_info=True,
+                        )
                         consumed = None
                         reasons.append(str(e))
                     if consumed is None:
@@ -1474,15 +1510,21 @@ class Folder(models.Model):
             dispatcher = SequentialDispatcher()
             folder_worker = process_folder
         try:
-            outcomes = walk_tree(
-                self.storage_id,
-                self.path,
-                ctx=ctx,
-                process_folder=folder_worker,
-                dispatch=dispatcher.dispatch,
-                gather=dispatcher.gather,
-                emit=emit,
-            )
+            # Story 3.2 (FR-18): while the walk runs — and only then,
+            # paged mode never sees it — worker-thread log records from
+            # the plugin's logger tree carry their folder path. The
+            # context manager restores the previous record factory in a
+            # finally, whichever way the walk ends.
+            with folder_log_attribution():
+                outcomes = walk_tree(
+                    self.storage_id,
+                    self.path,
+                    ctx=ctx,
+                    process_folder=folder_worker,
+                    dispatch=dispatcher.dispatch,
+                    gather=dispatcher.gather,
+                    emit=emit,
+                )
         except BaseException:
             # The run is dying — a raising emit, or the operator's
             # Ctrl-C. Release the pool WITHOUT waiting: stalling a

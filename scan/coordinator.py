@@ -45,6 +45,7 @@ merge key already guarantees byte-identical output under out-of-order
 completion. No ``WorkerResult`` change is required for any of it.
 """
 
+import contextvars
 import logging
 import os
 import time
@@ -57,6 +58,87 @@ from typing import Any, Callable, Dict, FrozenSet, List, Optional, Tuple
 from .verification import FolderListings
 
 log = logging.getLogger(__name__)
+
+# --------------------------------------------------------------------------
+# Story 3.2 (FR-18): worker-thread log attribution
+# --------------------------------------------------------------------------
+#
+# Under the pool, worker threads' log records from different folders
+# interleave in portal.log. The epic requirement is "ordered OR clearly
+# attributed": the report channel (``WorkerResult.log_lines`` -> ``emit``)
+# is already coordinator-only and merge-key ordered, so the diagnostic
+# chatter becomes ATTRIBUTED — never reordered, never buffered. The
+# pool-side worker wrapper sets ``current_scan_folder`` for the duration
+# of one folder's work; while ``folder_log_attribution`` is installed (by
+# the tree coordinator, around the walk only), every record logged from
+# the plugin's logger tree with the contextvar set gets a suffix naming
+# its folder. Suffix-only: every existing "fragment in message" assertion
+# keeps passing, and a record logged with the contextvar unset (the main
+# thread, sequential workers, paged mode) is byte-identical to what it
+# always was.
+
+current_scan_folder = contextvars.ContextVar("tapeless_scan_folder", default=None)
+
+# The plugin's logger-tree root, derived from this module's own logger
+# name (two levels up: ``<root>.scan.coordinator``) so it holds wherever
+# the package is mounted — the deployed plugin path and the bare-
+# interpreter import alike. The commands log to the root name itself;
+# the scan/model modules are its ``__name__`` children. A parent
+# logger's ``Filter`` never sees a child's records, which is why this is
+# a LogRecord-factory seam and not a filter on the root logger.
+_PLUGIN_LOGGER_ROOT = log.name.rsplit(".", 2)[0]
+
+
+def _attributing_record_factory(previous_factory):
+    """A record factory annotating plugin-tree records with their folder."""
+
+    def factory(*args, **kwargs):
+        record = previous_factory(*args, **kwargs)
+        folder_path = current_scan_folder.get()
+        if folder_path is not None and (
+            record.name == _PLUGIN_LOGGER_ROOT
+            or record.name.startswith(_PLUGIN_LOGGER_ROOT + ".")
+        ):
+            # Format FIRST, then annotate: appending to a %-style msg
+            # that still has args would put the suffix through the
+            # formatter, and a folder path containing '%' would crash
+            # getMessage() at emit time. Guarded: a mismatched-args log
+            # call would otherwise raise HERE, at the caller, while the
+            # factory is installed — stock logging defers exactly that
+            # to handleError at emit time. On failure the record passes
+            # through untouched (unannotated, never lost).
+            try:
+                record.msg = f"{record.getMessage()} [folder: {folder_path}]"
+                record.args = None
+            except Exception:
+                pass
+        return record
+
+    return factory
+
+
+@contextmanager
+def folder_log_attribution():
+    """Annotate plugin-tree log records with their folder while installed.
+
+    Installed by the tree coordinator around the walk ONLY — paged mode
+    never sees it — and restored in a ``finally`` whichever way the walk
+    ends. While the contextvar is unset (always true on the main thread
+    and for ``workers=1``'s bare workers) the factory changes nothing,
+    so a sequential run's records stay byte-identical.
+
+    The seam is PROCESS-GLOBAL (``logging.setLogRecordFactory``) and
+    non-reentrant; exactly one tree walk per process is the assumed
+    invariant — true today, since tree mode runs only inside a
+    management-command process and paged mode never installs this.
+    """
+    previous = logging.getLogRecordFactory()
+    logging.setLogRecordFactory(_attributing_record_factory(previous))
+    try:
+        yield
+    finally:
+        logging.setLogRecordFactory(previous)
+
 
 __all__ = [
     "AD13_COUNTER_KEYS",
@@ -76,7 +158,9 @@ __all__ = [
     "assert_mode_options",
     "build_ingest_response",
     "build_scan_response",
+    "current_scan_folder",
     "fold_timings",
+    "folder_log_attribution",
     "merge_results",
     "should_scan_entry",
     "summary_lines",

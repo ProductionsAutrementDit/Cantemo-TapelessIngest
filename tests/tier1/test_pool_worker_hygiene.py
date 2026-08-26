@@ -8,6 +8,8 @@ module's own bindings, and ``walk_tree`` is doubled for the selection
 pins, exactly like ``test_dry_run_purity`` does).
 """
 
+import logging
+
 import pytest
 
 from portal.plugins.TapelessIngest.models import folder as folder_module
@@ -182,3 +184,135 @@ def test_a_raising_emit_still_releases_the_pool_without_waiting(
         folder.scan_tree(_ctx(4), emit=raising_emit)
 
     assert shutdown_calls == [False]
+
+
+# --------------------------------------------------------------------------
+# Story 3.2: the wrapper feeds attribution; scan_tree installs it
+# --------------------------------------------------------------------------
+
+
+def test_the_wrapper_scopes_the_folder_contextvar_to_one_folders_work(monkeypatch):
+    """`current_scan_folder` is set for exactly the folder's duration.
+
+    The record factory (`folder_log_attribution`) reads this contextvar;
+    the wrapper is its one production writer. Reset happens AFTER the
+    connection close, so the close-failure warning is attributed too.
+    """
+    from portal.plugins.TapelessIngest.scan.coordinator import current_scan_folder
+
+    fake = _FakeConnections()
+    seen = {}
+
+    def worker(*args, **kwargs):
+        seen["during"] = current_scan_folder.get()
+        return object()
+
+    monkeypatch.setattr(folder_module, "connections", fake)
+    monkeypatch.setattr(folder_module, "process_folder", worker)
+
+    folder_module._process_folder_with_connection_hygiene(
+        "VX-41", "2026/A", None, **WORKER_KWARGS
+    )
+
+    assert seen["during"] == "2026/A"
+    assert current_scan_folder.get() is None
+
+
+def test_the_wrapper_resets_the_contextvar_when_the_worker_raises(monkeypatch):
+    from portal.plugins.TapelessIngest.scan.coordinator import current_scan_folder
+
+    fake = _FakeConnections()
+
+    def violating_worker(*args, **kwargs):
+        raise RuntimeError("contract violation")
+
+    monkeypatch.setattr(folder_module, "connections", fake)
+    monkeypatch.setattr(folder_module, "process_folder", violating_worker)
+
+    with pytest.raises(RuntimeError, match="contract violation"):
+        folder_module._process_folder_with_connection_hygiene(
+            "VX-41", "2026/A", None, **WORKER_KWARGS
+        )
+
+    assert current_scan_folder.get() is None
+
+
+def test_scan_tree_installs_attribution_around_the_walk_and_restores_it(monkeypatch):
+    """The factory is live exactly while the walk runs — never after.
+
+    Paged mode is covered structurally: only `scan_tree` installs it, and
+    `Folder.scan`/`Folder.ingest` never call `folder_log_attribution`.
+    """
+    previous = logging.getLogRecordFactory()
+    seen = {}
+
+    def fake_walk_tree(
+        root_storage_id, root_path, *, ctx, process_folder, dispatch, gather, emit
+    ):
+        seen["factory_during_walk"] = logging.getLogRecordFactory()
+        return []
+
+    monkeypatch.setattr(folder_module, "walk_tree", fake_walk_tree)
+    folder = folder_module.Folder(storage_id="VX-41", path="2026")
+
+    folder.scan_tree(_ctx(1), emit=lambda line: None)
+
+    assert seen["factory_during_walk"] is not previous
+    assert logging.getLogRecordFactory() is previous
+
+
+def test_the_close_failure_warning_is_attributed_before_the_reset(monkeypatch, caplog):
+    """MUTATION pin for the reset-LAST ordering in the wrapper's finally.
+
+    With the attribution factory installed (as `scan_tree` installs it),
+    the close-failure warning must still carry the folder suffix — which
+    is only true while the contextvar reset stays AFTER the close block.
+    Moving the reset ahead of `close_all()` strips the suffix and fails
+    here.
+    """
+    from portal.plugins.TapelessIngest.scan import coordinator
+
+    fake = _FakeConnections(fail=True)
+    outcome = object()
+    monkeypatch.setattr(folder_module, "connections", fake)
+    monkeypatch.setattr(folder_module, "process_folder", lambda *a, **k: outcome)
+
+    with coordinator.folder_log_attribution():
+        with caplog.at_level("WARNING", logger=folder_module.log.name):
+            result = folder_module._process_folder_with_connection_hygiene(
+                "VX-41", "2026/A", None, **WORKER_KWARGS
+            )
+
+    assert result is outcome
+    warnings = [
+        record
+        for record in caplog.records
+        if "connection close failed" in record.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert warnings[0].getMessage().endswith("[folder: 2026/A]")
+    # ...and the contextvar is still reset afterwards, warning or not.
+    assert coordinator.current_scan_folder.get() is None
+
+
+def test_the_contextvar_resets_even_when_close_and_warning_both_raise(monkeypatch):
+    """The reset is UNCONDITIONAL (nested finally): even a close failure
+    whose warning emit ALSO raises must not leave the pool thread's later
+    records misattributed to a stale folder path."""
+    from portal.plugins.TapelessIngest.scan.coordinator import current_scan_folder
+
+    fake = _FakeConnections(fail=True)
+    monkeypatch.setattr(folder_module, "connections", fake)
+    monkeypatch.setattr(folder_module, "process_folder", lambda *a, **k: object())
+
+    def exploding_warning(*args, **kwargs):
+        raise RuntimeError("logging broke too")
+
+    monkeypatch.setattr(folder_module.log, "warning", exploding_warning)
+
+    with pytest.raises(RuntimeError, match="logging broke too"):
+        folder_module._process_folder_with_connection_hygiene(
+            "VX-41", "2026/A", None, **WORKER_KWARGS
+        )
+
+    assert current_scan_folder.get() is None

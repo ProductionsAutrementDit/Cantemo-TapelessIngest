@@ -14,9 +14,11 @@ import re
 from datetime import datetime, timedelta
 from dateutil.relativedelta import relativedelta
 from slack_sdk import WebClient
+from slack_sdk.errors import SlackApiError
 
 import argparse
 import logging
+import time
 
 from django.contrib.auth.models import User
 from django.core.management.base import BaseCommand, CommandError
@@ -42,6 +44,52 @@ FORCE_DRY_RUN = False
 # (there is no msg_too_long error). Chunk at the documented 4,000-character
 # limit so no chunk ever nears the hard-truncation cliff.
 SLACK_MAX_MESSAGE_LENGTH = 4000
+
+# Story 3.2 (FR-18): Slack allows ~1 chat.postMessage per second per
+# channel, and a chunked report is exactly the burst that provokes 429s.
+# Successful sends are paced by SLACK_SEND_PACE_SECONDS between chunks
+# (never after the last); a chunk answered with a 429 is retried — the
+# SAME chunk — up to SLACK_RATE_LIMIT_RETRIES times, honouring the
+# server's Retry-After. Nothing but a 429 is retryable: any other error
+# still aborts on its first throw, exactly as story 1.5 shipped it
+# (waiver row in tests/fr4-waivers.md).
+SLACK_SEND_PACE_SECONDS = 1.0
+SLACK_RATE_LIMIT_RETRIES = 3
+
+
+def _slack_sleep(seconds):
+    """The send loop's ONE wait seam (pacing and 429 backoff alike).
+
+    A module-level indirection rather than a bare time.sleep so tests
+    can record the waits and run at pace zero — the injectable-interval
+    pattern (the pool's warn_interval), not time-faking.
+    """
+    time.sleep(seconds)
+
+
+def _retry_after_seconds(response):
+    """The wait a 429 asks for: case-insensitive Retry-After, in seconds.
+
+    Slack mirrors both header casings; read either. A missing or garbage
+    header falls back to 1.0 s, and the value is capped at 30 s so a
+    hostile or clock-skewed header can never park the nightly run for
+    minutes on one chunk.
+    """
+    headers = getattr(response, "headers", None) or {}
+    value = None
+    for name, candidate in headers.items():
+        if str(name).lower() == "retry-after":
+            value = candidate
+            break
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return 1.0
+    if seconds != seconds or seconds < 0:
+        # NaN ("nan" parses!) or negative is garbage too: NaN compares
+        # unequal to itself, survives min(), and time.sleep(nan) raises.
+        return 1.0
+    return min(seconds, 30.0)
 
 
 class CustomLogger:
@@ -103,22 +151,53 @@ class CustomLogger:
             # every no-send path must leave a log line.
             self.logger.info("Slack notification skipped: nothing to send")
             return
-        # One boundary around the whole loop, abort on first failure: after
-        # a network/auth error the remaining sends would fail identically,
-        # and a notification failure must never propagate into the scan run.
-        try:
-            for index, chunk in enumerate(chunks, start=1):
-                self.slack_client.chat_postMessage(
-                    channel="pad-notifications-cantemo",
-                    text=chunk,
+        # Per-chunk boundary (story 3.2; supersedes 1.5's abort-on-first-
+        # failure for the 429 case ONLY — waiver in tests/fr4-waivers.md).
+        # A 429 is transient by definition: the same chunk is retried up
+        # to SLACK_RATE_LIMIT_RETRIES times, waiting the server's
+        # Retry-After, each retry a WARNING. Anything else is fatal on
+        # its first throw — after a network/auth error the remaining
+        # sends would fail identically. Both endings share one shape:
+        # exactly one ERROR record, the remaining chunks abandoned, and
+        # never an exception into the scan run.
+        for index, chunk in enumerate(chunks, start=1):
+            try:
+                retries = 0
+                while True:
+                    try:
+                        self.slack_client.chat_postMessage(
+                            channel="pad-notifications-cantemo",
+                            text=chunk,
+                        )
+                        break
+                    except SlackApiError as e:
+                        status = getattr(e.response, "status_code", None)
+                        if status != 429 or retries >= SLACK_RATE_LIMIT_RETRIES:
+                            raise
+                        retries += 1
+                        wait_seconds = _retry_after_seconds(e.response)
+                        self.logger.warning(
+                            f"Slack rate limited on chunk {index}/"
+                            f"{len(chunks)}; retry {retries}/"
+                            f"{SLACK_RATE_LIMIT_RETRIES} in {wait_seconds:.1f}s"
+                        )
+                        _slack_sleep(wait_seconds)
+            except Exception:
+                self.logger.error(
+                    f"Slack notification failed on chunk {index}/{len(chunks)}; "
+                    f"remaining chunks abandoned",
+                    exc_info=True,
                 )
-        except Exception:
-            self.logger.error(
-                f"Slack notification failed on chunk {index}/{len(chunks)}; "
-                f"remaining chunks abandoned",
-                exc_info=True,
-            )
-            return
+                return
+            if index < len(chunks):
+                # Pace successful sends (~1 msg/s/channel); no wait
+                # after the last chunk. Guarded on its own: the pacing
+                # wait sits outside the per-chunk try, and even a
+                # raising sleep must never propagate into the scan run.
+                try:
+                    _slack_sleep(SLACK_SEND_PACE_SECONDS)
+                except Exception:
+                    pass
         self.logger.info(f"Slack notification sent ({len(chunks)} chunks)")
 
 

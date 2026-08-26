@@ -6,6 +6,8 @@ passes providers=[fake] so the FakeProvider registered in _PROVIDER_CACHE is
 used (providers=None would fall back to the real PROVIDERS_LIST → ffprobe).
 """
 
+import logging
+
 import pytest
 
 from portal.plugins.TapelessIngest.models.clip import Clip
@@ -154,3 +156,145 @@ def test_cursor_is_ignored(es_fake, es_page, fake_provider):
 
     assert with_cursor == without_cursor
     assert es_fake.calls == calls_without_cursor
+
+
+# --------------------------------------------------------------------------
+# Story 3.2 (AD-12): the four stderr tracebacks became attributed ERRORs
+# --------------------------------------------------------------------------
+#
+# `models/folder.py` carried four `traceback.print_exc()` calls that wrote
+# raw, unattributed tracebacks to stderr — from worker THREADS, under the
+# pool. Each became `log.error(..., exc_info=True)` keeping its existing
+# path-prefixed message; these pin all four: caplog sees exactly one
+# ERROR record, carrying exc_info, where a stderr traceback used to go.
+
+FOLDER_LOGGER = "portal.plugins.TapelessIngest.models.folder"
+
+
+def _folder_error_records(caplog):
+    return [
+        record
+        for record in caplog.records
+        if record.name == FOLDER_LOGGER and record.levelno >= logging.ERROR
+    ]
+
+
+def _hit(path):
+    return {
+        "path": path,
+        "hash": f"hash-{path}",
+        "storage": STORAGE_ID,
+        "id": f"{STORAGE_ID}-{path}",
+        "size": 1024,
+    }
+
+
+def test_a_per_file_scan_error_is_an_error_record_with_traceback(
+    es_fake, es_page, fake_provider, caplog
+):
+    """Pass-1 site: the file behind an index row fails verification."""
+    ghost = f"{PATH}/GHOST.fake"
+    es_fake.push(es_page([_hit(ghost)], total=1))
+
+    with caplog.at_level(logging.ERROR, logger=FOLDER_LOGGER):
+        response = _folder().scan(number=0, providers=[fake_provider.machine_name])
+
+    errors = _folder_error_records(caplog)
+    assert len(errors) == 1
+    assert errors[0].exc_info is not None
+    assert errors[0].getMessage().startswith(f"Error scanning file {ghost}: ")
+    # The response channel is unchanged: the same message still travels.
+    assert any(
+        entry.startswith(f"Error scanning file {ghost}: ")
+        for entry in response["errors"]
+    )
+
+
+def test_a_clip_assembly_error_is_an_error_record_with_traceback(
+    tmp_path, es_fake, es_page, fake_provider, caplog, monkeypatch
+):
+    """Pass-2 site: a verified, extracted file whose clip assembly dies."""
+    relative = f"{PATH}/CLIPA.fake"
+    target = tmp_path / relative
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"media")
+    es_fake.push(es_page([_hit(relative)], total=1))
+    # Tier 1 stays DB-free: the between-passes umid lookup answers empty.
+    monkeypatch.setattr(Clip.objects, "in_bulk", lambda umids: {})
+
+    def exploding_defaults(file, metadatas):
+        raise RuntimeError("assembly exploded")
+
+    monkeypatch.setattr(Clip, "new_clip_defaults", exploding_defaults)
+
+    with caplog.at_level(logging.ERROR, logger=FOLDER_LOGGER):
+        response = _folder(root=str(tmp_path)).scan(
+            number=0, providers=[fake_provider.machine_name]
+        )
+
+    errors = _folder_error_records(caplog)
+    assert len(errors) == 1
+    assert errors[0].exc_info is not None
+    assert errors[0].getMessage() == (
+        f"Error scanning file {relative}: assembly exploded"
+    )
+    assert f"Error scanning file {relative}: assembly exploded" in response["errors"]
+
+
+def test_a_persistence_failure_is_an_error_record_with_traceback(
+    es_fake, es_page, fake_provider, caplog, monkeypatch
+):
+    """Write-unit site: the rolled-back transaction (DatabaseError)."""
+    from django.db import DatabaseError
+
+    from portal.plugins.TapelessIngest.models import folder as folder_module
+
+    es_fake.push(es_page([], total=0))
+
+    def exploding_persist(folder, plan, dry_run=False):
+        raise DatabaseError("deadlock detected")
+
+    monkeypatch.setattr(folder_module, "persist_scan_results", exploding_persist)
+
+    with caplog.at_level(logging.ERROR, logger=FOLDER_LOGGER):
+        response = _folder().scan(number=0, providers=[fake_provider.machine_name])
+
+    errors = _folder_error_records(caplog)
+    assert len(errors) == 1
+    assert errors[0].exc_info is not None
+    assert errors[0].getMessage() == (
+        f"Error persisting scan results for {PATH}: deadlock detected"
+    )
+    assert (
+        f"Error persisting scan results for {PATH}: deadlock detected"
+        in response["errors"]
+    )
+
+
+def test_a_consumed_subdirs_failure_is_an_error_record_with_traceback(
+    es_fake, es_page, fake_provider, caplog, monkeypatch
+):
+    """Descent site: an unexpected raise is DOUBT — and now also logged."""
+    from portal.plugins.TapelessIngest.models import folder as folder_module
+
+    es_fake.push(es_page([], total=0))
+
+    def exploding_consumed(clips, matched_providers, folder_path, reasons=None):
+        raise RuntimeError("layout probe exploded")
+
+    monkeypatch.setattr(folder_module, "consumed_subdirs", exploding_consumed)
+
+    with caplog.at_level(logging.ERROR, logger=FOLDER_LOGGER):
+        response = _folder().scan(number=0, providers=[fake_provider.machine_name])
+
+    errors = _folder_error_records(caplog)
+    assert len(errors) == 1
+    assert errors[0].exc_info is not None
+    assert errors[0].getMessage() == (
+        f"Cannot compute consumed subdirs for {PATH}: layout probe exploded"
+    )
+    assert response["consumed_subdirs"] is None
+    assert (
+        f"Cannot compute consumed subdirs for {PATH}: layout probe exploded"
+        in response["errors"]
+    )

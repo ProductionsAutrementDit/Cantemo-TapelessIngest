@@ -17,6 +17,7 @@ dispatch order.
 
 import dataclasses
 import itertools
+import logging
 import os
 import pickle
 import random
@@ -1413,3 +1414,171 @@ def test_a_stalled_gather_warns_with_the_outstanding_paths(tmp_path, caplog):
     ]
     assert warnings, caplog.records
     assert all("2026/A" in message for message in warnings)
+
+
+# --------------------------------------------------------------------------
+# Story 3.2: coherent output and attributed worker logs under the pool
+# --------------------------------------------------------------------------
+
+PLUGIN_LOGGER = "portal.plugins.TapelessIngest"
+
+
+class _ChattyWorker(_Worker):
+    """A worker double that talks on BOTH channels, like the real worker.
+
+    Returns MULTI-line ``log_lines`` (the report channel, released by the
+    coordinator in merge-key order) AND writes to the plugin's logger
+    tree from whatever thread runs it — which under ``PoolDispatcher`` is
+    a pool thread. ``_Worker`` never logs; proving attribution needs a
+    double that does.
+    """
+
+    def __call__(self, storage_id, path, ctx, **kwargs):
+        logging.getLogger(f"{PLUGIN_LOGGER}.models.folder").info(f"chatter from {path}")
+        outcome = _Worker.__call__(self, storage_id, path, ctx, **kwargs)
+        return dataclasses.replace(
+            outcome,
+            result=dataclasses.replace(
+                outcome.result,
+                log_lines=(f"visited {path}", f"details for {path}"),
+            ),
+        )
+
+
+def test_pooled_report_is_coherent_and_worker_records_are_attributed(
+    tmp_path, monkeypatch, caplog
+):
+    """The story-3.2 concurrency proof (FR-18), over the REAL pool.
+
+    The real ``PoolDispatcher`` drives the real pool-side worker wrapper
+    (the contextvar's set/reset home) around a chatty double, with the
+    record factory installed exactly as ``scan_tree`` installs it. Two
+    claims: (a) the report channel is per-folder contiguous blocks in
+    merge-key order, byte-identical to the sequential run and free of
+    any attribution suffix; (b) every worker-thread log record
+    (threadName prefix ``tapeless-scan``) carries its folder path.
+    """
+    from portal.plugins.TapelessIngest.models import folder as folder_module
+
+    _tree(tmp_path, *TREE_FIXTURE)
+
+    sequential_emitted = []
+    # The wrap is deliberately INERT here: the bare double never sets the
+    # contextvar (workers=1 has no wrapper), proving the factory's no-op
+    # behavior on a sequential run's records.
+    with coordinator.folder_log_attribution():
+        sequential = merge_results(
+            _walk(
+                tmp_path,
+                "2026",
+                _ChattyWorker(hits=TREE_HITS),
+                emit=sequential_emitted.append,
+            )
+        )
+
+    monkeypatch.setattr(folder_module, "process_folder", _ChattyWorker(hits=TREE_HITS))
+    pooled_emitted = []
+    with caplog.at_level(logging.INFO, logger=PLUGIN_LOGGER):
+        with coordinator.folder_log_attribution():
+            pooled = merge_results(
+                _pooled_walk(
+                    tmp_path,
+                    "2026",
+                    folder_module._process_folder_with_connection_hygiene,
+                    max_workers=4,
+                    emit=pooled_emitted.append,
+                )
+            )
+
+    # (a) the report channel: byte-identical to the sequential run,
+    # contiguous per-folder blocks, merge-key ordered, no suffixes.
+    assert pooled == sequential
+    assert pooled_emitted == sequential_emitted
+    expected_blocks = []
+    for path in TREE_ORDER:
+        expected_blocks += [f"visited {path}", f"details for {path}"]
+    assert pooled_emitted == expected_blocks
+
+    # (b) portal.log's channel: every worker-thread record names its
+    # folder — and there really was one per folder, from pool threads.
+    worker_records = [
+        record
+        for record in caplog.records
+        if record.threadName.startswith("tapeless-scan")
+    ]
+    assert worker_records, (
+        "no records from pool threads were captured — this proof assumes "
+        "PoolDispatcher's thread_name_prefix is 'tapeless-scan'"
+    )
+    assert sorted(record.getMessage() for record in worker_records) == sorted(
+        f"chatter from {path} [folder: {path}]" for path in TREE_ORDER
+    )
+
+
+def test_folder_log_attribution_restores_the_factory_on_any_exit():
+    previous = logging.getLogRecordFactory()
+
+    with coordinator.folder_log_attribution():
+        assert logging.getLogRecordFactory() is not previous
+    assert logging.getLogRecordFactory() is previous
+
+    with pytest.raises(RuntimeError, match="walk died"):
+        with coordinator.folder_log_attribution():
+            raise RuntimeError("walk died")
+    assert logging.getLogRecordFactory() is previous
+
+
+def test_a_mismatched_args_record_is_left_untouched_not_raised():
+    """A latent bad %-call must not start CRASHING at the caller.
+
+    Stock logging routes a mismatched-args record through handleError at
+    emit time; the factory's annotation formats eagerly, so it is guarded
+    — on failure the record passes through untouched (unannotated, never
+    lost), instead of the factory raising in the caller's frame while a
+    worker folder runs.
+    """
+    with coordinator.folder_log_attribution():
+        token = coordinator.current_scan_folder.set("2026/A")
+        try:
+            factory = logging.getLogRecordFactory()
+            record = factory(
+                f"{PLUGIN_LOGGER}.scan.coordinator",
+                logging.INFO,
+                __file__,
+                42,
+                "bad call %s %s",
+                ("only-one-arg",),
+                None,
+            )
+        finally:
+            coordinator.current_scan_folder.reset(token)
+
+    assert record.msg == "bad call %s %s"
+    assert record.args == ("only-one-arg",)
+
+
+def test_attribution_annotates_only_the_plugin_tree_and_only_while_set(caplog):
+    """Suffix-only, plugin-tree-only, contextvar-gated.
+
+    A %-style record with args is formatted BEFORE the suffix lands (a
+    folder path containing % must never crash emit), a foreign logger's
+    records pass untouched, and after the contextvar is reset the
+    factory changes nothing.
+    """
+    plugin_logger = logging.getLogger(f"{PLUGIN_LOGGER}.scan.coordinator")
+    other_logger = logging.getLogger("someone.elses.library")
+
+    with coordinator.folder_log_attribution():
+        with caplog.at_level(logging.INFO):
+            token = coordinator.current_scan_folder.set("2026/A")
+            try:
+                plugin_logger.info("mine with %s", "args")
+                other_logger.info("theirs")
+            finally:
+                coordinator.current_scan_folder.reset(token)
+            plugin_logger.info("after reset")
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert "mine with args [folder: 2026/A]" in messages
+    assert "theirs" in messages
+    assert "after reset" in messages
