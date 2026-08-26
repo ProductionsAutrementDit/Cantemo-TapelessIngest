@@ -48,6 +48,7 @@ completion. No ``WorkerResult`` change is required for any of it.
 import contextvars
 import logging
 import os
+import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import contextmanager
@@ -99,6 +100,22 @@ def _attributing_record_factory(previous_factory):
             record.name == _PLUGIN_LOGGER_ROOT
             or record.name.startswith(_PLUGIN_LOGGER_ROOT + ".")
         ):
+            # A STABLE attribute first (retro-3 F4): the msg rewrite
+            # below destroys %-template identity, so a template-keyed
+            # consumer (an aggregator grouping on the unformatted msg)
+            # keys on ``record.tapeless_scan_folder`` instead — set
+            # BEFORE the rewrite, so it survives even when the rewrite is
+            # skipped by the guard.
+            #
+            # NAMESPACED, matching the contextvar (retro-3 review): a
+            # bare ``scan_folder`` is a name a caller may well pass as
+            # ``extra=``, and ``Logger.makeRecord`` applies ``extra``
+            # AFTER the factory and raises ``KeyError: "Attempt to
+            # overwrite ..."`` on a key the record already has. That is
+            # the same caller-side raise the try/except below exists to
+            # prevent — a log call that works everywhere and dies only
+            # inside a tree walk.
+            record.tapeless_scan_folder = folder_path
             # Format FIRST, then annotate: appending to a %-style msg
             # that still has args would put the suffix through the
             # formatter, and a folder path containing '%' would crash
@@ -117,6 +134,19 @@ def _attributing_record_factory(previous_factory):
     return factory
 
 
+# The one-walk-per-process invariant, enforced (retro-3 F4) with the
+# check and the install under ONE lock (retro-3 review). A bare
+# check-then-set let two threads both read "not installed" before either
+# called ``setLogRecordFactory`` — precisely the concurrent case the
+# guard exists to refuse. The flag is module state rather than an
+# attribute on the factory function for the same reason a marker is
+# fragile: a ``functools.wraps`` wrapper copies ``__dict__``, which would
+# carry the marker onto a foreign factory and refuse every later
+# legitimate walk for the life of the process.
+_ATTRIBUTION_LOCK = threading.Lock()
+_attribution_installed = False
+
+
 @contextmanager
 def folder_log_attribution():
     """Annotate plugin-tree log records with their folder while installed.
@@ -128,16 +158,32 @@ def folder_log_attribution():
     so a sequential run's records stay byte-identical.
 
     The seam is PROCESS-GLOBAL (``logging.setLogRecordFactory``) and
-    non-reentrant; exactly one tree walk per process is the assumed
-    invariant — true today, since tree mode runs only inside a
-    management-command process and paged mode never installs this.
+    non-reentrant; exactly one tree walk per process is the invariant —
+    true today, since tree mode runs only inside a management-command
+    process and paged mode never installs this — and ENFORCED here
+    (retro-3 F4): a second concurrent install would chain factories and
+    the inner exit would restore the outer's suffixing factory as the
+    process-wide default. Sequential re-installs (walk after walk) stay
+    legal; only overlap is refused.
     """
-    previous = logging.getLogRecordFactory()
-    logging.setLogRecordFactory(_attributing_record_factory(previous))
+    global _attribution_installed
+    with _ATTRIBUTION_LOCK:
+        if _attribution_installed:
+            raise RuntimeError(
+                "folder_log_attribution is already installed: the record-"
+                "factory seam is process-global and non-reentrant — exactly "
+                "one tree walk per process may hold it. Run one tree walk "
+                "per process, or serialise the walks."
+            )
+        previous = logging.getLogRecordFactory()
+        logging.setLogRecordFactory(_attributing_record_factory(previous))
+        _attribution_installed = True
     try:
         yield
     finally:
-        logging.setLogRecordFactory(previous)
+        with _ATTRIBUTION_LOCK:
+            logging.setLogRecordFactory(previous)
+            _attribution_installed = False
 
 
 __all__ = [
@@ -611,11 +657,16 @@ def assert_mode_options(options, mode: str) -> None:
     # tuple's truthiness test cannot police it: a paged call on one folder
     # has nothing to fan out, and a caller asking for a pool there has
     # confused the modes (AD-14, story 3.1).
-    workers = getattr(options, "workers", 1)
-    if workers is not None and workers > 1:
+    # Read DIRECTLY, exactly like ``scan_tree`` (retro-3 review): the
+    # chore's own justification for dropping that call site's
+    # ``getattr(..., 1) or 1`` applies here verbatim —
+    # ``RunOptions.__post_init__`` makes an absent or invalid width
+    # unconstructable, so a ``getattr`` default and a ``is not None``
+    # test could only ever have MASKED a defect.
+    if options.workers > 1:
         raise ValueError(
-            f"workers={workers} cannot be used in paged mode: the worker "
-            f"pool is tree mode's"
+            f"workers={options.workers} cannot be used in paged mode: the "
+            f"worker pool is tree mode's"
         )
 
 
@@ -706,7 +757,10 @@ class PoolDispatcher:
       contract, so anything a future holds is the pool-side wrapper (or a
       contract violation), and one folder's death must not cost the run.
       ``BaseException`` — ``KeyboardInterrupt``, ``SystemExit`` — still
-      propagates, exactly as it does through ``process_folder``.
+      propagates, exactly as it does through ``process_folder``. A
+      CANCELLED future is the carve-out: it is recognised BEFORE
+      ``result()`` is called at all, so it reaches neither branch and
+      becomes the same folder-shaped failure.
 
     Completion order is whatever the pool produced; output order is the
     merge key's job and is proven byte-identical either way.
@@ -715,8 +769,13 @@ class PoolDispatcher:
     bare ``wait(timeout=None)``: a genuinely slow folder keeps its
     sequential-parity semantics — the run waits, exactly as a sequential
     run would sit inside that folder — but a HUNG one becomes diagnosable,
-    a warning naming the outstanding folder paths every interval instead
-    of a silent nightly run an operator cannot tell from a dead one.
+    instead of a silent nightly run an operator cannot tell from a dead
+    one. Each interval warns with the folders a thread is really INSIDE
+    named, and the ones still QUEUED behind them counted — naming all of
+    them told the operator every pending folder was wedged when only
+    ``max_workers`` can execute at once. When nothing is running yet the
+    head of the queue is named instead, so the warning never lists
+    nothing at all.
     """
 
     __slots__ = ("_executor", "_pending", "_fed", "_warn_interval")
@@ -743,11 +802,38 @@ class PoolDispatcher:
             )
             if done:
                 return done
-            outstanding = sorted(item.path for item in self._pending.values())
+            # Running vs queued (retro-3 F4): listing every pending path
+            # as "still running" told the operator N folders were wedged
+            # when only ``max_workers`` can execute at once — the rest
+            # are just queued behind them. Name only the folders a
+            # thread is actually inside; count the remainder.
+            running = sorted(
+                item.path for future, item in self._pending.items() if future.running()
+            )
+            # Neither running NOR finished: still waiting for a thread.
+            # ``done()`` is excluded explicitly (retro-3 review) — a
+            # future that completed between the wait's timeout and this
+            # snapshot is neither running nor queued, and counting it as
+            # queued would overstate the backlog to the operator.
+            waiting = sorted(
+                item.path
+                for future, item in self._pending.items()
+                if not future.running() and not future.done()
+            )
+            # A warning naming NO folder is worth less than the one this
+            # replaced, and an all-queued wedge produces exactly that:
+            # nothing has reached a thread yet, so ``running`` is empty.
+            # Name the head of the queue instead (retro-3 review).
+            if running:
+                named = f"still running: {', '.join(running)}"
+            else:
+                named = (
+                    f"still running: (none yet); next up: "
+                    f"{', '.join(waiting[:3]) or '(nothing pending)'}"
+                )
             log.warning(
                 f"scan pool: no folder completed in "
-                f"{self._warn_interval:.0f}s; still running: "
-                f"{', '.join(outstanding)}"
+                f"{self._warn_interval:.0f}s; {named}; queued: {len(waiting)}"
             )
 
     def gather(self):
@@ -762,16 +848,42 @@ class PoolDispatcher:
         batch = []
         for future in done:
             item = self._pending[future]
-            try:
-                outcome = future.result()
-            except Exception as e:
-                # The AD-12 folder-boundary shape: counted failed, its
-                # lines in both errors and log_lines, the run continues.
+            if future.cancelled():
+                # A cancelled future's ``result()`` raises
+                # ``CancelledError``. Recognise the cancellation BEFORE
+                # asking for the result — correct under either exception
+                # hierarchy, which is the point. On THIS project's Python
+                # (3.14: ``concurrent.futures._base.CancelledError(Error)``
+                # -> ``Exception``, and no ``builtins.CancelledError``;
+                # measured, not assumed) the ``except Exception`` below
+                # does catch it — but the exception carries no message,
+                # so the folder's only trace would be a blank
+                # ``Error scanning <path>: ``, undiagnosable. Where the
+                # class derives from ``BaseException`` instead, it would
+                # sail past that clause and out of ``gather``, which the
+                # contract forbids. Only a
+                # ``shutdown(cancel_futures=True)`` produces one in
+                # this codebase, but ANY holder may cancel a future, so
+                # the reason states what is knowable — it never ran — and
+                # not a cause this frame cannot verify. Give it the AD-12
+                # folder-boundary shape explicitly.
                 outcome = _walk_failure(
                     item.path,
                     item.merge_key,
-                    [f"Error scanning {item.path}: {e}"],
+                    [f"Error scanning {item.path}: cancelled before it ran"],
                 )
+            else:
+                try:
+                    outcome = future.result()
+                except Exception as e:
+                    # The AD-12 folder-boundary shape: counted failed, its
+                    # lines in both errors and log_lines, the run
+                    # continues.
+                    outcome = _walk_failure(
+                        item.path,
+                        item.merge_key,
+                        [f"Error scanning {item.path}: {e}"],
+                    )
             batch.append((item, outcome))
             # Un-book the future only AFTER its pair is appended: a
             # BaseException out of result() (the operator's Ctrl-C) must

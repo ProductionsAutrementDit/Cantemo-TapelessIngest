@@ -1540,3 +1540,160 @@ def test_the_settings_profile_is_resolved_as_the_runs_user(
         assert all(details["runas"] is user for details in profile_calls)
     finally:
         user.delete()  # keep the auth table empty for the unknown-user tests
+
+
+def test_create_item_builds_every_vidispine_helper_per_call(
+    migrated_db, ingestable_provider, monkeypatch
+):
+    """Retro-3 F4: `gh`/`ith`/`ch` were story 3.1's `uh` defect, three more times.
+
+    A helper built as a DEFAULT ARGUMENT is constructed once, at class
+    definition time, and shared by every caller in the process — with
+    `runas=None`, so the run's user is silently nobody, and as mutable
+    cross-thread state once the pool runs several folders at once. Only
+    `uh` was fixed in 3.1; `gh`, `ith` and `ch` kept the shape. This
+    calls `create_item` the way a future caller would — omitting all
+    four — and proves each call gets FRESH instances, as the run's user.
+    """
+    from django.contrib.auth.models import User
+
+    from portal.plugins.TapelessIngest.models import clip as clip_module
+
+    HELPERS = ("GroupHelper", "ItemHelper", "CollectionHelper", "UserHelper")
+    built = []
+
+    def _recording(name):
+        base = getattr(clip_module, name)
+
+        class Recording(base):
+            def __init__(self, *args, **kwargs):
+                base.__init__(self, *args, **kwargs)
+                built.append((name, self, kwargs.get("runas")))
+
+        return Recording
+
+    # Patched AFTER import on purpose: a class-definition-time default is
+    # already built by now, so it can never show up in `built`.
+    for name in HELPERS:
+        monkeypatch.setattr(clip_module, name, _recording(name))
+
+    user = User.objects.create(pk=4246, username="retro3-per-call-helpers")
+    try:
+        for umid in ("HELPERS-A", "HELPERS-B"):
+            clip = Clip.objects.create(
+                umid=umid,
+                path="2026/HELPERS",
+                storage_id=STORAGE_ID,
+                provider_name=INGESTABLE_NAME,
+                metadatas={},
+            )
+            _item, created = clip.create_item(user=user)
+            assert created is True
+
+        first_call, second_call = built[:4], built[4:]
+        assert len(built) == 8, built
+
+        # Each call built one of each of the four, itself...
+        for call in (first_call, second_call):
+            assert sorted(name for name, _obj, _runas in call) == sorted(HELPERS)
+
+        # ...as a DISTINCT instance (eight calls, eight objects — nothing
+        # is shared between the two calls, let alone process-wide)...
+        assert len({id(obj) for _name, obj, _runas in built}) == 8
+
+        # ...and as the run's user, not as nobody.
+        assert all(runas is user for _name, _obj, runas in built), built
+    finally:
+        Clip.objects.filter(path="2026/HELPERS").delete()
+        user.delete()  # keep the auth table empty for the unknown-user tests
+
+
+def test_create_item_honours_explicitly_passed_helpers(
+    migrated_db, ingestable_provider, monkeypatch
+):
+    """The other half of the per-call default: an explicit helper is USED.
+
+    Freshness alone is only half the contract. `import_file` passes all
+    four helpers it built as the run's user, and `ith` is an
+    `ItemHelperExtended` — a subclass no default could supply. A
+    `create_item` that rebuilt them unconditionally would silently
+    discard the caller's subclass and its deliberate `runas`, and every
+    per-call-freshness assertion in the sibling test above would still
+    pass. So: pass all four, prove they are the objects used, and prove
+    nothing was constructed behind them.
+    """
+    from django.contrib.auth.models import User
+
+    from portal.plugins.TapelessIngest.models import clip as clip_module
+
+    used = []
+
+    class _SpyGroup(clip_module.GroupHelper):
+        def getUserIngestGroups(self):
+            used.append("gh")
+            return clip_module.GroupHelper.getUserIngestGroups(self)
+
+    class _SpyUser(clip_module.UserHelper):
+        def getUserSettingsProfile(self, basegroup=None):
+            used.append("uh")
+            return clip_module.UserHelper.getUserSettingsProfile(
+                self, basegroup=basegroup
+            )
+
+    class _SpyItem(clip_module.ItemHelper):
+        def createPlaceholder(self, *args, **kwargs):
+            used.append("ith")
+            return clip_module.ItemHelper.createPlaceholder(self, *args, **kwargs)
+
+    class _SpyCollection(clip_module.CollectionHelper):
+        def addItemToCollection(self, *args, **kwargs):
+            used.append("ch")
+            return clip_module.CollectionHelper.addItemToCollection(
+                self, *args, **kwargs
+            )
+
+    passed = {
+        "gh": _SpyGroup(),
+        "uh": _SpyUser(),
+        "ith": _SpyItem(),
+        "ch": _SpyCollection(),
+    }
+
+    # Anything create_item constructs for itself from here on is visible.
+    built = []
+
+    def _recording(name):
+        base = getattr(clip_module, name)
+
+        class Recording(base):
+            def __init__(self, *args, **kwargs):
+                base.__init__(self, *args, **kwargs)
+                built.append(name)
+
+        return Recording
+
+    for name in ("GroupHelper", "ItemHelper", "CollectionHelper", "UserHelper"):
+        monkeypatch.setattr(clip_module, name, _recording(name))
+
+    user = User.objects.create(pk=4247, username="retro3-explicit-helpers")
+    try:
+        clip = Clip.objects.create(
+            umid="HELPERS-EXPLICIT",
+            path="2026/HELPERS_EXPLICIT",
+            storage_id=STORAGE_ID,
+            provider_name=INGESTABLE_NAME,
+            metadatas={},
+        )
+
+        _item, created = clip.create_item(
+            user=user, collection_id="VX-COLLECTION-EXPLICIT", **passed
+        )
+
+        assert created is True
+        # Every one of the four was the object that did the work...
+        assert sorted(used) == ["ch", "gh", "ith", "uh"]
+        # ...and not one of them was rebuilt behind the caller's back.
+        assert built == []
+    finally:
+        Clip.objects.filter(path="2026/HELPERS_EXPLICIT").delete()
+        user.delete()  # keep the auth table empty for the unknown-user tests

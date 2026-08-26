@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from portal.plugins.TapelessIngest.scan.context import (
+    MAX_WORKERS,
     PhaseTimings,
     RunOptions,
     ScanContext,
@@ -174,3 +175,53 @@ def test_root_path_for_and_absolute_path_for():
     assert ctx.absolute_path_for("VX-MISSING", "2026/AH_x") is None
     # A None path never reaches os.path.join.
     assert ctx.absolute_path_for("VX-41", None) is None
+
+
+# --------------------------------------------------------------------------
+# Retro-3 F4: the worker bound is enforced at the DATACLASS, not just the CLI
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "workers",
+    [0, -1, "4", 3.0, None, True, MAX_WORKERS + 1, 500],
+    ids=["zero", "negative", "string", "float", "none", "bool", "over", "way-over"],
+)
+def test_run_options_refuses_an_invalid_worker_count(workers):
+    """An invalid width must be UNCONSTRUCTABLE, not merely un-typeable.
+
+    The CLI validates `--workers` at parse time, but the [1, MAX_WORKERS]
+    bound lived ONLY there: a programmatic caller could smuggle 0, a
+    negative, a bool or a string into the frozen options and fail deep
+    inside the run — or, off a truthy `"0"`, silently take the sequential
+    path and never fail at all. `True` is the discriminating case: it IS
+    an `int` equal to 1, so only an explicit `bool` exclusion catches a
+    caller who meant "yes, use workers" and got a one-worker run.
+    """
+    with pytest.raises(ValueError, match="workers must be"):
+        RunOptions(workers=workers)
+
+
+def test_run_options_names_the_field_and_the_bound_in_its_messages():
+    """The DATACLASS's own two messages — deliberately not the CLI's.
+
+    The CLI's argparse validator says `--workers must be >= 1`, naming
+    the FLAG, because that is what its reader typed; this one names the
+    FIELD, because its reader wrote Python. The two producers are
+    independent and their wording differs on purpose. What they share is
+    the bound and the verdict, and the CLI half is pinned separately in
+    tests/tier2/test_cli_validation.py.
+    """
+    with pytest.raises(ValueError, match=r"workers must be an int >= 1 \(got 0\)"):
+        RunOptions(workers=0)
+    with pytest.raises(ValueError, match=r"workers must be <= 16 \(got 17\)"):
+        RunOptions(workers=MAX_WORKERS + 1)
+
+
+@pytest.mark.parametrize("workers", [1, 2, MAX_WORKERS])
+def test_run_options_accepts_every_legal_width(workers):
+    """Both ends of the range, and the pre-3.1 default, still construct."""
+    assert RunOptions(workers=workers).workers == workers
+    assert RunOptions().workers == 1
+    # `replace` re-runs __post_init__ too — no back door around the bound.
+    assert dataclasses.replace(RunOptions(), workers=workers).workers == workers

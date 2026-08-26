@@ -7,6 +7,7 @@ drift apart.
 """
 
 import inspect
+import re
 
 import pytest
 
@@ -53,3 +54,51 @@ def test_handle_sources_identical():
     assert inspect.getsource(scan_mod.Command.handle) == inspect.getsource(
         check_mod.Command.handle
     )
+
+
+def test_add_arguments_sources_identical():
+    """Retro-3 F4: the argument surface was the one shared block no pin covered.
+
+    `handle()` is compared in full above, but a `--workers` (or any flag)
+    diverging between the two parsers would ship silently — the twin
+    commands' contract is that ONLY `FORCE_DRY_RUN` differs.
+    """
+    assert inspect.getsource(scan_mod.Command.add_arguments) == inspect.getsource(
+        check_mod.Command.add_arguments
+    )
+
+
+# Constants that must live exactly once, in scan/context.py, and be
+# IMPORTED by both commands. `LEGACY_STORAGES` joined `MAX_WORKERS` in the
+# retro-3 review: it sat below each command's `logger = None` line, which
+# is where the compared Slack band ends, so a mutation diverging the two
+# per-file copies left all 719 tests green.
+SHARED_CONSTANTS = ["MAX_WORKERS", "LEGACY_STORAGES"]
+
+
+@pytest.mark.parametrize("name", SHARED_CONSTANTS)
+def test_both_commands_use_the_shared_constant(name):
+    """The constant lives ONCE, in scan/context.py.
+
+    Value equality alone cannot catch a resurrected per-file copy (16 is
+    a small interned int, and a duplicated literal list compares equal),
+    so the pin is structural too: neither command module may carry its
+    own binding of the name. The literal itself is deliberately NOT
+    repeated here — asserting `== 16` would re-duplicate the very thing
+    this test exists to de-duplicate. The three names are compared to
+    each other, and scan/context.py is the only place the value appears.
+    """
+    from portal.plugins.TapelessIngest.scan import context
+
+    shared = getattr(context, name)
+    assert getattr(scan_mod, name) is shared
+    assert getattr(check_mod, name) is shared
+
+    # `(:[^=]+)?` catches an ANNOTATED rebinding (`MAX_WORKERS: int = 8`),
+    # which the bare `\s*=` form sailed straight past.
+    per_file_binding = re.compile(rf"^{name}\s*(:[^=]+)?=", re.MULTILINE)
+    for module in (scan_mod, check_mod):
+        assert not per_file_binding.search(inspect.getsource(module)), (
+            f"{module.__name__} rebinds {name} instead of importing "
+            f"the shared value from scan.context"
+        )

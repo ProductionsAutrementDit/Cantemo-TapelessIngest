@@ -235,3 +235,21 @@ def test_provider_legacy_fallback_raises_on_unresolvable_root(storage_fake):
 
     with pytest.raises(AttributeError, match="browse-capable"):
         Provider().get_file_absolute_path(_vsfile("VX-PROV-NB"))
+
+
+def test_build_context_rejects_a_bad_width_before_touching_any_storage(storage_fake):
+    """The width fail-fast must cost NOTHING (retro-3 review).
+
+    `RunOptions.__post_init__` replaced an explicit guard that ran before
+    any Portal I/O. Keyword arguments evaluate in source order, so a
+    `RunOptions(...)` built inline as an argument beside
+    `storages=resolve_storages(...)` would have spent a live getStorage
+    per id — and the whole provider registry build — before the width was
+    ever looked at. Same verdict, same cost: none.
+    """
+    storage_fake.set_root("VX-EARLY-FAIL", "/mnt/early")
+
+    with pytest.raises(ValueError, match="workers must be an int >= 1"):
+        build_context(["VX-EARLY-FAIL"], workers=0, **_options())
+
+    assert storage_fake.get_storage_calls == {}

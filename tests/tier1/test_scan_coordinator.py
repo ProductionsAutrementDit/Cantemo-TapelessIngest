@@ -504,8 +504,11 @@ def test_tree_only_options_names_the_four_folder_filters():
 
     A paged call scans ONE folder and never walks, so a `--skip`/`--only`/
     `--startWith`/date-window narrowing could only mislead a caller into
-    believing it had been applied. Epic 3 adds `workers` and Epic 4 adds
-    `discovery` to the same tuple.
+    believing it had been applied. Epic 4 adds `discovery` to the same
+    tuple. Story 3.1's `workers` is tree-only too but NEVER via this
+    tuple: the tuple's "in use" test is truthiness and `workers` carries
+    its default as the truthy scalar 1 — its paged-mode rejection is the
+    explicit `> 1` check in `assert_mode_options`.
     """
     assert TREE_ONLY_OPTIONS == ("skip", "only", "startwith", "date_window")
 
@@ -1387,6 +1390,11 @@ def test_a_stalled_gather_warns_with_the_outstanding_paths(tmp_path, caplog):
     sequential run would sit inside it), but every ``warn_interval`` a
     warning names the folders still running — so a wedged nightly run
     reads as wedged in portal.log instead of as silence.
+
+    One worker, one folder, so running and outstanding are the same set
+    here. The pin that they are NOT the same set once the queue is deeper
+    than the pool is
+    ``test_a_stalled_pool_separates_running_folders_from_queued_ones``.
     """
     import logging
 
@@ -1582,3 +1590,253 @@ def test_attribution_annotates_only_the_plugin_tree_and_only_while_set(caplog):
     assert "mine with args [folder: 2026/A]" in messages
     assert "theirs" in messages
     assert "after reset" in messages
+
+
+# --------------------------------------------------------------------------
+# Retro-3 F4: the concurrency-hardening pins
+# --------------------------------------------------------------------------
+
+
+def test_a_second_concurrent_attribution_install_is_refused():
+    """The record-factory seam is process-global: overlap is REFUSED.
+
+    The one-walk-per-process invariant was documented and unenforced. A
+    nested install would CHAIN factories, and the inner exit would then
+    restore the OUTER's suffixing factory as the process-wide default —
+    every later record in the process attributed to a finished walk's
+    folder. Sequential re-installs (walk after walk) stay legal; only
+    overlap is refused.
+    """
+    original = logging.getLogRecordFactory()
+
+    with coordinator.folder_log_attribution():
+        installed = logging.getLogRecordFactory()
+        with pytest.raises(RuntimeError, match="one tree walk per process"):
+            with coordinator.folder_log_attribution():
+                raise AssertionError("the nested install must not be entered")
+        # The refusal changed nothing: the outer install still stands...
+        assert logging.getLogRecordFactory() is installed
+
+    # ...and the outer context still restores the ORIGINAL on exit.
+    assert logging.getLogRecordFactory() is original
+
+    # A walk AFTER a walk is not an overlap.
+    with coordinator.folder_log_attribution():
+        assert logging.getLogRecordFactory() is not original
+    assert logging.getLogRecordFactory() is original
+
+
+def test_an_attributed_record_carries_the_folder_as_a_stable_attribute():
+    """`record.tapeless_scan_folder` is the key the msg rewrite destroys.
+
+    The suffix rewrite formats the message and drops `args`, so the
+    %-template an aggregator groups on is gone by emit time and there is
+    nothing stable left to key on. The attribute is that key — and it is
+    set BEFORE the rewrite, so a record whose rewrite the guard skips (a
+    mismatched-args call, left deliberately untouched) still carries it.
+    """
+    plugin = f"{PLUGIN_LOGGER}.scan.coordinator"
+
+    with coordinator.folder_log_attribution():
+        factory = logging.getLogRecordFactory()
+        token = coordinator.current_scan_folder.set("2026/A")
+        try:
+            annotated = factory(
+                plugin, logging.INFO, __file__, 1, "hello %s", ("you",), None
+            )
+            skipped = factory(
+                plugin, logging.INFO, __file__, 2, "bad %s %s", ("one",), None
+            )
+            foreign = factory(
+                "someone.elses.library", logging.INFO, __file__, 3, "theirs", (), None
+            )
+        finally:
+            coordinator.current_scan_folder.reset(token)
+        unset = factory(plugin, logging.INFO, __file__, 4, "later", (), None)
+
+    assert annotated.tapeless_scan_folder == "2026/A"
+    assert annotated.getMessage() == "hello you [folder: 2026/A]"
+    # The guard swallowed the rewrite; the attribute was already set.
+    assert skipped.tapeless_scan_folder == "2026/A"
+    assert (skipped.msg, skipped.args) == ("bad %s %s", ("one",))
+    # Records the factory leaves alone carry no attribute at all.
+    assert not hasattr(foreign, "tapeless_scan_folder")
+    assert not hasattr(unset, "tapeless_scan_folder")
+
+
+def test_attribution_does_not_collide_with_a_callers_extra_key(caplog):
+    """The attribute is NAMESPACED, so `extra=` still works inside a walk.
+
+    `Logger.makeRecord` applies `extra=` AFTER the record factory and
+    refuses to overwrite a key the record already carries — it raises
+    `KeyError: "Attempt to overwrite ... in LogRecord"`, in the CALLER's
+    frame. An attribute named plainly `scan_folder` would therefore turn
+    any `log.info(..., extra={"scan_folder": ...})` — ours or Portal's —
+    into a call that works everywhere in the process and dies only while
+    a tree walk happens to be running. That is the exact hazard the
+    sibling try/except around the msg rewrite exists to prevent, and a
+    namespaced attribute is what keeps it from coming back in.
+    """
+    plugin_logger = logging.getLogger(f"{PLUGIN_LOGGER}.scan.coordinator")
+
+    with coordinator.folder_log_attribution():
+        with caplog.at_level(logging.INFO):
+            token = coordinator.current_scan_folder.set("2026/A")
+            try:
+                plugin_logger.info("mine", extra={"scan_folder": "caller's own"})
+            finally:
+                coordinator.current_scan_folder.reset(token)
+
+    (record,) = [r for r in caplog.records if r.getMessage().startswith("mine")]
+    # Both survive, side by side and unconfused.
+    assert record.scan_folder == "caller's own"
+    assert record.tapeless_scan_folder == "2026/A"
+
+
+def _split_stall_warning(message):
+    """`(running paths, queued count)` out of one stall warning.
+
+    Tolerates both shapes the warning has: the usual one, and the
+    nothing-has-started-yet fallback that names the head of the queue
+    under an explicit `(none yet)` marker.
+    """
+    queued = re.search(r"queued: (\d+)$", message)
+    assert queued, message
+    running = re.search(r"still running: ([^;]*);", message)
+    assert running, message
+    named = [path for path in running.group(1).split(", ") if path]
+    return [path for path in named if path != "(none yet)"], int(queued.group(1))
+
+
+def test_a_stalled_pool_separates_running_folders_from_queued_ones(tmp_path, caplog):
+    """A deep queue must not read as N wedged folders.
+
+    Only `max_workers` folders can be executing at once, so listing every
+    pending path as "still running" told the operator twelve folders were
+    stuck when nine of them had never been started — and hid which three
+    to actually go and look at. The warning names the folders a thread is
+    really inside and COUNTS the rest.
+    """
+    width = 3
+    folders = tuple(f"2026/F{index:02d}" for index in range(12))
+    _tree(tmp_path, *folders)
+
+    class _StallingWorker(_Worker):
+        def __call__(self, storage_id, path, ctx, **kwargs):
+            time.sleep(0.15)
+            return _Worker.__call__(self, storage_id, path, ctx, **kwargs)
+
+    dispatcher = PoolDispatcher(max_workers=width, warn_interval=0.03)
+    with caplog.at_level(logging.WARNING, logger=coordinator.log.name):
+        try:
+            outcomes = _walk(tmp_path, "2026", _StallingWorker(), dispatcher=dispatcher)
+        finally:
+            dispatcher.shutdown()
+
+    # The run still completed correctly, in merge-key order...
+    assert [o.result.folder_path for o in outcomes] == list(folders)
+
+    warnings = [
+        record.message
+        for record in caplog.records
+        if "no folder completed" in record.message
+    ]
+    assert warnings, caplog.records
+
+    # ...and no warning it emitted along the way ever named more folders
+    # than the pool has threads to be inside them, nor claimed a backlog
+    # bigger than the tree. Unconditional: which folders have reached
+    # RUNNING at any given 30 ms tick is the scheduler's business, so
+    # nothing here may depend on a particular thread having started.
+    splits = [_split_stall_warning(message) for message in warnings]
+    for (running, queued), message in zip(splits, warnings):
+        assert len(running) <= width, message
+        assert set(running) <= set(folders), message
+        assert 0 <= queued <= len(folders) - len(running), message
+
+    # The deep queue really was exercised: at least once, work was
+    # waiting that no thread had picked up. That is the whole distinction
+    # the split exists to draw, and with twelve folders over three
+    # threads it cannot not happen.
+    assert any(queued > 0 for _running, queued in splits), warnings
+
+
+def test_a_cancelled_future_is_gathered_as_a_folder_failure():
+    """A cancelled future is a DIAGNOSABLE folder failure, not a blank one.
+
+    A future cancelled while it sat in the pool's queue answers
+    `result()` with `CancelledError`, and the generic `except Exception`
+    below cannot say anything useful about it either way. Where
+    `CancelledError` derives from `Exception` (this interpreter, and any
+    pre-3.8 hierarchy) it is caught, but its `str()` is empty, so the
+    folder is booked as "Error scanning <path>: " with no reason at all;
+    where it derives from `BaseException` (the 3.8+ `builtins` alias) it
+    is not caught, and it leaves `gather` and takes the run with it. The
+    explicit branch answers both. Only `shutdown(cancel_futures=True)`
+    produces a cancelled future, so the run is already dying — but it
+    must die through the AD-12 folder-boundary shape, with every pair
+    this batch gathered intact. The reason states only what this frame
+    can verify — that the folder never ran — since any holder of a future
+    may cancel it.
+    """
+    import threading
+    from concurrent.futures import wait as futures_wait
+
+    started = threading.Event()
+    gate = threading.Event()
+
+    def _blocking_worker(item):
+        started.set()
+        gate.wait(5)
+        return _outcome(item.path)
+
+    items = [
+        coordinator.WorkItem(STORAGE_ID, f"2026/C{index}", 1, (index,))
+        for index in range(3)
+    ]
+
+    dispatcher = PoolDispatcher(max_workers=1)
+    try:
+        dispatcher.dispatch(_blocking_worker, items[0])
+        # The first item must really OWN the only thread before the other
+        # two are queued behind it — otherwise all three are cancellable.
+        assert started.wait(5), "the pool never started the first item"
+        for item in items[1:]:
+            dispatcher.dispatch(_blocking_worker, item)
+
+        # Exactly what `shutdown(cancel_futures=True)` does to the queue
+        # out from under a dying run.
+        cancelled = [future for future in dispatcher._pending if future.cancel()]
+        assert len(cancelled) == 2
+
+        gate.set()
+        # The pool's own thread notifies a cancelled work item when it
+        # dequeues it — that is what makes one gatherable at all.
+        _done, not_done = futures_wait(cancelled, timeout=5)
+        assert not not_done, "the pool never notified the cancelled futures"
+
+        batch = dispatcher.gather()
+    finally:
+        gate.set()
+        dispatcher.shutdown()
+
+    # Nothing escaped, nothing was dropped, nothing stayed booked.
+    assert len(batch) == 3
+    assert not dispatcher._pending
+    by_path = {item.path: outcome for item, outcome in batch}
+
+    # The one that really ran is untouched...
+    assert by_path["2026/C0"].failed is False
+    assert by_path["2026/C0"].result.errors == ()
+
+    # ...and each cancelled one wears the `_walk_failure` shape, naming
+    # cancellation as the reason.
+    for path, merge_key in (("2026/C1", (1,)), ("2026/C2", (2,))):
+        outcome = by_path[path]
+        expected = (f"Error scanning {path}: cancelled before it ran",)
+        assert outcome.failed is True
+        assert outcome.consumed_subdirs is None
+        assert outcome.merge_key == merge_key
+        assert outcome.result.folder_path == path
+        assert outcome.result.errors == expected
+        assert outcome.result.log_lines == expected

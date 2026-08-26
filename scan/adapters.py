@@ -145,27 +145,34 @@ def build_context(
     exact aliasing bug story 2.6 removed from the date window. They default
     to ``None`` so every pre-2.8 call site compiles untouched.
     """
-    # Story 3.1 review: the CLI validates --workers at parse time, but a
-    # PROGRAMMATIC caller could smuggle 0, a negative, or a string into
-    # the frozen options and only fail deep inside the run (or silently
-    # take the sequential path off a truthy "0"). Same fail-fast here.
-    if not isinstance(workers, int) or isinstance(workers, bool) or workers < 1:
-        raise ValueError(f"workers must be an int >= 1 (got {workers!r})")
+    # Story 3.1's programmatic-workers fail-fast moved into
+    # ``RunOptions.__post_init__`` (retro-3 F4): the ``RunOptions``
+    # construction raises the same ``ValueError`` family for a defective
+    # width, and now catches direct constructions too.
+    #
+    # Constructed FIRST and bound to a local, deliberately (retro-3
+    # review): keyword arguments evaluate in source order, so building it
+    # inline beside ``storages=resolve_storages(...)`` would spend a live
+    # getStorage per id — and the whole registry build — BEFORE the width
+    # was ever looked at. The guard this replaced ran before any Portal
+    # I/O, and a fail-fast that costs a round trip per storage first is
+    # not the same guarantee.
+    options = RunOptions(
+        dry_run=dry_run,
+        providers=_as_tuple(providers),
+        legacy_storages=_as_tuple(legacy_storages),
+        replace=replace,
+        user=user,
+        skip=tuple(skip or ()),
+        only=tuple(only or ()),
+        startwith=tuple(startwith or ()),
+        date_window=tuple(date_window or ()),
+        workers=workers,
+    )
     registry, extension_map = _build_registry_and_map(providers)
     return ScanContext(
         storages=resolve_storages(storage_ids),
-        options=RunOptions(
-            dry_run=dry_run,
-            providers=_as_tuple(providers),
-            legacy_storages=_as_tuple(legacy_storages),
-            replace=replace,
-            user=user,
-            skip=tuple(skip or ()),
-            only=tuple(only or ()),
-            startwith=tuple(startwith or ()),
-            date_window=tuple(date_window or ()),
-            workers=workers,
-        ),
+        options=options,
         provider_registry=registry,
         extension_map=extension_map,
     )

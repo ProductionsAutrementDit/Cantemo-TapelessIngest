@@ -48,6 +48,10 @@ from configparser import ConfigParser
 from portal.plugins.TapelessIngest.models.folder import Folder
 from portal.plugins.TapelessIngest.providers import PROVIDER_NAMES
 from portal.plugins.TapelessIngest.scan import adapters
+from portal.plugins.TapelessIngest.scan.context import (
+    LEGACY_STORAGES,
+    MAX_WORKERS,
+)
 
 log = logging.getLogger(__name__)
 
@@ -229,17 +233,11 @@ logger = None
 # the golden-doc recorder (tests/tier1/build_golden_doc.py) imports it.
 PROVIDERS = list(PROVIDER_NAMES)
 
-LEGACY_STORAGES = ["VX-2", "VX-26", "VX-11"]
-
 SINCE_RE = re.compile(r"^(\d+)([dwmy])$")
 
-# NFR-3: the pool applies BOUNDED pressure to the shared production
-# server (index, NFS, Vidispine). The bound is deliberately generous —
-# nobody tunes past it on purpose — but it turns a fat-fingered
-# `--workers 500` into a parse-time error instead of a thread stampede.
-MAX_WORKERS = 16
 
-
+# `MAX_WORKERS` and `LEGACY_STORAGES` are imported above from
+# scan/context.py — one copy each, rationale there.
 def positive_worker_count(value):
     """argparse type= for --workers: an int in [1, MAX_WORKERS].
 

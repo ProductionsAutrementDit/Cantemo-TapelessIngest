@@ -44,6 +44,25 @@ class StorageInfo:
     storage: Any = None
 
 
+# NFR-3: the pool applies BOUNDED pressure to the shared production
+# server (index, NFS, Vidispine). The bound is deliberately generous —
+# nobody tunes past it on purpose — but it turns a fat-fingered
+# ``workers=500`` into a fail-fast error instead of a thread stampede.
+# ONE shared constant (retro-3 F4): both management commands import it
+# for their parse-time ``--workers`` validator, and ``RunOptions``
+# enforces it below for programmatic callers.
+MAX_WORKERS = 16
+
+# The legacy storages a run matches hash-less files against. Here for the
+# same reason, and found the same way (retro-3 review): it lived as a
+# per-command copy BELOW each command's ``logger = None`` line, which is
+# where the twin commands' compared band ends — so no sync pin ever saw
+# it, and a mutation diverging the two copies left the whole suite green.
+# A tuple, like every other membership constant a frozen ``RunOptions``
+# ends up holding.
+LEGACY_STORAGES = ("VX-2", "VX-26", "VX-11")
+
+
 @dataclass(frozen=True)
 class RunOptions:
     """The run-scoped options a passed context carries authoritatively.
@@ -79,9 +98,25 @@ class RunOptions:
     # Story 3.1: how many pool workers a TREE run may use. A scalar on the
     # frozen dataclass, defaulting to 1 so every pre-3.1 construction site
     # (build_default_context included) keeps paged mode inline and never
-    # constructs an executor. Validated >= 1 at the command boundary
-    # (AD-10); rejected > 1 in paged mode by assert_mode_options (AD-14).
+    # constructs an executor. Validated at the command boundary (AD-10)
+    # AND at construction below (retro-3 F4); rejected > 1 in paged mode
+    # by assert_mode_options (AD-14).
     workers: int = 1
+
+    def __post_init__(self):
+        # Retro-3 F4: the CLI validates --workers at parse time, but the
+        # [1, MAX_WORKERS] bound lived ONLY there — a programmatic caller
+        # could smuggle 0, a negative, a bool, or a string into the
+        # frozen options and only fail deep inside the run (or silently
+        # take the sequential path off a truthy "0"). Constructing an
+        # invalid width is now impossible. ``bool`` is excluded
+        # explicitly: it IS an ``int``, and ``workers=True`` is a
+        # confused caller, not a one-worker run.
+        workers = self.workers
+        if not isinstance(workers, int) or isinstance(workers, bool) or workers < 1:
+            raise ValueError(f"workers must be an int >= 1 (got {workers!r})")
+        if workers > MAX_WORKERS:
+            raise ValueError(f"workers must be <= {MAX_WORKERS} (got {workers})")
 
 
 @dataclass

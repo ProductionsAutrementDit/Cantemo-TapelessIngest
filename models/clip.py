@@ -937,10 +937,10 @@ class Clip(models.Model):
         collection_id: Optional[str] = None,
         replace: bool = False,
         metadatagroupname: str = "Film",
-        gh: Any = GroupHelper(),
+        gh: Any = None,
         uh: Any = None,
-        ith: Any = ItemHelper(),
-        ch: Any = CollectionHelper(),
+        ith: Any = None,
+        ch: Any = None,
     ) -> Tuple[Any, bool]:
         """Create a new Vidispine item with metadata or update existing item.
 
@@ -949,23 +949,22 @@ class Clip(models.Model):
             collection_id: Optional collection ID to add the item to
             replace: Whether to replace existing metadata if item exists
             metadatagroupname: Name of the metadata group to use
-            gh: GroupHelper instance for user group operations
-            uh: UserHelper instance for user settings
-            ith: ItemHelper instance for item operations
-            ch: CollectionHelper instance for collection operations
+            gh: GroupHelper for user group operations. ``None`` (the
+                default) means "build one per call, as ``user``".
+            uh: UserHelper for user settings. ``None`` (the default)
+                means "build one per call, as ``user``".
+            ith: ItemHelper for item operations. ``None`` (the default)
+                means "build one per call, as ``user``". A caller with a
+                subclass (``import_file`` passes an
+                ``ItemHelperExtended``) passes it explicitly and it is
+                used as given.
+            ch: CollectionHelper for collection operations. ``None`` (the
+                default) means "build one per call, as ``user``".
 
         Returns:
             Tuple of (item object, created flag) where created is True if new item was created
         """
         created = False
-
-        # Story 3.1 review: `uh` defaults to None and is built PER CALL,
-        # as the run's user. The old class-definition-time
-        # ``UserHelper()`` default was one shared instance — with
-        # ``runas=None`` — for every caller in the process; a future
-        # caller omitting ``uh`` must not silently inherit it back.
-        if uh is None:
-            uh = UserHelper(runas=user)
 
         if self.item_id and self.item is None:
             # The row NAMES an item Vidispine cannot resolve — `Clip.item`
@@ -983,6 +982,32 @@ class Clip(models.Model):
                 f"Vidispine cannot resolve — refusing to create a "
                 f"second placeholder for it; heal or reset the row"
             )
+
+        # BELOW the wedged-row refusal above, not before it (retro-3
+        # review): story 3.0's frozen intent is that a wedged row costs
+        # ONE getItem, not the full preamble, and four helper
+        # constructors ahead of the refusal quietly broke that — it
+        # recurs every run by design, so its cost is a per-run cost.
+        #
+        # Story 3.1 review: `uh` defaults to None and is built PER CALL,
+        # as the run's user. The old class-definition-time
+        # ``UserHelper()`` default was one shared instance — with
+        # ``runas=None`` — for every caller in the process; a future
+        # caller omitting ``uh`` must not silently inherit it back.
+        if uh is None:
+            uh = UserHelper(runas=user)
+        # Retro-3 F4: `gh`/`ith`/`ch` were the SAME defect class — one
+        # shared class-definition-time instance each, with ``runas=None``,
+        # for every caller in the process (cross-thread shared state under
+        # the pool). Per call, as the run's user, exactly like ``uh`` and
+        # like ``import_file`` already builds the ones it passes in. An
+        # explicitly passed helper is used AS GIVEN, never rebuilt.
+        if gh is None:
+            gh = GroupHelper(runas=user)
+        if ith is None:
+            ith = ItemHelper(runas=user)
+        if ch is None:
+            ch = CollectionHelper(runas=user)
 
         ingestgroups, default_ingest_group = gh.getUserIngestGroups()
         ingestgroupname = default_ingest_group.name
@@ -1408,12 +1433,16 @@ class Clip(models.Model):
         _gh = GroupHelper(runas=user)
         _ch = CollectionHelper(runas=user)
         _sh = StorageHelper(runas=user)
-        # Per-call, like every helper above (story 3.1): create_item's
-        # `uh` default is a single UserHelper built at class-definition
-        # time — with runas=None — shared by every caller in the process.
-        # Under the worker pool that is cross-thread shared state, and it
-        # ignores the run's user; the other helper defaults were already
-        # overridden here, uh was the one that slipped through.
+        # Per-call, like every helper above (story 3.1). This call site
+        # passes all four explicitly and always did — `_ith` in
+        # particular is an `ItemHelperExtended`, which no default could
+        # supply. What changed is on the other side: `create_item`'s
+        # `gh`/`uh`/`ith`/`ch` now DEFAULT to None and are built per call
+        # as the run's user (retro-3 F4), where they used to be four
+        # shared instances built at class-definition time with
+        # runas=None. Passing them here is no longer what saves a future
+        # caller from that — but it is still what puts the subclass and
+        # this run's user in.
         _uh = UserHelper(runas=user)
 
         # Create item if it doesn't exist

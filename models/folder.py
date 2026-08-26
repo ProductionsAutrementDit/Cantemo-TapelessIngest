@@ -1502,7 +1502,11 @@ class Folder(models.Model):
         # identical, and the tree-derived merge key already makes the
         # output independent of completion order. `workers=1` never
         # constructs an executor and stays the sequential code path.
-        workers = getattr(ctx.options, "workers", 1) or 1
+        # Read directly (retro-3 F4): `RunOptions.__post_init__` makes an
+        # invalid width unconstructable, so the old `getattr(..., 1) or 1`
+        # softening could only have MASKED a defect as a silent
+        # sequential run.
+        workers = ctx.options.workers
         if workers > 1:
             dispatcher = PoolDispatcher(max_workers=workers)
             folder_worker = _process_folder_with_connection_hygiene
