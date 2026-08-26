@@ -131,6 +131,35 @@ class FakeProvider:
         metadatas["umid"] = os.path.splitext(media_file.getPath())[0]
         return metadatas
 
+    # Story 3.2 (retro F2): the minimum surface `Clip.import_file` reads,
+    # so a tree run at `dry_run=False` can drive the REAL import against
+    # the portal_stub Vidispine doubles instead of failing every clip at
+    # `_createDictFromMetadataMapping`. Before this, the "writing" tree
+    # runs were an equivalence of three per-clip AttributeErrors — no
+    # placeholder was ever created, so nothing pooled could be proven
+    # about NFR-1. Modelled on test_ingest_discipline's IngestableProvider.
+
+    def _createDictFromMetadataMapping(self, clip):
+        # The base provider's version maps clip metadatas through the
+        # MetadataMapping table; the tier-2 DB holds no mapping rows, so
+        # the real thing would also answer empty HERE. {} is faithful for
+        # exactly that reason (and keeps the fake DB-free for Tier 1) —
+        # it would stop being faithful if a test ever seeded mappings.
+        return {}
+
+    def getClipMainMediaFile(self, clip):
+        # A file-less clip must not silently proceed through the fake:
+        # the real import needs a Vidispine file id, and a None here
+        # would only surface later as an unrelated-looking failure.
+        assert clip.file_id, f"clip {clip.umid} reached import with no file_id"
+        return {"file_id": clip.file_id, "path": clip.path, "type": "video"}
+
+    def getClipAdditionalMediaFiles(self, clip):
+        return []
+
+    def getImportOptions(self):
+        return {}
+
 
 @pytest.fixture(autouse=True)
 def _reset_query_elastic_fake():
@@ -196,11 +225,17 @@ def _reset_vidispine_fakes():
     yield
     # An armed fault whose call name never fired (misspelled window, or a
     # code path that stopped making the call) would otherwise turn a
-    # crash test into a vacuous happy-path pass.
+    # crash test into a vacuous happy-path pass. Same for a queued import
+    # response nothing consumed: the import the test scripted never ran.
     unfired = list(VidispineFake.faults)
+    leftover_imports = list(VidispineFake.import_responses)
     VidispineFake.reset()
     RestTransportFake.reset()
     assert not unfired, f"armed Vidispine fault(s) never fired: {unfired}"
+    assert not leftover_imports, (
+        f"queued import response(s) never consumed: {leftover_imports} — "
+        f"the test scripted an import that never happened"
+    )
     vidispine_pre_ingest.calls.clear()
     vidispine_post_ingest.calls.clear()
     invalidate_item_cache_fake.calls.clear()

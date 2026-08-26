@@ -22,6 +22,7 @@ script's ordering.
 """
 
 import dataclasses
+import logging
 import os
 import re
 
@@ -29,6 +30,7 @@ import pytest
 from django.contrib.auth.models import User
 from django.core.cache import cache
 from django.core.management import call_command
+from django.db.models import Q
 
 from portal.plugins.TapelessIngest.helpers import TapelessIngestException
 from portal.plugins.TapelessIngest.models.clip import Clip, ClipMetadata
@@ -436,6 +438,20 @@ def _normalized_emission(emitted):
     return emitted[:-2] + [emitted[-2].split(" in ")[0]] + [emitted[-1]]
 
 
+def _reset_world(django_user):
+    """Reset rows, django cache and fake state between independent runs.
+
+    The flush empties auth_user too. The tree's writing runs drive the
+    REAL import (story 3.2), so every ingested row writes `user_id` and
+    sqlite enforces the FK — the run's user must exist again afterwards.
+    """
+    call_command("flush", interactive=False, verbosity=0)
+    cache.clear()
+    VidispineFake.reset()
+    RestTransportFake.reset()
+    django_user.save(force_insert=True)
+
+
 def test_workers_4_is_equivalent_to_workers_1(
     migrated_db, tree, fake_provider, es_fake, django_user, monkeypatch
 ):
@@ -459,23 +475,49 @@ def test_workers_4_is_equivalent_to_workers_1(
     )
     sequential_rows = _stable_rows()
     assert sequential_rows[0], "the writing run wrote no clips — vacuous"
+    # Story 3.2 (retro F2): `_stable_rows` omits `item_id`, so the row
+    # compare alone cannot see the NFR-1 orphan — a pooled run minting a
+    # second placeholder per clip would ship green. Capture what was asked
+    # of Vidispine (and the ids the rows actually carry) BEFORE the reset
+    # clears the call log.
+    sequential_calls = sorted(VidispineFake.call_names())
+    sequential_item_ids = list(Clip.objects.values_list("item_id", flat=True))
 
     # Reset the world: rows, django cache, the Vidispine call logs.
-    call_command("flush", interactive=False, verbosity=0)
-    cache.clear()
-    VidispineFake.reset()
-    RestTransportFake.reset()
+    _reset_world(django_user)
 
     pooled_result, pooled_emitted = _run(
         _context(fake_provider, dry_run=False, user=django_user, workers=4)
     )
     pooled_rows = _stable_rows()
+    pooled_calls = sorted(VidispineFake.call_names())
+    pooled_item_ids = list(Clip.objects.values_list("item_id", flat=True))
 
     assert _comparable(pooled_result) == _comparable(sequential_result)
     assert _normalized_emission(pooled_emitted) == _normalized_emission(
         sequential_emitted
     )
     assert pooled_rows == sequential_rows
+    # Story 3.2 hardening: same Vidispine traffic, distinct placeholders,
+    # and exactly one create per created clip — the NFR-1 face of the
+    # equivalence, which none of the row/counter compares above can see.
+    assert pooled_calls == sequential_calls
+    for item_ids, run_result in (
+        (sequential_item_ids, sequential_result),
+        (pooled_item_ids, pooled_result),
+    ):
+        assert len(set(item_ids)) == len(item_ids) == run_result.counters.created
+    assert sequential_calls.count("createPlaceholder") == (
+        sequential_result.counters.created
+    )
+    # ...and the import half really RAN. Every compare above is RELATIVE:
+    # a regression failing every clip at import fails both halves
+    # symmetrically and ships green (deleting one FakeProvider import
+    # method proved it). Only absolute counters catch that — and the
+    # pooled half inherits them through `_comparable` equality.
+    assert sequential_result.counters.failed == 0
+    counters = sequential_result.counters
+    assert counters.ingested == counters.created
 
 
 def test_a_pooled_dry_run_writes_nothing_from_any_thread(
@@ -535,3 +577,159 @@ def test_workers_1_takes_the_sequential_path_and_builds_no_executor(
     run_result, _emitted = _run(_context(fake_provider, workers=1))
 
     assert run_result.counters.hits == 3
+
+
+# --------------------------------------------------------------------------
+# Story 3.2 (retro F2): the death window, composed through the pool
+# --------------------------------------------------------------------------
+#
+# Every pin of FR-36 recovery lived on the sequential/paged façade
+# (test_ingest_discipline.py) — never composed through `scan_tree` at
+# `workers > 1`, which is exactly the state a crashed nightly run leaves.
+# These runs drive the real pipeline: real walk, real pool, real ladder.
+
+
+def _crash_recovery_pair(fake_provider, django_user, workers):
+    """One FR-36 crash/recovery pair over the tree at ``workers``.
+
+    Run 1 arms the ``setItemMetadataFieldGroup`` fault — the first window
+    AFTER the combined write — so exactly one of the tree's three clips
+    dies holding the FR-36 cell (under the pool, WHICH clip is the pool's
+    choice; the assertions never assume). Run 2 runs clean over the same
+    world — no fake reset in between, because the cross-run
+    ``createPlaceholder`` count IS the NFR-1 evidence — and must recover
+    into the same placeholder.
+    """
+    VidispineFake.fail_next("setItemMetadataFieldGroup")
+    first_result, first_emitted = _run(
+        _context(fake_provider, dry_run=False, user=django_user, workers=workers)
+    )
+    # The fault must have been CLAIMED by run 1 — unclaimed, run 2 would
+    # be the crash run and everything below would assert the wrong world.
+    assert not VidispineFake.faults, "armed fault unclaimed after run 1"
+    # The crashed clip is the one whose import never started a job; the
+    # deletion listener writes "" and the ORM default is NULL, so both
+    # empty spellings are the same state here.
+    dead_rows = Clip.objects.filter(Q(job_id="") | Q(job_id__isnull=True))
+    assert dead_rows.count() == 1, (
+        f"exactly one clip should be job-less after the crash run; "
+        f"found {dead_rows.count()}"
+    )
+    dead = dead_rows.get()
+    creates_after_first = VidispineFake.call_names().count("createPlaceholder")
+
+    # A real post-crash recovery is a FRESH cron process: the 180 s
+    # `Clip.item` memo does not survive the crash, while Vidispine's own
+    # state (the fakes') does. Cold cache, warm server.
+    cache.clear()
+    VidispineFake.set_import_response({"jobId": "VX-JOB-RECOVERED"})
+    second_result, _second_emitted = _run(
+        _context(fake_provider, dry_run=False, user=django_user, workers=workers)
+    )
+    creates_after_second = VidispineFake.call_names().count("createPlaceholder")
+    return (
+        first_result,
+        first_emitted,
+        dead,
+        second_result,
+        creates_after_first,
+        creates_after_second,
+    )
+
+
+def test_a_pooled_crash_recovers_into_the_same_placeholder(
+    migrated_db, tree, fake_provider, es_fake, django_user, monkeypatch
+):
+    """FR-36 recovery, the `failed > 0` summary and NFR-1 — at workers=4.
+
+    A `workers=1` control pair runs the identical scenario first, so the
+    pooled pair's placeholder economy is pinned by PARITY with the
+    sequential path rather than by a constant that would drift with the
+    fixture tree.
+    """
+    # The same double every non-dry test here uses: getCollection needs a
+    # Settings row and a live search backend and says nothing about this.
+    monkeypatch.setattr(
+        Folder, "getCollection", lambda self, user, dryrun=False: "VX-COLLECTION"
+    )
+
+    (
+        control_first,
+        _control_emitted,
+        _control_dead,
+        control_second,
+        control_creates_first,
+        control_creates_second,
+    ) = _crash_recovery_pair(fake_provider, django_user, workers=1)
+    assert control_first.counters.failed == 1
+    # The healthy clips still landed — a crash run that silently skipped
+    # the survivors would otherwise ship green.
+    assert control_first.counters.ingested == 2
+    assert control_second.counters.ingested == 1
+    assert control_creates_second == control_creates_first
+
+    # Reset the world: rows, django cache, the Vidispine call logs.
+    _reset_world(django_user)
+
+    (
+        first_result,
+        first_emitted,
+        dead,
+        second_result,
+        creates_after_first,
+        creates_after_second,
+    ) = _crash_recovery_pair(fake_provider, django_user, workers=4)
+
+    # Run 1 left the FR-36 cell: named, job-less, at PLACEHOLDER.
+    assert dead.item_id
+    assert dead.status == Clip.STATUS_PLACHOLDER_CREATED
+    # ...and its merged failed/errors reached the operator's summary — the
+    # first `failed > 0` rendered from real pooled counters, not from a
+    # synthetic worker.
+    assert first_result.counters.failed == 1
+    assert first_result.counters.ingested == 2  # the survivors landed too
+    assert f" {first_result.counters.failed} failed, " in first_emitted[-1]
+    assert f"{len(first_result.errors)} errors" in first_emitted[-1]
+    assert any(
+        "died inside setItemMetadataFieldGroup" in error
+        for error in first_result.errors
+    )
+
+    # Run 2 recovered INTO that placeholder: no new create, same item id,
+    # the recovery job on the row.
+    assert (second_result.counters.ingested, second_result.counters.failed) == (1, 0)
+    stored = Clip.objects.get(pk=dead.umid)
+    assert stored.item_id == dead.item_id
+    assert stored.job_id == "VX-JOB-RECOVERED"
+    assert stored.status == Clip.STATUS_PLACHOLDER_CREATED
+    assert creates_after_second == creates_after_first
+    # Sequential parity: the pooled pair minted exactly as many
+    # placeholders, run by run, as the workers=1 control pair.
+    assert creates_after_first == control_creates_first
+    assert creates_after_second == control_creates_second
+
+
+def test_a_real_pool_workers_error_record_names_its_folder(
+    migrated_db, tree, fake_provider, es_fake, caplog
+):
+    """FR-18 end to end: the AD-12 ERROR record, from a REAL pool worker.
+
+    The tier-1 attribution proof drives the record factory with a
+    synthetic worker; nothing there proved `scan_tree` actually installs
+    it around a real walk. The ZERO ghost already makes pass 1 log its
+    AD-12 error from whichever pool thread scans that folder, so the
+    `[folder: …]` suffix is asserted on a record the real pipeline
+    emitted.
+    """
+    with caplog.at_level(logging.ERROR, logger="portal.plugins.TapelessIngest"):
+        run_result, _emitted = _run(_context(fake_provider, workers=4))
+
+    assert run_result.counters.hits == 3  # the composition really ran
+    [record] = [
+        record
+        for record in caplog.records
+        if f"Error scanning file {ZERO}/GHOST.fake" in record.getMessage()
+    ]
+    assert record.getMessage().endswith(f" [folder: {ZERO}]")
+    # A pool worker's record, not a main-thread re-report.
+    assert record.threadName.startswith("tapeless-scan")

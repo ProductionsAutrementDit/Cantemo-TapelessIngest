@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import sys
+import threading
 from pathlib import Path
 from types import ModuleType
 from urllib.parse import parse_qs, urlencode, urlsplit
@@ -367,6 +368,11 @@ class VidispineFake:
       which is the only half that can orphan anything.
 
     Read ``calls`` for what was asked, in order.
+
+    Threading invariant (story 3.2): faults are ARMED and state is RESET
+    from the test thread only, between runs — never from a worker; under
+    ``workers > 1`` the ORDER of ``calls`` is the pool's choice, which is
+    why tests compare SORTED call names.
     """
 
     import_responses = []
@@ -376,15 +382,21 @@ class VidispineFake:
     calls = []
     faults = []
     _placeholder_counter = 0
+    # Story 3.2: pool workers reach the two compound class-state operations
+    # below (`fault_point`'s scan-then-pop, `new_placeholder_id`'s
+    # read-increment-format) from up to `workers` threads at once. The GIL
+    # makes a single list.append atomic, not these.
+    _lock = threading.Lock()
 
     @classmethod
     def reset(cls):
-        cls.import_responses.clear()
-        cls.items.clear()
-        cls.item_shapes.clear()
-        cls.calls.clear()
-        cls.faults.clear()
-        cls._placeholder_counter = 0
+        with cls._lock:
+            cls.import_responses.clear()
+            cls.items.clear()
+            cls.item_shapes.clear()
+            cls.calls.clear()
+            cls.faults.clear()
+            cls._placeholder_counter = 0
 
     @classmethod
     def fail_next(cls, call_name, error=None):
@@ -393,7 +405,8 @@ class VidispineFake:
         One entry, one call: a two-run crash test arms the fault for run
         one and leaves run two clean without having to disarm anything.
         """
-        cls.faults.append((call_name, error))
+        with cls._lock:
+            cls.faults.append((call_name, error))
 
     @classmethod
     def record(cls, name, **details):
@@ -406,13 +419,24 @@ class VidispineFake:
         Called at the END of the modelled call, once its effect is in
         ``VidispineFake``'s state: the interesting failure is the one
         where Vidispine DID the thing and the caller never learned it.
+
+        The scan-then-pop is taken under the class lock (story 3.2): under
+        a worker pool several threads reach the same fault point at once,
+        and an unsynchronized pop could fire one armed fault twice — or
+        never — turning a one-crash test nondeterministic. The raise
+        happens OUTSIDE the lock; only the claim of the fault is guarded.
         """
-        for index, (call_name, error) in enumerate(cls.faults):
-            if call_name == name:
-                cls.faults.pop(index)
-                raise error or InjectedVidispineFault(
-                    f"injected fault: the process died inside {name}"
-                )
+        armed = None
+        with cls._lock:
+            for index, (call_name, error) in enumerate(cls.faults):
+                if call_name == name:
+                    armed = cls.faults.pop(index)
+                    break
+        if armed is not None:
+            _call_name, error = armed
+            raise error or InjectedVidispineFault(
+                f"injected fault: the process died inside {name}"
+            )
 
     @classmethod
     def call_names(cls):
@@ -424,9 +448,13 @@ class VidispineFake:
 
     @classmethod
     def next_import_response(cls):
-        if cls.import_responses:
-            return cls.import_responses.pop(0)
-        return dict(cls.default_import_response)
+        # Check-then-pop, same compound-operation class as `fault_point`:
+        # two pool workers importing at once must not both claim (or both
+        # miss) the single queued response.
+        with cls._lock:
+            if cls.import_responses:
+                return cls.import_responses.pop(0)
+            return dict(cls.default_import_response)
 
     @classmethod
     def set_item(cls, item_id, item=None):
@@ -489,8 +517,13 @@ class VidispineFake:
 
     @classmethod
     def new_placeholder_id(cls):
-        cls._placeholder_counter += 1
-        return f"VX-PLACEHOLDER-{cls._placeholder_counter}"
+        # Story 3.2: minted from up to `workers` pool threads at once. The
+        # bare `+= 1` is a read-increment-write; two racing workers could
+        # mint the SAME id — manufacturing, in the test stub, exactly the
+        # duplicate-placeholder state NFR-1 forbids production to create.
+        with cls._lock:
+            cls._placeholder_counter += 1
+            return f"VX-PLACEHOLDER-{cls._placeholder_counter}"
 
 
 class FakeItem:
