@@ -55,15 +55,27 @@ class QueryElasticFake:
     queried them in. The queue stays empty, so the autouse unconsumed-page
     guard is satisfied by construction rather than by counting.
 
+    `route_search_after()` is story 4.1's addition: the index path pages
+    with `search_after` carried IN the search doc, so a responder that can
+    only see `(first, number)` cannot model it. That responder reads the
+    cursor out of the doc, exactly where the real index reads it.
+
     `first`/`number` are deliberately required keyword arguments: Folder.scan
     always passes both explicitly, so the fake must never paper over a caller
     relying on defaults of the real query_elastic.
+
+    `call_kwargs` records EVERY argument of every call, the `**kwargs` the
+    pre-4.1 fake swallowed unrecorded included: `.calls` keeps its
+    `(first, number)` tuple shape (test_scan_pagination and
+    test_scan_counters depend on it) and cannot grow a third element
+    without breaking those pins, so the full record lives beside it.
     """
 
     def __init__(self):
         self.queue = []
         self.calls = []
         self.call_docs = []
+        self.call_kwargs = []
         self.responder = None
 
     @property
@@ -83,15 +95,59 @@ class QueryElasticFake:
         """
         self.responder = responder
 
+    def route_search_after(self, hits):
+        """Serve one ordered hit stream the way `search_after` paging does.
+
+        `hits` are raw hit dicts in the query's sort order, each carrying
+        its own `sort` values (see the `es_page` fixture's `sort=True`).
+        The cursor is read from `search_doc["search_after"]` — the index
+        path never uses `from`/`size` beyond page one, so `first` says
+        nothing about where a page starts and only `number` bounds it.
+
+        An unknown cursor is an AssertionError rather than an empty page:
+        a page requested from a position that does not exist in the stream
+        means the code under test invented one.
+        """
+        ordered = list(hits)
+
+        def respond(search_doc, first, number):
+            cursor = search_doc.get("search_after")
+            start = 0
+            if cursor is not None:
+                cursor = list(cursor)
+                for index, hit in enumerate(ordered):
+                    if hit.get("sort") == cursor:
+                        start = index + 1
+                        break
+                else:
+                    raise AssertionError(
+                        f"query_elastic fake asked for search_after={cursor!r}, "
+                        f"which is not a sort value in the routed stream"
+                    )
+            page = ordered[start : start + number]
+            return {"hits": {"total": {"value": len(ordered)}, "hits": page}}
+
+        self.route(respond)
+
     def reset(self):
         self.queue.clear()
         self.calls.clear()
         self.call_docs.clear()
+        self.call_kwargs.clear()
         self.responder = None
 
     def __call__(self, search_doc, doc_type=None, *, first, number, **kwargs):
         self.calls.append((first, number))
         self.call_docs.append((search_doc, doc_type))
+        self.call_kwargs.append(
+            dict(
+                kwargs,
+                search_doc=search_doc,
+                doc_type=doc_type,
+                first=first,
+                number=number,
+            )
+        )
         if self.responder is not None:
             return self.responder(search_doc, first=first, number=number)
         if not self.queue:

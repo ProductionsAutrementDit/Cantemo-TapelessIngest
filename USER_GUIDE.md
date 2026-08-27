@@ -267,6 +267,33 @@ worker pool:
 This applies to tree (command-line) scans only; UI/API paged scans are
 unaffected and reject `workers > 1`.
 
+### Discovery Path (`--discovery`)
+
+Since story 4.1 the tree scan can find its files two ways, and you choose
+with a flag:
+
+- `--discovery=legacy` — **the default, and what every run does today**:
+  one index query per folder (~4,000 for a year's tree), paged with
+  `from`/`size`.
+- `--discovery=index` — one index query stream for the whole scan root,
+  fetched up front and then read per folder. Far fewer queries, no
+  10,000-result ceiling, and no risk of a file being missed or counted
+  twice because the index shifted mid-scan.
+- `--discovery-page-size N` (1..10000, default 500) — how many hits come
+  back in ONE response of that stream. It does not limit how much is
+  fetched overall, and it does nothing under `--discovery=legacy`.
+
+Both paths must find the same clips; that is what the equivalence tests
+check. **The default will not change until that has been verified against
+the real production index**, so deploying this story changes nothing about
+the nightly run on its own.
+
+**Rollback lever**: `--discovery=legacy`. Drop the flag and the scan is
+back on the path it has always used.
+
+This applies to tree (command-line) scans only; UI/API paged scans always
+use `legacy` and reject `--discovery=index`.
+
 ### Spanned Clips
 
 **What are Spanned Clips?**

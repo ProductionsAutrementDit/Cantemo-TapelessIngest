@@ -14,6 +14,8 @@ from portal.vidispine.istorage import StorageHelper
 
 from portal.plugins.TapelessIngest.providers import PROVIDER_NAMES
 from portal.plugins.TapelessIngest.scan.context import (
+    DEFAULT_DISCOVERY,
+    DEFAULT_DISCOVERY_PAGE_SIZE,
     RunOptions,
     ScanContext,
     StorageInfo,
@@ -133,6 +135,8 @@ def build_context(
     startwith: Optional[Iterable[str]] = None,
     date_window: Optional[Iterable[str]] = None,
     workers: int = 1,
+    discovery: str = DEFAULT_DISCOVERY,
+    discovery_page_size: int = DEFAULT_DISCOVERY_PAGE_SIZE,
 ) -> ScanContext:
     """Build the one per-run context for tree mode (commands' ``handle()``).
 
@@ -168,6 +172,8 @@ def build_context(
         startwith=tuple(startwith or ()),
         date_window=tuple(date_window or ()),
         workers=workers,
+        discovery=discovery,
+        discovery_page_size=discovery_page_size,
     )
     registry, extension_map = _build_registry_and_map(providers)
     return ScanContext(
@@ -188,6 +194,13 @@ def build_default_context(
     replace: bool = False,
 ) -> ScanContext:
     """Default context for paged callers — root_path-first and lazy.
+
+    Deliberately no ``discovery`` kwarg, for the same reason there is no
+    ``workers`` one (AD-14): a paged call scans ONE folder and pins
+    ``legacy``. ``--discovery=index`` is illegal in paged mode until the
+    default flips at legacy retirement, and a paged caller has no scan
+    root to prefetch — offering the option here would only let a UI
+    request a mode ``assert_mode_options`` then rejects.
 
     Exact read order: the memoized ``folder._root_path`` when present,
     WITHOUT dereferencing ``folder.storage``; only otherwise the

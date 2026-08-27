@@ -29,7 +29,11 @@ from portal.plugins.TapelessIngest.models.folder import Folder
 from portal.plugins.TapelessIngest.providers import PROVIDER_NAMES
 from portal.plugins.TapelessIngest.scan import adapters
 from portal.plugins.TapelessIngest.scan.context import (
+    DEFAULT_DISCOVERY,
+    DEFAULT_DISCOVERY_PAGE_SIZE,
+    DISCOVERY_MODES,
     LEGACY_STORAGES,
+    MAX_DISCOVERY_PAGE_SIZE,
     MAX_WORKERS,
 )
 
@@ -239,6 +243,34 @@ def positive_worker_count(value):
     return workers
 
 
+def discovery_page_size(value):
+    """argparse type= for --discovery-page-size: an int in [1, MAX].
+
+    Story 4.1, the same shape as `positive_worker_count` above and for
+    the same reason (AD-10): a defective page size reports at PARSE time,
+    beside any other argument defect, before the config read, the Slack
+    client, the user lookup and any index or filesystem work.
+
+    The ceiling is OpenSearch's own `index.max_result_window`, which still
+    caps `size` under `search_after` — a larger page could only ever come
+    back as a window error from the server.
+    """
+    try:
+        page_size = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid int value: '{value}'") from None
+    if page_size < 1:
+        raise argparse.ArgumentTypeError(
+            f"--discovery-page-size must be >= 1 (got {page_size})"
+        )
+    if page_size > MAX_DISCOVERY_PAGE_SIZE:
+        raise argparse.ArgumentTypeError(
+            f"--discovery-page-size must be <= {MAX_DISCOVERY_PAGE_SIZE} "
+            f"(got {page_size})"
+        )
+    return page_size
+
+
 def parse_since(value, now):
     """Parse a --since period (e.g. 10d, 2w, 3m, 1y) into a window start."""
     match = SINCE_RE.match(value)
@@ -364,6 +396,29 @@ class Command(BaseCommand):
             help=f"Number of folder workers for the tree walk (default 4, "
             f"max {MAX_WORKERS}; 1 runs strictly sequentially)",
         )
+        # Story 4.1 (AD-2): the discovery path switch. The default stays
+        # `legacy` — the byte-frozen per-folder query — until the
+        # equivalence gate has been green in production. `index` runs ONE
+        # `search_after` query stream per scan root instead; it is a tree
+        # option only and is rejected in paged mode (AD-14).
+        parser.add_argument(
+            "--discovery",
+            choices=DISCOVERY_MODES,
+            default=DEFAULT_DISCOVERY,
+            help=f"Discovery path for the tree walk (default "
+            f"{DEFAULT_DISCOVERY}): 'legacy' queries the index once per "
+            f"folder, 'index' fetches the whole scan root once and buckets "
+            f"it by parent",
+        )
+        parser.add_argument(
+            "--discovery-page-size",
+            dest="discovery_page_size",
+            type=discovery_page_size,
+            default=DEFAULT_DISCOVERY_PAGE_SIZE,
+            help=f"Hits per response for --discovery=index (default "
+            f"{DEFAULT_DISCOVERY_PAGE_SIZE}, max {MAX_DISCOVERY_PAGE_SIZE}); "
+            f"it bounds one response, not the prefetch total",
+        )
 
     def handle(self, *cmd_args, **options):
         global SLACK_ACCESS_TOKEN, logger
@@ -448,6 +503,8 @@ class Command(BaseCommand):
             startwith=args.startWith,
             date_window=date_window,
             workers=args.workers,
+            discovery=args.discovery,
+            discovery_page_size=args.discovery_page_size,
         )
 
         folder, is_new = Folder.get_or_new(storage_id=storage, path=path)

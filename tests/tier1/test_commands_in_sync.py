@@ -25,6 +25,9 @@ SHARED_HELPERS = [
     "format_window_log",
     # Story 3.1: the --workers parse-time validator ([1, MAX_WORKERS]).
     "positive_worker_count",
+    # Story 4.1: the --discovery-page-size parse-time validator
+    # ([1, MAX_DISCOVERY_PAGE_SIZE]).
+    "discovery_page_size",
     # Story 2.6 added `should_scan_entry` and `consumed_subdirs_from_results`
     # here as a stopgap: each command carried its own copy of the recursion,
     # and check_clips_in_folder's copy landed unexecuted and uncompared, so
@@ -73,7 +76,17 @@ def test_add_arguments_sources_identical():
 # retro-3 review: it sat below each command's `logger = None` line, which
 # is where the compared Slack band ends, so a mutation diverging the two
 # per-file copies left all 719 tests green.
-SHARED_CONSTANTS = ["MAX_WORKERS", "LEGACY_STORAGES"]
+SHARED_CONSTANTS = [
+    "MAX_WORKERS",
+    "LEGACY_STORAGES",
+    # Story 4.1: the discovery switch's four constants, imported by both
+    # commands for `--discovery`'s choices/default and
+    # `--discovery-page-size`'s default and ceiling.
+    "DISCOVERY_MODES",
+    "DEFAULT_DISCOVERY",
+    "DEFAULT_DISCOVERY_PAGE_SIZE",
+    "MAX_DISCOVERY_PAGE_SIZE",
+]
 
 
 @pytest.mark.parametrize("name", SHARED_CONSTANTS)

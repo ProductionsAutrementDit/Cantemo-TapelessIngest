@@ -62,6 +62,30 @@ MAX_WORKERS = 16
 # ends up holding.
 LEGACY_STORAGES = ("VX-2", "VX-26", "VX-11")
 
+# AD-2, story 4.1: the two discovery paths that coexist behind
+# ``--discovery``. ``legacy`` is the byte-frozen ``build_search_doc``
+# query paged with ``from``/``size``; ``index`` is the one query stream
+# per scan root that ``scan.discovery`` pages with ``search_after``. The
+# DEFAULT stays ``legacy`` until the equivalence gate has been green in
+# production AND paged mode has been re-pointed (spine "Deferred") — the
+# flip is a roadmap call, not this story's.
+DISCOVERY_LEGACY = "legacy"
+DISCOVERY_INDEX = "index"
+DISCOVERY_MODES = (DISCOVERY_LEGACY, DISCOVERY_INDEX)
+DEFAULT_DISCOVERY = DISCOVERY_LEGACY
+
+# AD-3: the index path's page size is CLI-tunable with a conservative
+# default. It bounds ONE response, never the prefetch total — the stream
+# runs until a short page, so a whole scan root is fetched whatever this
+# is set to. The ceiling is OpenSearch's own: `size` is still capped by
+# `index.max_result_window` (10,000 by default) even under `search_after`,
+# so a larger page could only ever come back as a window error from the
+# server. Here, and only here, for the same reason as MAX_WORKERS above:
+# both commands import it for their parse-time validator and
+# ``RunOptions`` enforces it below for programmatic callers.
+DEFAULT_DISCOVERY_PAGE_SIZE = 500
+MAX_DISCOVERY_PAGE_SIZE = 10000
+
 
 @dataclass(frozen=True)
 class RunOptions:
@@ -102,6 +126,15 @@ class RunOptions:
     # AND at construction below (retro-3 F4); rejected > 1 in paged mode
     # by assert_mode_options (AD-14).
     workers: int = 1
+    # Story 4.1 (AD-2): which discovery path a TREE run takes, and the
+    # index path's page size. Scalars on the frozen dataclass with the
+    # pre-4.1 behavior as their defaults, so every existing construction
+    # site (build_default_context included) keeps running legacy
+    # discovery and never reaches scan/discovery.py. Validated at the
+    # command boundary (AD-10) AND at construction below; `index` is
+    # rejected in paged mode by assert_mode_options (AD-14).
+    discovery: str = DEFAULT_DISCOVERY
+    discovery_page_size: int = DEFAULT_DISCOVERY_PAGE_SIZE
 
     def __post_init__(self):
         # Retro-3 F4: the CLI validates --workers at parse time, but the
@@ -117,6 +150,31 @@ class RunOptions:
             raise ValueError(f"workers must be an int >= 1 (got {workers!r})")
         if workers > MAX_WORKERS:
             raise ValueError(f"workers must be <= {MAX_WORKERS} (got {workers})")
+        # Same reasoning for story 4.1's two options. An unknown
+        # `discovery` string must be unconstructable rather than silently
+        # taking the legacy path off an `== "index"` test that no longer
+        # matches — a run that reports "index discovery" while querying
+        # the legacy way is the one outcome the equivalence gate cannot
+        # detect.
+        if self.discovery not in DISCOVERY_MODES:
+            raise ValueError(
+                f"discovery must be one of {', '.join(DISCOVERY_MODES)} "
+                f"(got {self.discovery!r})"
+            )
+        page_size = self.discovery_page_size
+        if (
+            not isinstance(page_size, int)
+            or isinstance(page_size, bool)
+            or page_size < 1
+        ):
+            raise ValueError(
+                f"discovery_page_size must be an int >= 1 (got {page_size!r})"
+            )
+        if page_size > MAX_DISCOVERY_PAGE_SIZE:
+            raise ValueError(
+                f"discovery_page_size must be <= {MAX_DISCOVERY_PAGE_SIZE} "
+                f"(got {page_size})"
+            )
 
 
 @dataclass
@@ -151,6 +209,13 @@ class ScanContext:
     provider_registry: Any = None
     extension_map: Any = None
     timings: PhaseTimings = field(default_factory=PhaseTimings)
+    # Story 4.1 (AD-3/AD-4): the scan root's prefetched, parent-bucketed
+    # hits when ``options.discovery == "index"``, else ``None``. Attached
+    # by ``Folder.scan_tree`` — with ``dataclasses.replace``, so no
+    # instance is ever mutated — BEFORE fan-out, and read-only from then
+    # on: workers only ever call ``hits_for``. Appended LAST so the
+    # positional construction sites stay valid.
+    discovery_index: Any = None
 
     def __post_init__(self):
         # Frozen dataclass: bypass the frozen __setattr__ once to install

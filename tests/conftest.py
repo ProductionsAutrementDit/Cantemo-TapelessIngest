@@ -260,15 +260,23 @@ def es_fake():
 
 @pytest.fixture
 def es_page():
-    """Factory for raw query_elastic result pages."""
+    """Factory for raw query_elastic result pages.
 
-    def _page(sources, total):
-        return {
-            "hits": {
-                "total": {"value": total},
-                "hits": [{"_source": source} for source in sources],
-            }
-        }
+    `sort=True` (story 4.1) attaches the per-hit `sort` values a real
+    response carries when the search doc sorts — `[path, id]`, the index
+    path's own tuple — so a `search_after` stream can be scripted. It
+    defaults to False, which is the pre-4.1 shape byte for byte: the
+    legacy path's query is unsorted and its pins compare whole hits.
+    """
+
+    def _page(sources, total, *, sort=False):
+        hits = []
+        for source in sources:
+            hit = {"_source": source}
+            if sort:
+                hit["sort"] = [source.get("path"), source.get("id")]
+            hits.append(hit)
+        return {"hits": {"total": {"value": total}, "hits": hits}}
 
     return _page
 

@@ -59,7 +59,8 @@ the command modules themselves are import-side-effect-free):
 Flags, defaults, output, and failure modes are identical to the old scripts
 (`--storage`, `--path`, `--userId` required; `--startWith`, `--providers`,
 `--skip`, `--only` accept multiple values; plus `--from`, `--since`,
-`--dryrun`, `--replace`, and since story 3.1 `--workers`). Check with
+`--dryrun`, `--replace`, since story 3.1 `--workers`, and since story 4.1
+`--discovery`/`--discovery-page-size`). Check with
 `/opt/cantemo/python/bin/python /opt/cantemo/portal/manage.py scan_tapeless_dir --help`.
 
 ### Parallel scanning (`--workers`, story 3.1)
@@ -80,6 +81,38 @@ Two operational facts worth knowing:
   sequential code path (no executor is even constructed). If a pooled run
   misbehaves, append `--workers 1` to the cron line and the scan behaves
   as it did before the story, byte for byte.
+
+### Discovery path (`--discovery`, story 4.1)
+
+Two discovery implementations coexist behind one flag (AD-2). They find
+the same clips; they ask the index for them very differently.
+
+* **`--discovery=legacy` (the DEFAULT, and unchanged)** issues one query
+  per folder — ~4,000 for the 2026 tree — using a `regexp` on `parent`
+  and paired `*.ext`/`*.EXT` wildcards on `name`, paged with `from`/`size`
+  over an unsorted query. It cannot exceed OpenSearch's 10,000-result
+  window, and a document can be skipped or returned twice if index order
+  shifts mid-scan.
+* **`--discovery=index`** issues ONE query stream per scan root, sorted
+  `[path, id]` and paged with `search_after`, prefetched before the walk
+  fans out and bucketed by `parent`; each folder then reads its bucket
+  instead of querying. No result-window ceiling, no skipped or duplicated
+  document, and extension/filename filtering happens client-side.
+* **`--discovery-page-size N`** (1..10000, default **500**) bounds ONE
+  response of that stream — not the prefetch total, which always runs to
+  the end of the scan root. It has no effect under `--discovery=legacy`.
+
+Three operational facts worth knowing:
+
+* **Nothing changes on deploy.** The default stays `legacy` until the
+  FR-4/FR-34 equivalence gate has been green in production; the nightly
+  cron keeps taking exactly the path it takes today unless someone adds
+  the flag.
+* **`--discovery=legacy` is the rollback lever**, and it is where you
+  already are. If an index run looks wrong, drop the flag.
+* **Tree mode only.** UI/API paged scans reject `--discovery=index`
+  (AD-14): it prefetches a whole scan root, and a paged call has one
+  folder and no root to prefetch.
 
 **Dependency note:** the command modules import `slack_sdk` at module level,
 and Django imports every management command module on *any* `manage.py`

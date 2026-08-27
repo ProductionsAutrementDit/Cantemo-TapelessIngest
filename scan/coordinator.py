@@ -56,6 +56,7 @@ from dataclasses import dataclass, fields, replace
 from heapq import heappop, heappush
 from typing import Any, Callable, Dict, FrozenSet, List, Optional, Tuple
 
+from .context import DEFAULT_DISCOVERY
 from .verification import FolderListings
 
 log = logging.getLogger(__name__)
@@ -247,11 +248,17 @@ TIMING_PHASES = (
 # Options that only tree mode may carry. The four folder filters are
 # genuinely meaningless in paged mode — a paged call scans ONE folder and
 # never walks, so a `--skip`/`--only`/`--startWith`/date-window narrowing
-# could only mislead a caller into thinking it had been applied. Epic 4
-# adds `discovery` to this tuple. Story 3.1's `workers` is tree-only too,
-# but NOT via this tuple: the tuple's "in use" test is truthiness, and
-# `workers` carries its default as the truthy scalar 1 — its rejection is
-# the explicit `> 1` check in `assert_mode_options`.
+# could only mislead a caller into thinking it had been applied. Story
+# 3.1's `workers` is tree-only too, but NOT via this tuple: the tuple's
+# "in use" test is truthiness, and `workers` carries its default as the
+# truthy scalar 1 — its rejection is the explicit `> 1` check in
+# `assert_mode_options`.
+#
+# Story 4.1 CORRECTS the prediction that used to stand here — "Epic 4 adds
+# `discovery` to this tuple". It cannot: `discovery` carries its default
+# as the string "legacy", which is truthy, so the tuple would reject every
+# paged call ever made. It gets the same explicit check `workers` does,
+# for the same reason, and this tuple stays the four folder filters.
 TREE_ONLY_OPTIONS = ("skip", "only", "startwith", "date_window")
 
 # Safety valve for the fan-out seam (E29). A `gather()` that never reports
@@ -667,6 +674,21 @@ def assert_mode_options(options, mode: str) -> None:
         raise ValueError(
             f"workers={options.workers} cannot be used in paged mode: the "
             f"worker pool is tree mode's"
+        )
+    # `discovery` is tree-only for the same structural reason and needs
+    # the same explicit form (story 4.1, AD-14): its default is the
+    # truthy string "legacy", so `TREE_ONLY_OPTIONS`' truthiness test
+    # would reject every paged call in existence. Index discovery
+    # prefetches a whole SCAN ROOT before fan-out; a paged call has one
+    # folder and no root to prefetch, so asking for it here has confused
+    # the modes. This rejection stands until the default flips at legacy
+    # retirement, when paged mode is re-pointed onto the surviving path.
+    # Read DIRECTLY, exactly like `workers` above:
+    # `RunOptions.__post_init__` makes an unknown mode unconstructable.
+    if options.discovery != DEFAULT_DISCOVERY:
+        raise ValueError(
+            f"discovery={options.discovery!r} cannot be used in paged mode: "
+            f"index discovery prefetches a scan root, which is tree mode's"
         )
 
 

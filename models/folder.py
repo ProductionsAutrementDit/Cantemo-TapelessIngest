@@ -3,6 +3,7 @@ import time
 import uuid
 import os
 import re
+from dataclasses import replace as dataclass_replace
 from typing import Optional, Dict, List, Any
 from django.db import DatabaseError, connections, models, transaction
 
@@ -33,7 +34,10 @@ from portal.plugins.TapelessIngest.scan.adapters import (
     build_default_context,
     build_provider_registry,
 )
-from portal.plugins.TapelessIngest.scan.context import browse_root_path
+from portal.plugins.TapelessIngest.scan.context import (
+    DISCOVERY_INDEX,
+    browse_root_path,
+)
 from portal.plugins.TapelessIngest.scan.coordinator import (
     FolderOutcome,
     PhaseTimer,
@@ -51,6 +55,7 @@ from portal.plugins.TapelessIngest.scan.coordinator import (
     summary_lines,
     walk_tree,
 )
+from portal.plugins.TapelessIngest.scan.discovery import prefetch_index
 from portal.plugins.TapelessIngest.scan.extraction import (
     applicable_providers,
     consumed_subdirs,
@@ -873,6 +878,41 @@ class Folder(models.Model):
         if provider_list is None:
             provider_list = Clip._get_provider_list(requested_providers)
         extension_map = scan_context.extension_map
+        # Story 4.1 (AD-2): which discovery path this pass takes. `None`
+        # is legacy — the byte-frozen `build_search_doc` query, paged with
+        # `from`/`size` — and stays the default; `index` reads the scan
+        # root's prefetched buckets instead of querying at all.
+        #
+        # A missing prefetch is fatal rather than a silent fall back to
+        # legacy: a run that reports index discovery while querying the
+        # legacy way is the one outcome the equivalence gate cannot
+        # detect. It is unreachable in practice — `scan_tree` prefetches
+        # before fan-out and `assert_mode_options` forbids the mode in
+        # paged mode — so reaching it means a caller built a context by
+        # hand and skipped the prefetch.
+        discovery_index = None
+        if scan_context.options.discovery == DISCOVERY_INDEX:
+            discovery_index = scan_context.discovery_index
+            if discovery_index is None:
+                raise TapelessIngestException(
+                    f"index discovery reached {self.path} with no prefetched "
+                    f"index for its scan root"
+                )
+            if first or number:
+                # A folder's whole bucket arrives at once, so there is no
+                # page to slice and `first`/`number` would be SILENTLY
+                # ignored — a paged caller would get the entire folder
+                # while believing it asked for 25 rows. Index discovery is
+                # tree-only by AD-14, so a paging request here is a
+                # contract violation, not a soft case. (`number=0` is the
+                # walk's loop-all-pages sentinel and is what tree mode
+                # always passes.)
+                raise TapelessIngestException(
+                    f"index discovery cannot serve a paged request for "
+                    f"{self.path} (first={first}, number={number}): it "
+                    f"returns a folder's whole bucket at once and is tree "
+                    f"mode's only"
+                )
         # Two DIFFERENT things, and before this round they shared the name
         # `providers`: the run's requested provider FILTER (above) and the
         # provider NAMES this pass actually saw claim a clip (below, the
@@ -934,7 +974,16 @@ class Folder(models.Model):
             # One listings cache per scan invocation (AD-4): batched
             # verification, one os.scandir per unique directory.
             listings = FolderListings()
-            search_doc = self.build_search_doc(provider_list)
+            # Built ONLY on the legacy path: `build_search_doc` is the
+            # byte-frozen query AD-3 grandfathers, and index discovery
+            # never sends it. Reaching it here anyway would spend the
+            # aggregation over every provider's three methods per folder
+            # for a document nothing uses.
+            search_doc = (
+                None
+                if discovery_index is not None
+                else self.build_search_doc(provider_list)
+            )
             # Named provider_context (not `context`) so the mutable provider
             # dict never shadows the ScanContext kwarg. One per scan()
             # invocation, spanning every page: the providers' sidecar caches
@@ -965,19 +1014,35 @@ class Folder(models.Model):
                 if number == 0:
                     result_number = 100
                 # The `discovery` phase, ACCUMULATING across every page of
-                # this folder — Epic 4 replaces what happens inside it.
+                # this folder — story 4.1 is what replaces its inside.
+                # Whichever path runs, it yields `(hits, total)` and
+                # everything below stays discovery-agnostic.
                 with timer("discovery"):
-                    search_result = query_elastic(
-                        search_doc,
-                        doc_type=["file"],
-                        first=first,
-                        number=result_number,
-                    )
-                hits = search_result["hits"]["hits"]
-                response["hits"] = search_result["hits"]["total"]["value"]
+                    if discovery_index is not None:
+                        # Index mode: the scan root was fetched ONCE
+                        # before fan-out, so this folder's query is a
+                        # read of its own bucket plus the buckets its
+                        # providers' getSubPaths() claim. There is no
+                        # second page — the whole folder is here — so the
+                        # continue rule below is legacy's alone.
+                        hits, total = discovery_index.hits_for(self.path, provider_list)
+                    else:
+                        search_result = query_elastic(
+                            search_doc,
+                            doc_type=["file"],
+                            first=first,
+                            number=result_number,
+                        )
+                        hits = search_result["hits"]["hits"]
+                        total = search_result["hits"]["total"]["value"]
+                response["hits"] = total
                 self.clips_total = response["hits"]
                 seen_hits += len(hits)
-                if number == 0 and len(hits) == result_number:
+                if (
+                    discovery_index is None
+                    and number == 0
+                    and len(hits) == result_number
+                ):
                     has_next = True
                     first += result_number
                 # Deterministic per-page iteration order. The key tolerates
@@ -1495,6 +1560,52 @@ class Folder(models.Model):
                     "a collection or submit a clip without one"
                 )
         started = time.monotonic()
+        # Story 4.1 (AD-3): index discovery's ONE query stream, run here
+        # and only here — once per SCAN ROOT, BEFORE fan-out. Placing it
+        # ahead of the walk is what keeps `ScanContext` immutable while
+        # workers run (AD-4): the prefetched index is attached with
+        # `dataclasses.replace`, so no context instance is ever mutated,
+        # and every worker only ever reads it. `timings` is carried
+        # through by `replace`, so the caller's own context still sees the
+        # fold below.
+        #
+        # The cost lands in the run's elapsed time and therefore in the
+        # summary's `other` bucket: it belongs to no single folder, and
+        # charging it to one folder's `discovery` phase would misattribute
+        # the whole scan root's fetch to whichever folder ran first.
+        if ctx.options.discovery == DISCOVERY_INDEX:
+            try:
+                discovery_index = prefetch_index(
+                    query_elastic,
+                    self.storage_id,
+                    self.path,
+                    page_size=ctx.options.discovery_page_size,
+                )
+            except Exception as e:
+                # BROADLY, not just ValueError: the prefetch is one long
+                # HTTP conversation with the index, so a connection reset,
+                # a read timeout or a 429 is at least as likely as a
+                # malformed stream — and any of them propagating raw kills
+                # a multi-hour nightly run with an unattributed traceback.
+                # Whatever it was, the scan root is named and the run dies
+                # here rather than letting 4,000 folders read a truncated
+                # view of the tree.
+                raise TapelessIngestException(
+                    f"Index discovery failed to prefetch {self.path} on "
+                    f"storage {self.storage_id}: {e}"
+                ) from e
+            # portal.log, deliberately NOT `emit`: the equivalence gate
+            # compares the two modes' emitted lines, so index discovery
+            # must not add one of its own to the operator's report.
+            log.info(
+                "Index discovery: prefetched %d files in %d folders under %s "
+                "(page size %d)",
+                discovery_index.hit_count,
+                discovery_index.bucket_count,
+                self.path,
+                ctx.options.discovery_page_size,
+            )
+            ctx = dataclass_replace(ctx, discovery_index=discovery_index)
         # The fan-out seam (story 3.1). `workers > 1` swaps the dispatcher
         # for a real pool and wraps the worker body with per-thread
         # connection hygiene — the two bound methods and the worker are

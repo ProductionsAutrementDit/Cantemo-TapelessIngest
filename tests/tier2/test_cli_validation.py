@@ -258,3 +258,83 @@ def test_workers_reaches_the_run_context(
         user.delete()  # keep the auth table empty for the unknown-user tests
 
     assert captured["workers"] == expected
+
+
+# --------------------------------------------------------------------------
+# Story 4.1: --discovery and --discovery-page-size
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("command", COMMANDS)
+def test_an_unknown_discovery_mode_aborts(command):
+    """AD-10: argparse's own choices check, before any scan or storage I/O."""
+    with pytest.raises(CommandError, match="discovery"):
+        call_command(command, *BASE_ARGS, "--userId", "1", "--discovery", "elastic")
+
+
+@pytest.mark.parametrize("command", COMMANDS)
+@pytest.mark.parametrize("value", ["0", "-2"])
+def test_a_non_positive_discovery_page_size_aborts(command, value):
+    expected = f"--discovery-page-size must be >= 1 (got {value})"
+    with pytest.raises(CommandError, match=re.escape(expected)):
+        call_command(
+            command, *BASE_ARGS, "--userId", "1", "--discovery-page-size", value
+        )
+
+
+@pytest.mark.parametrize("command", COMMANDS)
+def test_a_non_integer_discovery_page_size_aborts(command):
+    with pytest.raises(CommandError, match="discovery-page-size"):
+        call_command(
+            command, *BASE_ARGS, "--userId", "1", "--discovery-page-size", "many"
+        )
+
+
+@pytest.mark.parametrize("command", COMMANDS)
+def test_a_discovery_page_size_above_the_result_window_aborts(command):
+    """AD-3: `size` is still capped by index.max_result_window under
+    search_after, so a bigger page could only come back as a window
+    error from the server."""
+    expected = "--discovery-page-size must be <= 10000 (got 10001)"
+    with pytest.raises(CommandError, match=re.escape(expected)):
+        call_command(
+            command, *BASE_ARGS, "--userId", "1", "--discovery-page-size", "10001"
+        )
+
+
+@pytest.mark.parametrize("command", COMMANDS)
+@pytest.mark.parametrize(
+    "flags,expected",
+    [
+        # No flag: the default stays `legacy` until the equivalence gate
+        # has been green in production — the nightly cron is unchanged by
+        # this story unless an operator asks for the new path.
+        ([], ("legacy", 500)),
+        (["--discovery", "index"], ("index", 500)),
+        (["--discovery", "index", "--discovery-page-size", "50"], ("index", 50)),
+    ],
+)
+def test_the_discovery_options_reach_the_run_context(
+    command, flags, expected, migrated_db, monkeypatch, storage_fake
+):
+    module = importlib.import_module(
+        f"portal.plugins.TapelessIngest.management.commands.{command}"
+    )
+    captured = {}
+
+    def fake_scan_tree(self, ctx, *, emit):
+        captured["discovery"] = ctx.options.discovery
+        captured["page_size"] = ctx.options.discovery_page_size
+        return None
+
+    monkeypatch.setattr(Folder, "scan_tree", fake_scan_tree)
+    monkeypatch.setattr(module, "CustomLogger", _CapturingLogger)
+    storage_fake.set_root("VX-41", "/wired-root")
+
+    user = User.objects.create(pk=4244, username=f"story41-discovery-{command}")
+    try:
+        call_command(command, *BASE_ARGS, "--userId", "4244", *flags)
+    finally:
+        user.delete()  # keep the auth table empty for the unknown-user tests
+
+    assert (captured["discovery"], captured["page_size"]) == expected
