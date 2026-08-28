@@ -1,0 +1,48 @@
+# The FR-4 / AD-2 waiver list. APPEND-ONLY, and HUMAN-WRITTEN.
+#
+# AD-2 admits an explicit waiver list beside the harness: one entry per
+# Feature-G fix, EACH CITING ITS FR. The harness only ever READS this
+# file. It proposes waiver lines in its output -- with `FR-?` in the
+# first column, which the parser refuses -- so ratifying one is a
+# deliberate act: copy the proposal, choose the FR it belongs to, and
+# write down why in the note.
+#
+# It starts EMPTY, and an empty list is valid. Every line added here
+# suppresses a real, observed difference between the two discovery paths;
+# a line nobody can trace back to a decision is indistinguishable from
+# somebody silencing a defect.
+#
+# Format, one entry per line:
+#
+#     FR-<n> | side | folder glob | file glob | provider glob | note
+#
+# EXACTLY six columns; no column may contain `|` (no escaping exists).
+#
+# side          one of legacy_only, index_only, any
+# folder glob   pattern over owning_folder_path
+# file glob     pattern over verified_file_path
+# provider glob pattern over provider_name
+#
+# GLOB SEMANTICS -- read this before writing a pattern. Patterns are
+# matched PER PATH SEGMENT: `*` and `?` never cross `/`. So
+# `2026/AA_*` matches a shoot folder and NOT its card subdirectories,
+# which is the point: a waiver ratified for one file must not silently
+# cover a whole subtree. To cross separators deliberately, write `**`:
+# `2026/AA_*/**` covers everything below those shoots. A pattern that is
+# exactly `*` means "anything at all", which is what a blanket column
+# should be written as -- so that a blanket waiver is visibly one.
+#
+# The proposed lines the harness prints are glob-ESCAPED: a real path
+# containing `*`, `?` or `[` comes out as `[*]`, `[?]`, `[[]`, so
+# ratifying a proposal verbatim can never silence more than what was
+# observed.
+#
+# Folder-set divergences (a folder one path walked into and the other did
+# not) are NOT waivable here. They are `consumed_subdirs` drift, i.e. the
+# duplicate-ingest direction of NFR-1, and they need a fix, not a
+# signature.
+#
+# The harness reports any waiver that matched NOTHING during a run. A
+# stale waiver can hide a new defect, so an unmatched entry is a prompt
+# to delete it -- not noise. That report is marked INCONCLUSIVE when an
+# entry errored, since its waivers never got the chance to match.

@@ -1,0 +1,50 @@
+# The reference corpus for the FR-4 / AD-2 discovery equivalence gate.
+#
+#! ratified: no
+#! ratification-note: PROPOSED. No human has confirmed these paths exist on the storage or that they cover the population FR-4 must be proven over. The harness carries this flag into every verdict and the command prints a warning, so a rehearsal cannot be quoted as the gate.
+#
+# Format, one entry per line:
+#
+#     storage_id | path | free-text note
+#
+# A `#!` line is a DIRECTIVE (`#! name: value`), not a comment. `#` alone
+# is a comment. Blank lines are ignored.
+#
+# EXACTLY three columns. This format has no escaping, so neither a path
+# nor a note may contain `|` -- a line with four columns is REFUSED
+# rather than mis-split. That costs you a pipe in your notes and buys an
+# unambiguous scope: the alternative silently re-parsed `2026/a | b` into
+# the path `2026/a`, and the gate then ran, cleanly and confidently, over
+# the wrong subtree.
+#
+# `path` is STORAGE-ROOT-RELATIVE (the same coordinate system as
+# Folder.path and VSFile.getPath()). Refused: absolute paths, `..`, a
+# path that normalises to the storage root, a path containing `|` (this
+# format has no escaping), a duplicate, and a path NESTED inside another
+# entry -- the shared subtree would be scanned twice and counted twice.
+#
+# `path` is a SCAN ROOT, exactly as `scan_tapeless_dir --path` is: the
+# walk treats it as a container and scans everything BELOW it, never the
+# root folder itself. Name the PARENT of the shoots you want gated.
+#
+# What a corpus has to cover to be worth ratifying:
+#
+#   * the five on-disk card shapes tests/tier2/test_red_card_shapes.py
+#     enumerates;
+#   * at least one shoot whose clips live in a provider sub-path;
+#   * at least one FOLDER holding more than 100 matching files. Legacy
+#     pages at 100 hits PER FOLDER (`result_number = 100` in
+#     `_scan_pass`), not per subtree, so a corpus of small folders never
+#     exercises legacy's unsorted `from`/`size` loop at all -- and that
+#     loop is the whole reason the reference is run twice;
+#   * at least one shoot with a mixed provider population, so
+#     `provider_name` attribution is exercised rather than assumed.
+#
+# Run it with:
+#   python manage.py verify_discovery_equivalence --corpus <this file>
+#
+# Sizing note for whoever ratifies this: the gate walks each entry THREE
+# times (legacy, legacy, index). Size the corpus to the maintenance
+# window accordingly.
+
+VX-41 | 2026 | Seed entry: the 2026 shoot tree, which contains the 2026-08-27 manual dry-run precedent (2026/AA_20260804_A350_STARLUX_SHOTOVER -- 71 folders, 244 clips, 42 RED cards, both modes identical by hand). Named at the PARENT because a scan root is never itself scanned. Ratification should decide whether the whole year is the right scope for a maintenance window or whether it needs narrowing to a named set of shoots' parents.

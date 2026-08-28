@@ -38,6 +38,9 @@ SWEEP_MODULES = [
     "portal.plugins.TapelessIngest.models.settings",
     "portal.plugins.TapelessIngest.management.commands.scan_tapeless_dir",
     "portal.plugins.TapelessIngest.management.commands.check_clips_in_folder",
+    # Story 4.2: the FR-4 gate. It is the only command with no twin,
+    # so nothing else pins its import health.
+    "portal.plugins.TapelessIngest.management.commands.verify_discovery_equivalence",
     "portal.plugins.TapelessIngest.providers.providers",
     "portal.plugins.TapelessIngest.providers.atomos",
     "portal.plugins.TapelessIngest.providers.avchd",
