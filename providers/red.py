@@ -8,6 +8,7 @@ import shutil
 import sys
 import os
 import csv
+import re
 from datetime import datetime
 from io import StringIO
 from portal.plugins.TapelessIngest.helpers import TapelessIngestException
@@ -16,6 +17,7 @@ from portal.plugins.TapelessIngest.models.clip import (
     Clip,
     ClipFile,
     ClipMetadata,
+    segment_stem,
 )
 from portal.plugins.TapelessIngest.models.settings import Settings
 
@@ -49,6 +51,50 @@ REDLINE_REQUIRED_COLUMNS = (
     "Camera Model",
     "Camera PIN",
 )
+
+# Where a RED card's media sits, RELATIVE to the folder being scanned —
+# and the whole of what "card structure" now means.
+#
+# Card structure is OPTIONAL and NON-DISCRIMINATING. A folder is a RED
+# card folder because its name ENDS IN `.RDM` or `.RDC`, in any case —
+# never because it spells a camera letter, a reel number and a
+# six-character shoot id. BOTH levels are optional and BOTH accept either
+# extension, and the copy suffix an `.RDC` may carry (`…_002.RDC`,
+# `…_S000.RDC`, any) is never discriminating.
+#
+# The precise pattern this replaces —
+# `[A-Z][0-9]{3}_[0-9A-Z]{6}.RDM/[A-Z][0-9]{3}_[A-Z][0-9]{3}_[0-9A-Z]{6}.RDC`
+# — recognised exactly one on-disk shape. Rushes copied loose (no `.RDM`
+# level, or a copy suffix on the `.RDC`) missed it and fell through to
+# the extension declaration, where the bare `.r3d` matches EVERY segment
+# and each one was probed as its own clip candidate. Measured on prod
+# 2026-08-27: 132 such `.RDC` folders across five shoots spanning
+# 2022-2026, of which 24 clips ended up anchored on a middle segment.
+#
+# "Ends in `.RDM`/`.RDC`" is the convention PAD already runs on: the
+# `collections_ignore_folder` SETTING is configured with `.+\.RDM` and
+# `.+\.RDC` on the production server. That is an operator configuration,
+# not a shipped default (`models/settings.py` defaults the field to
+# `""`), so it is corroboration for the convention — not an invariant
+# this code may assume.
+#
+# Case-tolerant because the story exists for copies made any which way,
+# and expressed with character classes only: `[^/]`, `[Rr]`, `+`, `?`
+# and `\.` mean the same thing to Lucene (the legacy query) and to
+# Python (`scan/discovery.py`'s client-side evaluator), so both discovery
+# paths read it identically.
+CARD_SUBPATH_REGEXP = r"[^/]+\.[Rr][Dd][MmCc](/[^/]+\.[Rr][Dd][MmCc])?"
+
+# The runtime guard's extension, exactly. `getSegmentedExtensions` must
+# declare the case the guard accepts and nothing wider — see the note
+# there.
+R3D_EXTENSION = ".R3D"
+
+# `getFilesInStorage`'s hard page size when collecting a clip's segments.
+# A RED segment is ~2 GB, so a take with more than this many files does
+# not exist; the ceiling is here so that hitting it is REPORTED rather
+# than silently truncating a clip's media.
+SEGMENT_FILE_LIMIT = 1000
 
 
 def configured_redline_path():
@@ -106,13 +152,59 @@ class Provider(BaseProvider):
         self.clips_file_extension = ".RDC"
 
     def getExtensions(self):
-        # Both forms on purpose: `_001.r3d` is the narrow ES wildcard,
-        # `.r3d` keeps the declaration a superset of the runtime guard
-        # below (`== ".R3D"`), which is what decides. Drop `.r3d` and an
-        # uppercase non-`_001` file flips to `file` — a different umid.
+        # Both forms on purpose. `.r3d` keeps the declaration a superset
+        # of the runtime guard below (`== ".R3D"`), which is what
+        # decides: drop it and an uppercase non-`_001` file flips to
+        # `file` — a different umid. `_001.r3d` is now redundant with it
+        # (nothing selects the anchor in the query any more, see
+        # `getFilters`), and it is kept because narrowing a declaration
+        # is the one direction that can silently change which provider
+        # claims a file.
         return ["_001.r3d", ".r3d"]
 
+    def getSegmentedExtensions(self):
+        """The suffix whose files are segments of one take, not clips.
+
+        A RED take longer than the card's file-size limit is written as
+        ``X_001.R3D``, ``X_002.R3D`` … ``X_NNN.R3D`` — N files, ONE clip,
+        one UUID. The query no longer picks the anchor out (see
+        ``getFilters``), so the assembly rules in ``models/clip.py`` do:
+        ``_001`` anchors, its siblings are extras
+        ``getClipAdditionalMediaFiles`` re-attaches at ingest, and an
+        increment with no ``_001`` and other increments beside it is an
+        incomplete copy.
+
+        UPPERCASE, matching the runtime guard below EXACTLY, and matched
+        case-sensitively by the grouping. Declaring ``".r3d"`` here would
+        make grouping suppress ``x_002.r3d`` — a file this provider's
+        guard DECLINES, and which the `file` provider then claims as a
+        clip of its own with no extras of any kind. Net effect of the
+        wider declaration: one lonely `file` clip and every other segment
+        of that card silently dropped. A grouping declaration must never
+        be wider than the guard that will actually claim the anchor.
+
+        This is the opposite direction from ``getExtensions()``, which
+        must be a SUPERSET of the guard: that one decides who is OFFERED
+        a file, this one decides who is DENIED one.
+
+        These are EXTRA FILES, not spanned clips: `red` segments are one
+        take's media split into files in one place (one row, N files),
+        where ``Clip.spanned``/``getSpannedClips()`` are for a take split
+        across several physical cards (N linked rows, one master). The
+        two are complementary; nothing here touches a spanned field. See
+        ``models/clip.py``'s grouping note.
+        """
+        return [R3D_EXTENSION]
+
     def getFilters(self, escaped_path):
+        # `wildcard *.R3D`, not `*_001.R3D`: SELECTING the anchor was a
+        # query concern only as long as the card pattern above was
+        # precise enough to bound the reach. Grouping is an assembly
+        # concern now, so discovery returns every segment and the
+        # assembly rules decide which one anchors a clip. The name
+        # clause stays — without it this filter would claim the `.wav`,
+        # `.RMD` and `.mov` sidecars sitting beside the media in a card
+        # folder, which no provider here would then claim.
         return [
             {
                 "bool": {
@@ -121,11 +213,22 @@ class Provider(BaseProvider):
                             "regexp": {
                                 "parent": os.path.join(
                                     escaped_path,
-                                    "[A-Z][0-9]{3}_[0-9A-Z]{6}.RDM/[A-Z][0-9]{3}_[A-Z][0-9]{3}_[0-9A-Z]{6}.RDC",
+                                    CARD_SUBPATH_REGEXP,
                                 )
                             }
                         },
-                        {"wildcard": {"name": "*_001.R3D"}},
+                        # Either case, because the copies this story
+                        # exists for were made any which way. A nested
+                        # `should` inside the `must`, which is the same
+                        # subset `scan/discovery.py` already models.
+                        {
+                            "bool": {
+                                "should": [
+                                    {"wildcard": {"name": "*.R3D"}},
+                                    {"wildcard": {"name": "*.r3d"}},
+                                ]
+                            }
+                        },
                     ]
                 }
             },
@@ -200,7 +303,11 @@ class Provider(BaseProvider):
 
     def getMetadatasFromFile(self, media_file, metadatas, context):
         filename, file_extension = os.path.splitext(media_file.getFileName())
-        if file_extension == ".R3D":
+        # The one guard, and the reason `getSegmentedExtensions()`
+        # declares `.R3D` uppercase: it is case-SENSITIVE, so an
+        # `x_001.r3d` is not this provider's and grouping must not
+        # suppress its siblings on this provider's behalf.
+        if file_extension == R3D_EXTENSION:
             metadatas["provider"] = self.machine_name
             metadatas["clipname"] = filename
             metadatas["file_id"] = media_file.getId()
@@ -225,30 +332,70 @@ class Provider(BaseProvider):
         }
         return None
 
+    @staticmethod
+    def segment_selector(anchor_name):
+        """``(glob, pattern)`` selecting ``anchor_name``'s sibling segments.
+
+        ``glob`` is what the storage query can express (``*``); ``pattern``
+        is the exact rule the returned names are then held to. Both are
+        derived from the ANCHOR'S OWN FILENAME, never from REDline's
+        ``Clip Name`` — for renamed or re-wrapped rushes, which is this
+        story's whole population, the two diverge and the CSV name selects
+        nothing, silently costing the clip every segment but its first.
+
+        The pattern is what stops a neighbouring clip being swallowed: a
+        glob of ``A001_*`` matches ``A001_B_004.R3D`` as happily as
+        ``A001_004.R3D`` whenever one stem prefixes another, which the new
+        flat-folder shape makes reachable. Only ``<stem>_<three
+        digits><same extension>`` survives.
+
+        Returns ``None`` when the anchor carries no increment — a clip
+        with no segments has no siblings to look for.
+        """
+        parsed = segment_stem(anchor_name)
+        if parsed is None:
+            return None
+        stem, _index, extension = parsed
+        glob = f"{stem}_*{extension}"
+        pattern = re.compile(rf"{re.escape(stem)}_[0-9]{{3}}{re.escape(extension)}")
+        return glob, pattern
+
     def getClipAdditionalMediaFiles(self, clip):
         files = []
         main_file_id = clip.file.getId()
-        # Get video files:
-        """
-        file_part_name = (
-            clip.metadatas["clipname"]
-            + "_"
-            + "{0:0=3d}".format(file_count)
-            + ".R3D"
-        )
-        """
-        file_part_name = f"{clip.metadatas['clipname']}_*.R3D"
-        file_part_path = os.path.join(clip.path, file_part_name)
-        _ret = clip.get_storage_helper().getFilesInStorage(
-            1000,
-            0,
-            path=urllib.parse.quote(file_part_path, safe="*/"),
-            sort="filename",
-        )
-        _ret_files = _ret["files"]
-        file_count = 2
-        for _ret_file in _ret_files:
-            if _ret_file.getId() != main_file_id:
+        selector = self.segment_selector(os.path.basename(clip.file.getPath()))
+        if selector is not None:
+            glob, pattern = selector
+            file_part_path = os.path.join(clip.path, glob)
+            _ret = clip.get_storage_helper().getFilesInStorage(
+                SEGMENT_FILE_LIMIT,
+                0,
+                path=urllib.parse.quote(file_part_path, safe="*/"),
+                sort="filename",
+            )
+            _ret_files = _ret["files"]
+            if len(_ret_files) >= SEGMENT_FILE_LIMIT:
+                # Truncation here loses media from an item that will look
+                # perfectly imported. Report it rather than trim quietly.
+                log.error(
+                    f"{clip.umid}: the segment listing for {file_part_path} hit "
+                    f"the {SEGMENT_FILE_LIMIT}-file page limit, so this clip may "
+                    f"be missing segments; its media is incomplete"
+                )
+            # Sorted by name here as well as in the query: the ORDER is
+            # the shape's track order, and it must not depend on what a
+            # storage backend chooses to mean by sort="filename".
+            selected = sorted(
+                (
+                    _ret_file
+                    for _ret_file in _ret_files
+                    if _ret_file.getId() != main_file_id
+                    and pattern.fullmatch(os.path.basename(_ret_file.getPath()))
+                ),
+                key=lambda _ret_file: os.path.basename(_ret_file.getPath()),
+            )
+            file_count = 2
+            for _ret_file in selected:
                 files.append(
                     {
                         "type": "video",

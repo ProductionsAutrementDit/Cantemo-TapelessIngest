@@ -1,4 +1,5 @@
 import logging
+import re
 from collections.abc import Mapping
 from typing import Optional, Dict, List, Tuple, Any
 
@@ -80,6 +81,234 @@ def job_id_from_response(response: Any) -> Optional[str]:
     if not isinstance(response, Mapping):
         return None
     return response.get("jobId") or None
+
+
+# ---------------------------------------------------------------------------
+# Segment grouping: the three clip-assembly rules
+# ---------------------------------------------------------------------------
+#
+# A camera that splits one take across several files (`red`: `X_001.R3D`,
+# `X_002.R3D` … `X_NNN.R3D`) hands discovery N files for ONE clip. Which
+# of them anchors that clip is decided HERE, when clips are assembled —
+# not in the discovery query, which returns them all.
+#
+# The rules, in this order:
+#
+#   1. `X_001.R3D` is present -> ONE clip anchored on it; `X_002…X_NNN`
+#      are its extra files (attached at ingest by the provider's
+#      `getClipAdditionalMediaFiles`) and are never probed as clip
+#      candidates of their own.
+#   2. A name carrying NO increment (`SOMECLIP.R3D`) -> its own clip, no
+#      extras. Since 2026-08-28 this ALSO covers a name that merely ends
+#      in three digits with nothing else of its stem beside it — a lone
+#      `SHOT_042.R3D` is an ordinary filename, not a broken set, and must
+#      be ingested rather than reported forever.
+#   3. An increment with no `_001` anchor AND at least one OTHER increment
+#      of the same stem beside it -> an ERROR, never a clip. The second
+#      condition is what makes rule 3 evidence of a genuinely incomplete
+#      multi-file set, which is what the 24 mis-anchored production clips
+#      were (`…_004.R3D`, `…_012.R3D`, `…_026.R3D` standing in for their
+#      clip's first segment).
+#
+# EXTRAS, NOT SPANNED CLIPS (ruled by Camille 2026-08-28, recorded here
+# because it is domain knowledge the code cannot carry). `Clip.spanned`,
+# `spanned_order`, `spanned_id`, `master_clip` and
+# `Provider.getSpannedClips()` already exist and look like they should
+# serve this — `USER_GUIDE.md`'s "Spanned Clips" section even uses
+# `A001_C001_001.R3D`/`_002`/`_003` as its worked example. They are for a
+# DIFFERENT shape: a take spread across SEVERAL PHYSICAL CARDS (P2,
+# XDCAM), reunited as N linked `Clip` rows with one master. RED segments
+# are the other shape — one take whose media is split into numbered files
+# in ONE place — which is ONE row carrying N files on its item. The two
+# are complementary, not competing; nothing here reads or writes a
+# spanned field, and a take that is both segmented and card-spanned is
+# out of scope (recorded as deferred work).
+#
+# None of this touches `Clip.umid` — the RED clip UUID read from the
+# media, shared by every segment. Grouping changes which file ANCHORS a
+# clip, never the clip's identity, so a clip already ingested stays
+# already-ingested.
+
+# `<stem>_<three digits>`, matched against the name with its extension
+# already stripped. Three digits is the camera's own format
+# ("{0:0=3d}"). Anchoring both ends is load bearing: `X_1000` has four
+# digits after its only underscore and does NOT match (it is an ordinary
+# name, not segment 1000 of anything), and `_001` has no stem and does
+# not match either.
+SEGMENT_INDEX_RE = re.compile(r"\A(?P<stem>.+)_(?P<index>[0-9]{3})\Z")
+
+# The increment that anchors a clip. Not "the lowest increment present":
+# a card whose `_001` was not copied must be reported, not silently
+# re-anchored, which is the whole point of rule 3.
+SEGMENT_ANCHOR_INDEX = "001"
+
+# What `segment_role` answers. ANCHOR/STANDALONE/UNGROUPED all mean
+# "extract this file"; they are kept apart so each rule can be pinned on
+# its own.
+SEGMENT_UNGROUPED = "ungrouped"  # no applicable provider groups this suffix
+SEGMENT_STANDALONE = "standalone"  # rule 2
+SEGMENT_ANCHOR = "anchor"  # rule 1, the file that becomes the clip
+SEGMENT_EXTRA = "extra"  # rule 1, a sibling of an anchor: skipped
+SEGMENT_ORPHAN = "orphan"  # rule 3, an incomplete set: reported, not a clip
+
+
+def segment_stem(filename: str) -> Optional[Tuple[str, str, str]]:
+    """``(stem, index, extension)`` for a segmented name, else ``None``.
+
+    The one parser. ``red.getClipAdditionalMediaFiles`` reads it too, so
+    the set of files the SCAN drops as extras and the set the INGEST
+    re-attaches are derived from the same rule rather than from two
+    independent guesses about the naming.
+    """
+    stem, extension = os.path.splitext(filename)
+    match = SEGMENT_INDEX_RE.match(stem)
+    if match is None:
+        return None
+    return match.group("stem"), match.group("index"), extension
+
+
+def _validated_suffixes(provider: Any) -> Tuple[str, ...]:
+    """One provider's ``getSegmentedExtensions()``, checked.
+
+    Refuses LOUDLY rather than degrading. A bare string would be iterated
+    character by character — a declaration of ``".R3D"`` would become the
+    suffixes ``.``/``R``/``3``/``D`` and group every filename ending in
+    ``d`` — and a suffix without its leading dot would do the same kind of
+    damage more quietly. Both are provider bugs that must not be absorbed
+    into a scan that silently stops ingesting media.
+    """
+    declared = getattr(provider, "getSegmentedExtensions", None)
+    if not callable(declared):
+        # A duck-typed double predating the hook groups nothing.
+        return ()
+    label = getattr(provider, "machine_name", None) or repr(provider)
+    value = declared()
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        raise TapelessIngestException(
+            f"provider {label} returned the bare string {value!r} from "
+            f"getSegmentedExtensions(); expected a sequence of suffixes — "
+            f"iterating it would group every filename ending in one of its "
+            f"characters"
+        )
+    suffixes = []
+    for suffix in list(value):
+        if not isinstance(suffix, str) or not suffix.startswith(".") or len(suffix) < 2:
+            raise TapelessIngestException(
+                f"provider {label} declared the unusable segmented extension "
+                f"{suffix!r}; it must be a non-empty string beginning with '.'"
+            )
+        suffixes.append(suffix)
+    return tuple(dict.fromkeys(suffixes))
+
+
+def segmented_extensions_by_provider(
+    provider_list: Optional[List[Any]],
+) -> Dict[int, Tuple[str, ...]]:
+    """``{id(provider): suffixes}`` for the providers that group.
+
+    Keyed by IDENTITY, like ``ExtensionMap._ranks``: two instances of one
+    class must be told apart. Built once per scan invocation and consulted
+    per file, so a file is only ever grouped by the suffixes of a provider
+    that is APPLICABLE to it — declaring ``.R3D`` does not let `red`
+    suppress a file `red` would never be offered.
+    """
+    by_provider = {}
+    for provider in provider_list or ():
+        suffixes = _validated_suffixes(provider)
+        if suffixes:
+            by_provider[id(provider)] = suffixes
+    return by_provider
+
+
+def segmented_extensions(provider_list: Optional[List[Any]]) -> Tuple[str, ...]:
+    """The flat union of every grouped suffix, order-stable and validated.
+
+    The case is PRESERVED, and that is load bearing (see ``segment_role``).
+    """
+    suffixes: List[str] = []
+    for provider in provider_list or ():
+        suffixes.extend(_validated_suffixes(provider))
+    return tuple(dict.fromkeys(suffixes))
+
+
+def segment_suffixes_for(
+    providers: Any, by_provider: Dict[int, Tuple[str, ...]]
+) -> Tuple[str, ...]:
+    """The grouped suffixes BINDING on one file.
+
+    ``providers`` is that file's APPLICABLE set (the extraction
+    pre-filter's answer), not the registry: a provider that declares a
+    segmented suffix it does not also claim through ``getExtensions()``
+    would otherwise suppress files it is never offered and never
+    re-attaches, and the media would simply never be ingested. Within the
+    applicable set a declaration is binding on everyone, because there is
+    one clip per anchor rather than one per interested provider.
+    """
+    if not by_provider:
+        return ()
+    suffixes: Tuple[str, ...] = ()
+    for provider in providers or ():
+        suffixes += by_provider.get(id(provider), ())
+    return suffixes
+
+
+def _is_sibling_increment(name: str, stem: str, extension: str) -> bool:
+    """Is ``name`` another numbered segment of ``stem``+``extension``?"""
+    if not name.endswith(extension):
+        return False
+    parsed = segment_stem(name)
+    return parsed is not None and parsed[0] == stem
+
+
+def segment_role(
+    filename: str,
+    segmented_suffixes: Tuple[str, ...],
+    siblings: Any,
+) -> str:
+    """Which of the assembly rules ``filename`` falls under.
+
+    Args:
+        filename: the BASENAME of a discovered file.
+        segmented_suffixes: the suffixes the providers APPLICABLE TO THIS
+            FILE group. Matched CASE-SENSITIVELY, because a provider must
+            declare the case its own runtime guard accepts: `red` guards
+            on ``file_extension == ".R3D"`` and declares ``".R3D"``, so a
+            lowercase ``x_002.r3d`` — which `red` would decline and the
+            `file` provider would claim as a clip of its own — is
+            ``UNGROUPED`` and keeps being ingested exactly as before.
+            Lowercasing here silently deleted such a card's media.
+        siblings: called with no arguments, at most once, and only for a
+            non-anchor increment. It returns the names in the file's
+            directory — a FILESYSTEM question, not an index one, so a card
+            whose segments span two result pages groups the same way one
+            that fits on a single page does.
+
+    Returns:
+        ``UNGROUPED``/``STANDALONE``/``ANCHOR`` (extract this file),
+        ``EXTRA`` (skip it, the anchor's clip owns it) or ``ORPHAN``
+        (report it, never a clip).
+    """
+    if not any(filename.endswith(suffix) for suffix in segmented_suffixes or ()):
+        return SEGMENT_UNGROUPED
+    parsed = segment_stem(filename)
+    if parsed is None:
+        return SEGMENT_STANDALONE
+    stem, index, extension = parsed
+    if index == SEGMENT_ANCHOR_INDEX:
+        return SEGMENT_ANCHOR
+    names = siblings() or ()
+    if f"{stem}_{SEGMENT_ANCHOR_INDEX}{extension}" in names:
+        return SEGMENT_EXTRA
+    for name in names:
+        if name != filename and _is_sibling_increment(name, stem, extension):
+            # Another increment of the same stem, and no `_001`: a set
+            # that was copied incompletely.
+            return SEGMENT_ORPHAN
+    # Rule 2 (amended 2026-08-28): nothing else of this stem is here, so
+    # the three digits are just how the file is named.
+    return SEGMENT_STANDALONE
 
 
 class ItemAPIEnhanced(ItemAPI):

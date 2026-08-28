@@ -229,9 +229,9 @@ def test_log_lines_are_emitted_in_merge_key_order(
     # order: …01_one, …02_two, …03_zero, …04_boom. That the folder that
     # DIED is last is what makes this order tree-derived rather than
     # completion-derived — it finished first, having done nothing.
-    assert folder_lines[0].startswith(f"found 1 clips in {HIT_ONE},")
-    assert folder_lines[1].startswith(f"found 2 clips in {HIT_TWO},")
-    assert folder_lines[2].startswith(f"found 0 clips in {ZERO},")
+    assert folder_lines[0].startswith(f"found 1 files in {HIT_ONE},")
+    assert folder_lines[1].startswith(f"found 2 files in {HIT_TWO},")
+    assert folder_lines[2].startswith(f"found 0 files in {ZERO},")
     assert folder_lines[3] == (
         f"Error ingesting {BOOM}: index unavailable for this folder"
     )
@@ -260,7 +260,7 @@ def test_a_zero_hit_folders_errors_are_surfaced_and_it_still_counts(
 ):
     run_result, emitted = _run(_context(fake_provider))
 
-    [line] = [line for line in emitted if line.startswith(f"found 0 clips in {ZERO},")]
+    [line] = [line for line in emitted if line.startswith(f"found 0 files in {ZERO},")]
     assert "1 errors encountered" in line
     assert f"Error scanning file {ZERO}/GHOST.fake" in line
     # Per-file errors never fail the FOLDER.
@@ -274,10 +274,10 @@ def test_all_eight_counters_appear_on_every_folder_line(
     _run_result, emitted = _run(_context(fake_provider))
 
     [line] = [
-        line for line in emitted if line.startswith(f"found 2 clips in {HIT_TWO}")
+        line for line in emitted if line.startswith(f"found 2 files in {HIT_TWO}")
     ]
     for fragment in (
-        "found 2 clips",
+        "found 2 files",
         "0 already ingested",
         "2 created",
         "2 ingested",

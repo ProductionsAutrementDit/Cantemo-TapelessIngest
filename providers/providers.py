@@ -39,6 +39,49 @@ class Provider:
         """
         return []
 
+    def getSegmentedExtensions(self):
+        """Suffixes whose files may be SEGMENTS of one clip, not clips.
+
+        A camera that splits a long take into ``X_001.EXT``,
+        ``X_002.EXT`` … ``X_NNN.EXT`` writes N files for ONE clip. The
+        scan groups them at assembly time (``models/clip.py``'s
+        ``segment_role``): the ``_001`` file anchors the clip, its
+        higher-numbered siblings are attached as extra media files by
+        ``getClipAdditionalMediaFiles`` and are never probed as clip
+        candidates of their own, and an increment whose ``_001`` anchor
+        is missing from the directory is a per-file ERROR — an
+        incomplete copy, not a clip.
+
+        Declare the suffix in the EXACT CASE your runtime guard accepts,
+        and never wider. Matching is case-SENSITIVE, deliberately: a
+        declaration that reaches past your guard makes the scan suppress
+        files you will then decline, and whichever provider claims the
+        anchor instead has no way to re-attach them — the segments are
+        simply never ingested. This is the opposite direction from
+        ``getExtensions()``, which must be a SUPERSET of your guard:
+        that one decides who is OFFERED a file, this one decides who is
+        DENIED one.
+
+        A declared suffix suppresses matching files for EVERY provider,
+        not only for you — there is one clip per anchor, not one per
+        interested provider. The scan limits the blast radius by
+        consulting only the providers the extraction pre-filter found
+        APPLICABLE to that filename, so you cannot suppress a file you
+        would never have been offered; within that set, your declaration
+        is binding on all of them.
+
+        This mechanism is for one take's media split into numbered files
+        in ONE place: one ``Clip`` row carrying N files. It is NOT
+        ``Clip.spanned``/``getSpannedClips()``, which exist for a take
+        split across SEVERAL PHYSICAL CARDS (P2, XDCAM) and produce N
+        linked rows with one master. The two are complementary; declaring
+        a segmented extension neither reads nor writes a spanned field.
+
+        An empty declaration (the default) means every file with this
+        provider's extensions stands alone.
+        """
+        return []
+
     def is_extension_guarded(self):
         """Whether ``getExtensions()`` bounds what this provider can claim.
 

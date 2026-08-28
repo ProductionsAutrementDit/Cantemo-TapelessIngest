@@ -227,12 +227,23 @@
                         "must": [
                           {
                             "regexp": {
-                              "parent": "2026/AH_20260101_golden/[A-Z][0-9]{3}_[0-9A-Z]{6}.RDM/[A-Z][0-9]{3}_[A-Z][0-9]{3}_[0-9A-Z]{6}.RDC"
+                              "parent": "2026/AH_20260101_golden/[^/]+\\.[Rr][Dd][MmCc](/[^/]+\\.[Rr][Dd][MmCc])?"
                             }
                           },
                           {
-                            "wildcard": {
-                              "name": "*_001.R3D"
+                            "bool": {
+                              "should": [
+                                {
+                                  "wildcard": {
+                                    "name": "*.R3D"
+                                  }
+                                },
+                                {
+                                  "wildcard": {
+                                    "name": "*.r3d"
+                                  }
+                                }
+                              ]
                             }
                           }
                         ]

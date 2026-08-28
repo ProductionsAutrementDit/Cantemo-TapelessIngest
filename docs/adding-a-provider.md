@@ -35,12 +35,55 @@ Implement, on a subclass of `providers.providers.Provider`:
 | `getSubPaths()` | the ES parent-path filter | the directory shapes you live in |
 | `getFilters(escaped_path)` | raw ES clauses OR'd into the query | optional |
 | `is_extension_guarded()` | the extraction pre-filter | `False` if your guard ignores the extension |
+| `getSegmentedExtensions()` | segment grouping at clip assembly | the EXACT case your guard accepts, never wider |
 | `getMetadatasFromFile(media_file, metadatas, context)` | the merge loop | return metadatas only |
 
 Adding or removing a name in `PROVIDER_NAMES`, or changing any of the
 first three methods, changes the golden search doc
 (`tests/fixtures/golden_search_doc.json`), which is byte-frozen and
-needs human sign-off to re-record.
+needs human sign-off to re-record. `getSegmentedExtensions()` does
+**not**: it is read at clip assembly, never by `build_search_doc`, so
+declaring one changes no query.
+
+## Segment grouping (`getSegmentedExtensions()`)
+
+Only for a camera that splits ONE take into numbered files —
+`X_001.EXT`, `X_002.EXT` … `X_NNN.EXT` — where all of them are one clip.
+`red` is the only shipped provider that declares one.
+
+The scan classifies every discovered file whose suffix you declare,
+before extraction:
+
+* `X_001.EXT` **anchors** the clip and is the only file extracted;
+* `X_002…X_NNN` are **extras**: skipped entirely at scan (no provider
+  call, not counted `processed`), and re-attached to the item at ingest
+  by your `getClipAdditionalMediaFiles`;
+* an increment with no `_001` **and another increment of the same stem
+  beside it** is an incomplete copy: reported once per directory, never a
+  clip;
+* an increment with nothing else of its stem beside it — a lone
+  `SHOT_042.EXT` — is an ordinary filename and becomes its own clip.
+
+Two rules, both of which have already cost media:
+
+1. **Declare the case your guard accepts, and nothing wider.** Matching
+   is case-sensitive. `red` guards on `file_extension == ".R3D"` and
+   declares `".R3D"`; declaring `".r3d"` would make the scan suppress
+   `x_002.r3d`, a file `red` then declines — and the provider that does
+   claim the anchor has no way to put the siblings back. This is the
+   OPPOSITE direction from `getExtensions()`, which must be a superset:
+   that one decides who is *offered* a file, this one decides who is
+   *denied* one.
+2. **If you declare a segmented extension you owe a
+   `getClipAdditionalMediaFiles`,** and it must select exactly the files
+   the scan dropped. Derive it from the anchor's ON-DISK filename, not
+   from a name your extractor read out of the media — for renamed rushes
+   the two diverge and the clip is imported with only its first segment.
+
+This is not `Clip.spanned`/`getSpannedClips()`. Those are for a take
+split across several PHYSICAL CARDS (P2, XDCAM) and produce N linked rows
+with one master; segments are one take's media split into files in one
+place, which is one row with N files.
 
 ## The superset rule
 
@@ -60,6 +103,11 @@ Two escapes, both already used:
   `["_001.r3d", ".r3d"]`. The broad form is inert for discovery
   (`providers/file.py` already declares `.r3d` and the query dedupes
   through `set()`) and it makes the declaration a superset of the guard.
+  The narrow `"_001.r3d"` form is now inert too: since the segment story
+  nothing selects the anchor in the query — `getFilters()` returns every
+  `.R3D` and grouping picks the anchor at assembly — so it is kept only
+  because NARROWING a declaration is the direction that silently changes
+  which provider claims a file.
 * **Declare yourself non-extension-guarded.** The card providers
   (`xdcam`, `panasonicP2`, `ikegami`) guard purely on sidecar presence —
   `{clip}M01.XML`, `../CLIP/{name}.XML`, `../CLIPINF/CLIP{name}.XML` —

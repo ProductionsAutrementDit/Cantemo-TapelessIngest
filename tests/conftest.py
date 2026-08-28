@@ -117,6 +117,12 @@ class FakeProvider:
     def getExtensions(self):
         return [".fake"]
 
+    def getSegmentedExtensions(self):
+        # No grouping by default — a `.fake` file is a clip of its own.
+        # Tests that need red's multi-segment shape monkeypatch this on
+        # the instance, the way they already do for getSubPaths/getFilters.
+        return []
+
     def getSubPaths(self):
         return []
 

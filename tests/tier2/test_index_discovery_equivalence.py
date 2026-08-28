@@ -38,6 +38,7 @@ from django.contrib.auth.models import User
 from portal.plugins.TapelessIngest.helpers import TapelessIngestException
 from portal.plugins.TapelessIngest.models.clip import Clip, ClipMetadata
 from portal.plugins.TapelessIngest.models.folder import Folder, process_folder
+from portal.plugins.TapelessIngest.providers.red import CARD_SUBPATH_REGEXP
 from portal.plugins.TapelessIngest.scan.adapters import build_context
 from portal.plugins.TapelessIngest.scan.context import DISCOVERY_INDEX
 from portal.plugins.TapelessIngest.scan.discovery import DiscoveryIndex, prefetch_index
@@ -72,8 +73,11 @@ FILES = [
     f"{CARD}/{SUBPATH}/CLIPD.fake",
     f"{DEEP}/sub/CLIPE.fake",
     f"{RED_CLIP_DIR}/A001_001.fake",
-    # Same card, NOT the first frame file: red's wildcard excludes it, so
-    # a mode that ignored the `wildcard` half would find six clips here.
+    # Same card, NOT the first segment. Since the card story it is a HIT
+    # on both paths — the raw filter stopped selecting the anchor — and
+    # is dropped at ASSEMBLY, as the anchor's extra file. A mode that
+    # disagreed with the other about the raw filter would report a
+    # different hit count here.
     f"{RED_CLIP_DIR}/A001_002.fake",
     # Indexed, in a matching parent, and NOT a media file: only the
     # extension clause excludes it. Without it in the fixture, a router
@@ -82,9 +86,12 @@ FILES = [
     f"{ONE}/NOTES.txt",
 ]
 
-# One clip per file, less the second RED frame file (excluded by red's
-# name wildcard) and the text file (excluded by the extension clause).
-EXPECTED_CLIPS = len(FILES) - 2
+# Every file but the text one (excluded by the extension clause) is
+# DISCOVERED — the second RED segment included.
+EXPECTED_HITS = len(FILES) - 1
+# ...and one fewer becomes a clip: the second segment is the first one's
+# extra file, which is the assembly rules' job, not the query's.
+EXPECTED_CLIPS = EXPECTED_HITS - 1
 
 
 def _source(path):
@@ -193,9 +200,15 @@ def _red_filters(escaped_path):
     """`red.getFilters()`'s exact shape, over the fixture's extension.
 
     The structure is red's verbatim — `bool.must` of a `regexp` on
-    `parent` joined to the escaped folder plus a `wildcard` on `name`.
-    Only the suffix differs (`.fake` instead of `.R3D`), so the fixture's
-    provider double can actually extract the clips it finds.
+    `parent` joined to the escaped folder plus a `wildcard` on `name` —
+    and the card pattern is IMPORTED from the provider rather than
+    copied, so narrowing it reddens the equivalence too. Only the suffix
+    differs (`.fake` instead of `.R3D`), so the fixture's provider double
+    can actually extract the clips it finds.
+
+    Note the `name` wildcard no longer selects the `_001` anchor: since
+    the card story that is an assembly concern, and the query returns
+    every segment.
     """
     return [
         {
@@ -203,14 +216,10 @@ def _red_filters(escaped_path):
                 "must": [
                     {
                         "regexp": {
-                            "parent": os.path.join(
-                                escaped_path,
-                                "[A-Z][0-9]{3}_[0-9A-Z]{6}.RDM/"
-                                "[A-Z][0-9]{3}_[A-Z][0-9]{3}_[0-9A-Z]{6}.RDC",
-                            )
+                            "parent": os.path.join(escaped_path, CARD_SUBPATH_REGEXP)
                         }
                     },
-                    {"wildcard": {"name": "*_001.fake"}},
+                    {"wildcard": {"name": "*.fake"}},
                 ]
             }
         },
@@ -228,9 +237,14 @@ def card_provider(fake_provider, monkeypatch):
     about discovery. `getFilters()` is the half no earlier test reached:
     `red` is the only shipped provider that has one, and its evaluator is
     the largest speculative piece of `scan/discovery.py`.
+
+    `getSegmentedExtensions()` joins them for the same reason: since the
+    card story it is what drops `A001_002.fake`, and it must drop it
+    identically on both paths.
     """
     monkeypatch.setattr(fake_provider, "getSubPaths", lambda: [SUBPATH])
     monkeypatch.setattr(fake_provider, "getFilters", _red_filters)
+    monkeypatch.setattr(fake_provider, "getSegmentedExtensions", lambda: [".fake"])
     return fake_provider
 
 
@@ -322,7 +336,8 @@ def test_the_two_paths_agree_on_counters_errors_and_emitted_lines(
     assert _timing_free(index_lines) == _timing_free(legacy_lines)
     # ...and the run really did find the tree, so this is not two empty
     # runs agreeing.
-    assert legacy_result.counters.hits == EXPECTED_CLIPS
+    assert legacy_result.counters.hits == EXPECTED_HITS
+    assert legacy_result.counters.created == EXPECTED_CLIPS
 
 
 def test_the_raw_filter_half_agrees_with_the_legacy_query(
@@ -331,18 +346,23 @@ def test_the_raw_filter_half_agrees_with_the_legacy_query(
     """C3: the RED card, found through `getFilters()` on both paths.
 
     Its files sit in no `getSubPaths()` bucket, so ONLY the raw filter
-    can reach them — and the wildcard half must exclude `A001_002.fake`.
-    A mode that ignored the filter finds 0 clips here; one that ignored
-    the wildcard finds 2.
+    can reach them — and both segments must be DISCOVERED, which is what
+    changed with the card story: the raw filter stopped selecting the
+    anchor, so `A001_002.fake` is a hit on both paths and is dropped at
+    assembly instead. A mode that ignored the filter finds 0 files here;
+    one that still narrowed it to `*_001` finds 1.
     """
     legacy_result, legacy_lines = _run(_context(card_provider))
     index_result, index_lines = _run(_context(card_provider, discovery=DISCOVERY_INDEX))
 
     def red_line(lines):
-        return [line for line in lines if f" clips in {RED}," in line]
+        return [line for line in lines if f" files in {RED}," in line]
 
     assert red_line(legacy_lines) == red_line(index_lines)
-    assert red_line(index_lines)[0].startswith(f"found 1 clips in {RED},")
+    # "clips" in that line is the HIT count (a legacy misnomer the
+    # summary keeps): both segments are found, and one clip is created.
+    assert red_line(index_lines)[0].startswith(f"found 2 files in {RED},")
+    assert ", 1 created," in red_line(index_lines)[0]
     assert _counters(index_result) == _counters(legacy_result)
 
 
@@ -480,8 +500,8 @@ def test_a_consumed_subdir_is_never_scanned_as_a_folder_of_its_own(
         _context(card_provider, discovery=DISCOVERY_INDEX)
     )
 
-    card_lines = [line for line in index_lines if f" clips in {CARD}," in line]
-    assert card_lines[0].startswith(f"found 1 clips in {CARD},")
+    card_lines = [line for line in index_lines if f" files in {CARD}," in line]
+    assert card_lines[0].startswith(f"found 1 files in {CARD},")
     # The sub-path folder never reports at all: it was never visited.
     assert not any(f"{CARD}/{SUBPATH}" in line for line in index_lines)
     # Same for the RED card's internals, consumed by its own clip.
@@ -500,8 +520,8 @@ def test_an_ordinary_child_folder_is_still_the_walks_to_visit(
         _context(card_provider, discovery=DISCOVERY_INDEX)
     )
 
-    assert any(line.startswith(f"found 1 clips in {DEEP}/sub,") for line in index_lines)
-    assert not any(line.startswith(f"found 1 clips in {DEEP},") for line in index_lines)
+    assert any(line.startswith(f"found 1 files in {DEEP}/sub,") for line in index_lines)
+    assert not any(line.startswith(f"found 1 files in {DEEP},") for line in index_lines)
 
 
 # --------------------------------------------------------------------------
@@ -668,7 +688,7 @@ def test_a_prefetch_failure_kills_the_run_with_the_scan_root_named(
 def test_a_dry_run_under_index_writes_nothing(migrated_db, tree, card_provider):
     run_result, _lines = _run(_context(card_provider, discovery=DISCOVERY_INDEX))
 
-    assert run_result.counters.hits == EXPECTED_CLIPS
+    assert run_result.counters.hits == EXPECTED_HITS
     assert Clip.objects.count() == 0
     assert ClipMetadata.objects.count() == 0
     assert Folder.objects.count() == 0

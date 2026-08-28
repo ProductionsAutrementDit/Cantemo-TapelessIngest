@@ -25,7 +25,15 @@ from portal.vidispine.icollection import CollectionHelper
 from portal.vidispine.iexception import NotFoundError
 
 
-from portal.plugins.TapelessIngest.models.clip import Clip
+from portal.plugins.TapelessIngest.models.clip import (
+    Clip,
+    SEGMENT_ANCHOR_INDEX,
+    SEGMENT_EXTRA,
+    SEGMENT_ORPHAN,
+    segment_role,
+    segment_suffixes_for,
+    segmented_extensions_by_provider,
+)
 from portal.plugins.TapelessIngest.helpers import (
     TapelessIngestHelper,
     TapelessIngestException,
@@ -268,7 +276,10 @@ def _folder_worker(folder, ctx, *, first, number, cursor, count_only, ingest):
             error_string = "\n".join(errors)
             error_message += f": {error_string}"
         log_lines = (
-            f"found {counters.hits} clips in {folder.path}, "
+            # "files", not "clips": this is the DISCOVERY count, and
+            # since segment grouping a 30-segment card is 30 files and
+            # one clip. `created` two fields along is the clip count.
+            f"found {counters.hits} files in {folder.path}, "
             f"{counters.already_ingested} already ingested, "
             f"{counters.created} created, providers are {folder.provider_names}, "
             f"{counters.ingested} ingested, {counters.skipped} skipped, "
@@ -295,6 +306,19 @@ def _folder_worker(folder, ctx, *, first, number, cursor, count_only, ingest):
         # drops it as soon as it has expanded them.
         listings=response.get("_listings"),
     )
+
+
+def _summarize_names(names, limit=5):
+    """A stable, bounded rendering of a filename set for one log line.
+
+    Bounded because an incompletely copied 300-segment card would
+    otherwise put 300 names into a cron line and into `errors`.
+    """
+    ordered = sorted(names)
+    shown = ", ".join(ordered[:limit])
+    if len(ordered) > limit:
+        shown += f", +{len(ordered) - limit} more"
+    return shown
 
 
 def _failed_folder_outcome(path, message):
@@ -994,6 +1018,18 @@ class Folder(models.Model):
                 "scan_context": scan_context,
                 "listings": listings,
             }
+            # `{id(provider): suffixes}` for the providers that group a
+            # take's files into ONE clip (`red`'s `.R3D`). Built once per
+            # invocation; consulted per file against that file's own
+            # applicable providers, so a suffix only ever suppresses a
+            # file the DECLARING provider would actually be offered.
+            segmented_by_provider = segmented_extensions_by_provider(provider_list)
+            # directory -> the extra segments skipped there, and the
+            # incomplete sets found there. Both are reported ONCE per
+            # directory after the page loop (see below): a 30-segment card
+            # missing its anchor is one data condition, not 30 failures.
+            skipped_extras = {}
+            orphan_segments = {}
             # The write unit's input, accumulated across every page of
             # this invocation and persisted ONCE after the loop (AD-6).
             candidates = []
@@ -1091,6 +1127,61 @@ class Folder(models.Model):
                                 file_providers = applicable_providers(
                                     file.getFileName(), extension_map
                                 )
+                            # Segment grouping, BEFORE extraction (the
+                            # assembly rules live in models/clip.py). A
+                            # multi-file take reaches discovery as N
+                            # files and is ONE clip: only the `_001`
+                            # anchor is extracted, its siblings cost
+                            # nothing here and are re-attached at ingest
+                            # by the provider's
+                            # getClipAdditionalMediaFiles.
+                            #
+                            # The suffixes are this FILE's applicable
+                            # providers' own, not the whole registry's:
+                            # a provider must not suppress a file it
+                            # would never be offered.
+                            #
+                            # Timed as EXTRACTION, not verification:
+                            # this is clip assembly, and the directory
+                            # listing it reads was already paid for by
+                            # the DC-2 guard above.
+                            file_suffixes = segment_suffixes_for(
+                                file_providers, segmented_by_provider
+                            )
+                            file_directory = os.path.dirname(file.getPath())
+                            if file_suffixes:
+                                with timer("extraction"):
+                                    role = segment_role(
+                                        file.getFileName(),
+                                        file_suffixes,
+                                        lambda: listings.get(
+                                            os.path.dirname(file_absolute_path)
+                                        ).names,
+                                    )
+                            else:
+                                role = None
+                            if role == SEGMENT_EXTRA:
+                                # Not a hit this folder failed to claim:
+                                # it IS claimed, by the anchor's clip.
+                                # Deliberately before `processed` — the
+                                # canonical card reported one processed
+                                # file per clip before the query stopped
+                                # selecting the anchor, and still does.
+                                skipped_extras.setdefault(file_directory, []).append(
+                                    file.getFileName()
+                                )
+                                continue
+                            if role == SEGMENT_ORPHAN:
+                                # Reported once per directory after the
+                                # loop, at a level that matches "expected
+                                # data condition" — 30 tracebacks for one
+                                # incompletely copied card read as 30 scan
+                                # failures and inflate the error count
+                                # `unclaimed_hits_doubt` weighs.
+                                orphan_segments.setdefault(file_directory, []).append(
+                                    file.getFileName()
+                                )
+                                continue
                             # `matched` is an out-parameter: every provider
                             # that CONTRIBUTED to this file, not just the
                             # last one to write `metadatas["provider"]`.
@@ -1212,6 +1303,57 @@ class Folder(models.Model):
                             )
                     self.provider_names = ",".join(matched_provider_names)
                     self.scanned_on = timezone.now()
+            # Segment grouping's two reports, ONE per directory rather
+            # than one per file, and only now that every page has been
+            # seen (a card's anchor can arrive on a later page than its
+            # segments).
+            #
+            # (1) Incomplete sets. An expected data condition — somebody
+            # copied part of a card — so it is a WARNING without a
+            # traceback, not an ERROR that reads as a scan failure. It is
+            # still an `errors` entry, because the operator has to know
+            # the media was not ingested and because a folder whose media
+            # is ALL orphans must reach `unclaimed_hits_doubt` with a
+            # non-zero error count and refuse descent.
+            for directory, names in sorted(orphan_segments.items()):
+                log.warning(
+                    "%s: %d segment(s) with no %s anchor (%s) — not ingested",
+                    directory,
+                    len(names),
+                    SEGMENT_ANCHOR_INDEX,
+                    _summarize_names(names),
+                )
+                response["errors"].append(
+                    f"Incomplete segment set in {directory}: {len(names)} "
+                    f"segment(s) with no _{SEGMENT_ANCHOR_INDEX} anchor "
+                    f"({_summarize_names(names)}) — not ingested"
+                )
+            # (2) Extras whose clip never appeared. Grouping resolves the
+            # anchor on the FILESYSTEM but drops the extras from the
+            # INDEX's hit set, so an index/filesystem desync (DC-2) in
+            # which the anchor is on disk and absent from the hits would
+            # otherwise skip every segment as an extra, assemble no clip,
+            # record no error — and let the walk descend into a card whose
+            # media had silently vanished. Recording it is what keeps
+            # `unclaimed_hits_doubt` reachable.
+            # Only a COMPLETE pass may ask this. A PAGED caller sees one
+            # page of an unknown number, so a card's anchor legitimately
+            # sits on another page and every extra on this one would look
+            # unclaimed — the same reason `consumed_subdirs` stays DOUBT
+            # in paged mode.
+            claimed_directories = {clip.path for clip in response["clips"] if clip.path}
+            for directory, names in sorted(
+                skipped_extras.items() if may_be_complete else ()
+            ):
+                if directory in claimed_directories:
+                    continue
+                response["errors"].append(
+                    f"{len(names)} segment(s) in {directory} "
+                    f"({_summarize_names(names)}) were grouped onto a clip this "
+                    f"folder never assembled: their anchor is on disk but was "
+                    f"not among the files discovery returned, so the clip was "
+                    f"not scanned"
+                )
             # The listings cache is handed back to the coordinator so the
             # walk can reuse it for subdirectory discovery instead of
             # scanning this directory a second time (and reporting the same

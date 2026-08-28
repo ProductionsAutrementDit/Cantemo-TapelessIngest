@@ -47,6 +47,30 @@ def getFilters(self, escaped_path):
         list: Elasticsearch query filters
     """
     return []
+
+def getSegmentedExtensions(self):
+    """
+    Returns suffixes whose files are SEGMENTS of one clip, not clips.
+
+    For a camera that splits one take into `X_001.EXT`, `X_002.EXT` …
+    `X_NNN.EXT`: the `_001` file anchors the clip, its siblings are
+    skipped at scan and re-attached at ingest by
+    getClipAdditionalMediaFiles, and an increment with no `_001` and
+    other increments beside it is reported as an incomplete copy.
+
+    Declare the EXACT case your runtime guard accepts and nothing wider:
+    matching is case-sensitive, and a declaration reaching past your
+    guard suppresses files you then decline — which loses their media,
+    because whichever provider claims the anchor cannot re-attach them.
+
+    Unlike the three methods above, this one does NOT feed
+    build_search_doc, so declaring a suffix leaves the byte-frozen
+    golden search doc untouched.
+
+    Returns:
+        list: Suffixes (e.g. ['.R3D']); empty means nothing is grouped
+    """
+    return []
 ```
 
 #### Metadata Methods
@@ -663,6 +687,10 @@ def getMetadatasFromFile(self, file, metadatas, context):
 ### Provider Not Detecting Files
 1. Check `getExtensions()` returns correct extensions
 2. Verify `getSubPaths()` matches folder structure
+2b. If the format splits a take into numbered files, check
+   `getSegmentedExtensions()` declares the suffix in the case your guard
+   accepts, and that `getClipAdditionalMediaFiles()` selects exactly the
+   siblings the scan drops
 3. Test Elasticsearch filters with sample data
 
 ### Metadata Not Extracted

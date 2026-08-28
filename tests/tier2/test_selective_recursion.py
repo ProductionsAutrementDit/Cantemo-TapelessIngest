@@ -260,7 +260,7 @@ def test_independent_subtrees_are_scanned_and_nothing_is_ingested_twice(
     nofiles_lines = [
         message
         for message in logger.messages
-        if message.startswith(f"found 0 clips in {shoot}/NOFILES,")
+        if message.startswith(f"found 0 files in {shoot}/NOFILES,")
     ]
     assert len(nofiles_lines) == 1
     assert "1 errors encountered" in nofiles_lines[0]
@@ -344,5 +344,5 @@ def test_doubt_in_the_response_forbids_descent(
     assert re.escape(f"{shoot}/INTERVIEWS") not in queried
     assert count == 1
 
-    [line] = [m for m in logger.messages if m.startswith(f"found 1 clips in {shoot},")]
+    [line] = [m for m in logger.messages if m.startswith(f"found 1 files in {shoot},")]
     assert f"Cannot compute consumed subdirs for {shoot}: 'A)B/C'" in line

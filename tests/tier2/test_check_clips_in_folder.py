@@ -187,7 +187,7 @@ def test_the_folder_line_reports_all_eight_counters(
     [line] = [
         message
         for message in module.logger.messages
-        if message.startswith(f"found 2 clips in {SHOOT},")
+        if message.startswith(f"found 2 files in {SHOOT},")
     ]
     for fragment in (
         "0 already ingested",
