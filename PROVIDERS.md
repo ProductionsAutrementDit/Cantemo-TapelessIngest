@@ -190,6 +190,68 @@ def getSpannedClips(self, clip):
     return False
 ```
 
+#### The main file's own video component
+
+`getClipMainMediaFile` may declare whether Vidispine's shape deduction
+will extract a **video component** from the main file itself. The
+multi-component import declares up front how many components the
+placeholder shape must expect, and Vidispine promotes the shape only
+once every declared slot is filled — so a slot declared for essence the
+anchor never yields leaves the item holding all its media on a
+placeholder for ever: no `original` tag, no transcode, and no error
+anywhere.
+
+```python
+from portal.plugins.TapelessIngest.providers.providers import (
+    MAIN_FILE_YIELDS_VIDEO,
+)
+
+def getClipMainMediaFile(self, clip):
+    return {
+        "type": "video",
+        "track": 1,
+        "order": 0,
+        "file_id": clip.file.getId(),
+        "path": clip.file.getPath(),
+        # Optional. Absent means True. None means "I could not tell",
+        # and a multi-component import is REFUSED on it.
+        MAIN_FILE_YIELDS_VIDEO: True,
+    }
+```
+
+- **Absent, or a non-mapping, reads as `True`.** That is backward
+  compatibility — it is what every provider declared implicitly before
+  the key existed — and not a claim that `True` is the safe answer.
+- **An explicit `None` means "I could not tell", and is not a
+  declaration.** `yields_video_component` still folds it into `True`
+  for callers that only need a count, but the multi-component import
+  reads the raw value (`main_file_verdict_is_unknown`) and **refuses to
+  declare a budget on it**: the clip is reported failed, naming the
+  main file, before anything is imported. A budget is a claim; a claim
+  without evidence is one of the two errors below, and a guess cannot
+  know which. The single-component path never reads the key. (Ruled
+  2026-09-02.)
+- **The two errors are not symmetric.** Over-declaring (counting a video
+  slot the main file never fills) is **silent**: the shape stays a
+  placeholder for ever. Under-declaring is **loud**: Vidispine refuses
+  the main file with `400 {"invalidInput": {"explanation": "No more
+  components of that type is accepted", "value": "VIDEO_COMPONENT"}}`
+  and the clip is reported failed.
+- **Only answer `False` when you can actually tell.** A source Vidispine
+  cannot decode yields a *binary* component, which satisfies the
+  container slot and no video slot. `red` derives the answer from
+  REDline's `Abs TC` (`Provider.anchor_yields_video_component`): a
+  whole-field dot-separated timecode means no video component, a
+  colon-separated one means a video component, and anything it does not
+  recognise answers `None` with a warning — so a RED clip with an
+  unreadable `Abs TC` and span files is refused rather than guessed at.
+- The key is read by `providers.providers.yields_video_component` (a
+  count: `None` and an absent key both read `True` there) and by
+  `providers.providers.main_file_verdict_is_unknown` (the refusal: an
+  explicit `None` is the only value it answers `True` for, and
+  `_import_multi_component` refuses to declare a budget on it);
+  `models/clip.py` never learns what a codec or a timecode is.
+
 #### Import Configuration
 
 ```python

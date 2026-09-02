@@ -63,6 +63,26 @@ Flags, defaults, output, and failure modes are identical to the old scripts
 `--discovery`/`--discovery-page-size`). Check with
 `/opt/cantemo/python/bin/python /opt/cantemo/portal/manage.py scan_tapeless_dir --help`.
 
+### Multi-component clips make a scan WAIT (story red-multi-component)
+
+A clip whose media is several files (RED span files, a P2 audio track) now
+imports its extra components, **waits for them to attach**, and imports the
+main file last — the main file's job is the only thing that evaluates the
+placeholder, and nothing re-evaluates one afterwards. In the normal case
+that is seconds. Against a wedged Vidispine it is **up to 300 s per clip**
+on the scan path, and a run has no aggregate bound: budget wall-clock time
+accordingly, and treat a run reporting "component job(s) were still
+running" as a Vidispine queue problem rather than a plugin one.
+
+Such a clip is counted `failed`, its reason appears in the run's errors
+(capped at 10 per folder, then a count), and the item is left **resumable**
+— the next run imports only what is missing. The one state needing hands
+is reported as "STILL a placeholder"; see USER_GUIDE.md's Troubleshooting.
+
+The REST endpoints get a much shorter bound (30 s per clip) and a 60 s
+budget shared by all of one call's waits, because they hold a request
+thread and its database connection.
+
 ### Parallel scanning (`--workers`, story 3.1)
 
 The tree walk processes folders on a worker pool. `--workers N` sets the

@@ -138,13 +138,13 @@ class ClipSerializer(serializers.ModelSerializer):
             ):
                 # Except not finding the object or the data being ambiguous
                 # for defining it. Then validate the data as usual
-                return super().is_valid(raise_exception)
+                return super().is_valid(raise_exception=raise_exception)
             else:
                 # If the object is found add it to the serializer. Then
                 # validate the data as usual
                 self.instance = obj
-                return super().is_valid(raise_exception)
+                return super().is_valid(raise_exception=raise_exception)
         else:
             # If the Serializer was instantiated with just an object, and no
             # data={something} proceed as usual
-            return super().is_valid(raise_exception)
+            return super().is_valid(raise_exception=raise_exception)

@@ -733,3 +733,43 @@ def test_a_real_pool_workers_error_record_names_its_folder(
     assert record.getMessage().endswith(f" [folder: {ZERO}]")
     # A pool worker's record, not a main-thread re-report.
     assert record.threadName.startswith("tapeless-scan")
+
+
+def test_a_pooled_run_registers_one_distinct_import_job_per_clip(
+    migrated_db, tree, fake_provider, es_fake, django_user, monkeypatch
+):
+    """The stub's default import response used to be the ONE constant
+    `{"jobId": "VX-JOB-DEFAULT"}`, and every import registers a job
+    under its id: two pool workers importing single-component clips with
+    no queued response both registered under the same key, so worker
+    B's entry overwrote worker A's before A settled it — A's settle
+    landed B's file, B's settle found the job already settled, and A's
+    placeholder never promoted. Sequentially the overwrite is harmless,
+    which is why only a pooled run could see it.
+
+    Mutation killed (deterministically): minting the constant id again —
+    `component_jobs` then holds ONE entry for three ingested clips. The
+    lost-promotion half is a race and is asserted here too, but it is
+    the id count that cannot pass by luck.
+    """
+    monkeypatch.setattr(
+        Folder, "getCollection", lambda self, user, dryrun=False: "VX-COLLECTION"
+    )
+
+    run_result, _emitted = _run(
+        _context(fake_provider, dry_run=False, user=django_user, workers=4)
+    )
+
+    counters = run_result.counters
+    assert counters.failed == 0
+    assert counters.ingested == 3
+    job_ids = list(VidispineFake.component_jobs)
+    assert len(job_ids) == counters.ingested
+    assert len(set(job_ids)) == len(job_ids)
+    assert all(job_id.startswith("VX-JOB-DEFAULT-") for job_id in job_ids)
+    # ...and every clip's row carries its own job, distinct from the others.
+    row_job_ids = list(Clip.objects.values_list("job_id", flat=True))
+    assert sorted(row_job_ids) == sorted(job_ids)
+    # Every shape promoted: each settle landed ITS OWN file.
+    for item_id in Clip.objects.values_list("item_id", flat=True):
+        assert VidispineFake.placeholder_shape(item_id) is None, item_id

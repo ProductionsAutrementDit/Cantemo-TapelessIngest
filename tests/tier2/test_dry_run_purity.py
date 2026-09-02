@@ -444,7 +444,7 @@ def test_dry_run_counters_match_real_run(
     # be an agreement between two rehearsals.
     assert "importFileToPlaceholder" in VidispineFake.call_names()
     assert collection_seam == [rel]
-    assert Clip.objects.get(pk=f"{rel}/CLIPNEW").job_id == "VX-JOB-DEFAULT"
+    assert Clip.objects.get(pk=f"{rel}/CLIPNEW").job_id.startswith("VX-JOB-DEFAULT-")
 
 
 def test_a_would_be_replacement_surfaces_as_ingested_never_replaced(

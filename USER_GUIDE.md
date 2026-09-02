@@ -322,13 +322,106 @@ A001_C001_003.R3D  <- Spanned segment
 - Custom formats with external audio
 
 **How It Works**:
-1. Provider identifies main video file
-2. Provider identifies additional audio files
-3. Import creates shape with:
-   - 1 video component
-   - N audio components
+1. Provider identifies the main media file and the additional ones
+2. The ingest DECLARES up front how many components the shape must
+   expect, and Vidispine promotes it only once every declared slot is
+   filled:
+   - 1 container component (the main file always fills this)
+   - N components of each extra file's own type (audio or video)
+   - plus 1 video component for the main file itself — **only when the
+     provider says Vidispine can decode it**, see "Sources Vidispine
+     cannot decode" below
+3. The extra components are imported, then the main file LAST
+
+A slot declared for essence that never arrives leaves the item holding
+all its media on a shape that is never promoted, never tagged `original`
+and never transcoded — with no error anywhere. That is why the count is
+a branch and not a constant.
 
 **Result**: Proper multi-track audio in Vidispine
+
+**The import WAITS for the extra components.**
+A multi-component import declares up front how many components the shape
+must expect, imports every extra component, and imports the main file
+LAST. The main file's job is the only thing that evaluates the
+placeholder, creates the shape and starts the transcode — and nothing
+re-evaluates a placeholder afterwards. So the ingest now blocks until
+every extra component has actually attached its file before the main
+file is imported. In the normal case that is a matter of seconds: the
+files are already on the storage and already hashed.
+
+**What a wedged Vidispine costs**, and it is not the same on both entry
+points:
+
+| Entry point | Per clip | All the waits of one call | Why |
+|-------------|----------|---------------------------|-----|
+| Scan (cron / command line) | 300 s | unbounded | Nothing is waiting on the run; it can afford to sit on a clip. |
+| REST (`/tapelessingest/api/...`) | 30 s | 60 s | The call holds a request thread and its database connection for the whole wait. |
+
+The REST column has two numbers because a REST call does not ingest one
+clip: both ingest endpoints run many. All of one call's component waits
+share a 60 s **component-wait budget**, and every per-clip bound is
+clamped against what is left of it — so a 50-clip folder cannot cost
+50 x 30 s on a held request thread. The first clips may spend the full
+per-clip bound; the ones after them get whatever remains, and the ones
+past the budget do not wait at all.
+
+It bounds the **waiting**, not the request. A REST ingest also scans the
+folder, extracts metadata and resolves collections, and none of that is
+inside the 60 s — the call can take longer than a minute, it just cannot
+spend longer than a minute waiting for components. The budget starts
+when the ingest does, after the scan, so a large healthy folder cannot
+spend it in discovery and leave every clip a 0 s wait.
+
+The cron has no such budget: it holds nothing anyone is waiting on. Note
+that this also means a cron run has no aggregate bound — 300 s per clip
+against a wedged Vidispine is 300 s x the number of multi-component
+clips, and the error cap keeps the report short without making the run
+short. Watch the wall-clock time of a run whose report says components
+never landed.
+
+If the bound expires, the main file is **NOT** imported and the clip is
+counted `failed` with the reason in the run's error list (and therefore
+in the run summary's error count, not only in `portal.log`). Importing
+the main file anyway would leave the item holding all its media on a
+shape that is never promoted, never tagged `original` and never
+transcoded — which is the failure this bound exists to prevent.
+
+Only the first 10 such reasons per folder are listed, followed by a
+count of the rest: a wedged Vidispine fails every clip of a card the
+same way, and 200 identical lines would bury the rest of the report.
+Every one of them is still in `portal.log`.
+
+**A failed multi-component import leaves a RESUMABLE item.** Whatever
+components did attach stay attached, and the next run imports only what
+is missing and then the main file. It also accounts for the components
+whose import job is **still running** from the failed run: those files
+are not on the shape yet, but re-importing them would attach the same
+media twice and Vidispine refuses the duplicate, so the next run waits
+for the running job instead of starting a rival. A clip can therefore
+need one more run than you expect — one to let the stuck job finish, one
+to finish the import — and each of them reports why.
+
+Two states are not resumed:
+
+- **the placeholder already holds *every* file of the clip and is still
+  a placeholder.** Vidispine is waiting on a component slot nothing will
+  fill; no re-run can change that, and the shape has to be removed by
+  hand in the Vidispine admin. Reported by name, with the files it
+  holds. (`--replace` does *not* help here: its shape query only sees
+  non-placeholder shapes, so a stuck item exposes no shape to remove.)
+- **the placeholder holds a file that is not this clip's.** That is not
+  a partly finished import of this clip at all, so nothing is imported
+  into it. The report names the foreign file ids; check which item they
+  belong to before re-running.
+
+**Sources Vidispine cannot decode.** Some media yields no video essence
+to Vidispine's shape deduction — every `.R3D` whose start timecode
+carries the drop-frame flag, for instance. Those produce a *binary*
+component, which satisfies the container slot and no video slot, so the
+declared component count leaves the video slot out for them. The
+provider decides this (`red` reads it from REDline's `Abs TC`); every
+other provider keeps counting its main file as a video contributor.
 
 ### Dry Run Mode
 
@@ -401,6 +494,67 @@ POST /tapelessingest/api/folder/{folder_id}/ingest/
 3. Review Vidispine job logs
 4. Check storage methods (browse enabled)
 5. Review Portal error logs
+
+### Issue: A clip is `failed` and its media is already on the item
+
+**Symptoms**: the run reports the clip `failed` with a reason mentioning
+components, the item exists, and some or all of its files are attached
+to a shape that is still a placeholder (no `original` tag, no proxy).
+
+This is the multi-component import stopping deliberately rather than
+finishing a shape nothing could promote. Read the reason in the run's
+error list — it says which of the three states you are in:
+
+1. **"extra component job(s) were still running after Ns"** — the wait
+   expired. Nothing is wrong with the item: the components that landed
+   stay attached and **the next run finishes it**. If it recurs, the
+   Vidispine job queue is the thing to look at, not the plugin.
+2. **"is still being imported by job VX-…"** — a previous run's import
+   is still in flight. Again nothing to do: let that job finish and
+   re-run. A clip can legitimately need one extra run for this.
+3. **"STILL a placeholder"** / **"the shape is still a placeholder"** —
+   the dead end, and the only one needing hands. Every slot Vidispine
+   was told to expect can no longer be filled, or the anchor has already
+   been imported — by this run's wait catching an earlier run's anchor
+   job, or by an earlier run outright — and nothing re-evaluates a
+   placeholder afterwards. The clip is reported `failed` on every run
+   until someone acts, deliberately: it is never counted ingested on
+   the strength of a landed anchor alone. No re-run can fix it:
+   **remove the shape by hand in the Vidispine admin**, then re-scan.
+   `--replace` does *not* help — its shape query only sees
+   non-placeholder shapes, so a stuck item exposes nothing to remove.
+
+A fourth message, **"holds N file(s) that are not this clip's"**, means
+the item is not the one this clip belongs to. Find out which item those
+file ids belong to before re-running anything.
+
+A fifth message, **"the placeholder shape could not be read"**, means the
+run could not tell whether the components attached at all: the shape
+query itself did not answer. The main file is deliberately **not**
+imported on an unknown state — closing a component set blind is how an
+unpromotable placeholder gets made — so nothing has been damaged and the
+next run resumes the clip. This one points at Vidispine's availability,
+not at the item: if it recurs for every clip, check that Vidispine is
+answering `GET /API/item/{id}/shape` at all before looking at the job
+queue. Do **not** read it as "the components never attached" — that is a
+different message, and this run never observed it.
+
+A sixth message, **"the provider could not tell whether the anchor …
+contributes a video component"**, means the provider declared that it
+could not answer the question the component budget depends on — for a
+RED clip, the `timecode` metadata (REDline's `Abs TC`) could not be
+read as either `HH:MM:SS:FF` or `HH.MM.SS.FF`. The run refuses to
+declare a component budget on a guess: over-declaring makes the dead
+end above, under-declaring is Vidispine's refusal, and neither is
+knowable without the evidence. Nothing was imported and nothing was
+declared, so the item is a clean placeholder: fix the clip's metadata
+(re-scan the folder if REDline can read the file) and the next run
+imports it fresh. `portal.log` carries the provider's matching warning
+— `red: clip <umid> … unreadable timecode` with the value it saw. This
+refusal is made only when the run is about to **declare**: a clip
+resumed into a shape that already holds a file keeps the budget the
+first run declared, and is not refused on a verdict that run is not
+going to use.
 
 ### Issue: Spanned Clips Not Working
 

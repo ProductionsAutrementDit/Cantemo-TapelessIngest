@@ -9,6 +9,7 @@ framework code refer to the Django developers documentation.
 
 import logging
 import os
+import time
 from django.urls import reverse_lazy
 from django.core.exceptions import ObjectDoesNotExist
 from django.http import (
@@ -30,7 +31,11 @@ from portal.generic.decorators import isAdminPermission
 from portal.vidispine.iexception import NotFoundError
 
 from portal.plugins.TapelessIngest.helpers import TapelessIngestPath
-from portal.plugins.TapelessIngest.models.clip import Clip
+from portal.plugins.TapelessIngest.models.clip import (
+    REST_EXTRA_COMPONENT_WAIT_SECONDS,
+    REST_COMPONENT_WAIT_BUDGET_SECONDS,
+    Clip,
+)
 from portal.plugins.TapelessIngest.models.folder import Folder
 from portal.plugins.TapelessIngest.models.settings import (
     Settings,
@@ -46,6 +51,12 @@ from portal.plugins.TapelessIngest.serializers import (
 )
 
 log = logging.getLogger(__name__)
+
+# Serializer fields that DELIBERATELY have no `Folder` model field behind
+# them, and are therefore dropped from `Folder(**validated_data)` on every
+# request. Named here so the "dropped" log line below can stay a signal:
+# it fires for the fields nobody declared, i.e. the typos.
+SERIALIZER_ONLY_FOLDER_FIELDS = frozenset({"error"})
 
 
 class SettingsView(CView):
@@ -193,20 +204,101 @@ class ClipsInPathsView(APIView):
         try:
             serialized_folder = request.data["folder"]
             folder_serializer = FolderSerializer(data=serialized_folder)
-            if folder_serializer.is_valid():
-                folder = Folder(**folder_serializer.validated_data)
+            # Two pre-existing defects, both fixed here because the first
+            # request-level test ever written against this view hit them
+            # immediately and neither branch below can run without it.
+            #
+            # 1. An INVALID body used to fall straight through, leaving
+            #    `folder` unbound and answering 500 on an UnboundLocalError
+            #    where the client's own payload was the problem. It is a
+            #    400, and it says which fields.
+            # 2. `FolderSerializer` declares `error` — required, and not
+            #    blank-able — but `Folder` has NO `error` model field, so
+            #    `Folder(**validated_data)` raised `TypeError` for every
+            #    accepted body. Between the two, this endpoint could not
+            #    succeed for ANY input. Only concrete model fields are
+            #    passed to the constructor; the serializer's extra keys
+            #    (`error`, and anything added to it later) are dropped.
+            if not folder_serializer.is_valid():
+                return Response(
+                    folder_serializer.errors,
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            # `concrete_fields`, NOT `get_fields()`: the latter also
+            # returns REVERSE relations (`Clip.folders` is listed on
+            # `Folder` under the field name `clip`, and anything else
+            # pointing at `Folder` would be too), which are not
+            # constructor keywords at all. `Model.__init__` accepts any
+            # name `get_field()` resolves, so a serializer key colliding
+            # with a reverse relation's name would have gone through
+            # `Folder(**kwargs)` and landed as a stray attribute on the
+            # instance — never a model field, and never said.
+            #
+            # `validated_data` is keyed by SOURCE, not by declared name:
+            # `umid = CharField(source="id")` arrives here as `id`. The
+            # filter and `SERIALIZER_ONLY_FOLDER_FIELDS` both speak in
+            # sources.
+            model_fields = {f.name for f in Folder._meta.concrete_fields}
+            folder_kwargs = {
+                key: value
+                for key, value in folder_serializer.validated_data.items()
+                if key in model_fields
+            }
+            dropped = sorted(
+                set(folder_serializer.validated_data)
+                - set(folder_kwargs)
+                - SERIALIZER_ONLY_FOLDER_FIELDS
+            )
+            if dropped:
+                # SAID, not swallowed. A serializer field with no model
+                # field behind it is either deliberate (`error`) or a
+                # typo, and dropping both silently makes the two
+                # indistinguishable — which is how `error` came to raise
+                # TypeError here unnoticed in the first place.
+                #
+                # The DELIBERATE ones are subtracted first. `error` is
+                # dropped on every single request, so logging it made the
+                # line fire unconditionally — which is the same as not
+                # having it: the typo it exists to surface was buried in
+                # a message the operator learns to ignore.
+                log.info(
+                    "ClipsInPathsView: folder field(s) %s are on the "
+                    "serializer but not on the Folder model, so they are not "
+                    "passed to it",
+                    ", ".join(dropped),
+                )
+            folder = Folder(**folder_kwargs)
 
             if request.data["clips"] == "__all__":
-                response = folder.ingest(user=request.user)
+                # The SHORT per-clip bound, AND the shared budget it is
+                # clamped against. The cron gets the generous default and
+                # no budget at all; a caller sitting on an HTTP socket
+                # gets both.
+                #
+                # A DURATION, not a deadline: `Folder.ingest` runs a full
+                # scan pass before it imports anything, and it opens the
+                # deadline at the start of its INGEST leg. Opening it
+                # here would let discovery on a large healthy folder eat
+                # the budget and hand every clip a 0 s bound.
+                response = folder.ingest(
+                    user=request.user,
+                    component_wait_seconds=REST_EXTRA_COMPONENT_WAIT_SECONDS,
+                    component_wait_budget=REST_COMPONENT_WAIT_BUDGET_SECONDS,
+                )
                 new_clips = response["clips"]
             else:
                 serialized_clips = request.data["clips"]
+                # This branch has no scan pass to precede it, so the
+                # ingest leg starts here and so does the budget.
+                component_wait_deadline = (
+                    time.monotonic() + REST_COMPONENT_WAIT_BUDGET_SECONDS
+                )
                 for serialized_clip in serialized_clips:
                     serializer = ClipSerializer(data=serialized_clip)
                     if serializer.is_valid():
                         clip = Clip(**serializer.validated_data)
                         try:
-                            clip.ingest(
+                            result = clip.ingest(
                                 user=request.user,
                                 collection_id=folder.collection_id,
                                 folder=folder,
@@ -215,7 +307,32 @@ class ClipsInPathsView(APIView):
                                 # normal here, not the broken invariant
                                 # Clip.ingest logs for the scan path.
                                 expect_persisted=False,
+                                # The short bound and the request's own
+                                # budget: see the folder branch above.
+                                # This loop is N clips on ONE held
+                                # request thread, which is exactly what
+                                # the deadline exists to bound.
+                                component_wait_seconds=(
+                                    REST_EXTRA_COMPONENT_WAIT_SECONDS
+                                ),
+                                component_wait_deadline=component_wait_deadline,
                             )
+                            # A clip that came back `failed` without
+                            # raising said nothing here at all: this is
+                            # the entry point that just gained a bound
+                            # and a budget, and it was the one reporting
+                            # nothing about why a clip did not ingest.
+                            # `clip.error` carries the reason
+                            # `import_file` recorded; the response shape
+                            # is an API contract this story does not
+                            # touch, so the reason goes to `portal.log`
+                            # and onto the clip the serializer returns.
+                            if result.get("failed"):
+                                log.error(
+                                    f"Failed to ingest clip {clip} from the "
+                                    f"REST endpoint: "
+                                    f"{clip.error or 'no reason recorded'}"
+                                )
                             # The serializer's writable `metadatas` field
                             # used to be persisted by Clip.save()'s
                             # per-key fan-out, deleted in story 2.4. This

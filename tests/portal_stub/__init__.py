@@ -20,7 +20,7 @@ import sys
 import threading
 from pathlib import Path
 from types import ModuleType
-from urllib.parse import parse_qs, urlencode, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlencode, urlsplit
 
 log = logging.getLogger(__name__)
 
@@ -394,6 +394,56 @@ class InjectedVidispineFault(Exception):
     """
 
 
+class ComponentBudgetExceeded(Exception):
+    """Vidispine's ``400`` when a component overflows the declared budget.
+
+    ``{"invalidInput": {"explanation": "No more components of that type is
+    accepted", "value": "VIDEO_COMPONENT"}}``, measured 2026-08-31 by
+    declaring ``video=len(extras)`` for a DEDUCIBLE anchor. It is what
+    makes "just subtract one, always" wrong, so the stub has to be able
+    to answer it — otherwise the conditional count could be mutated into
+    a constant with the suite still green.
+    """
+
+
+class DuplicateImportOfAnAttachedFile(ComponentBudgetExceeded):
+    """A component imported again after its file has already ATTACHED.
+
+    A TRIPWIRE, not a Vidispine answer: what Vidispine does with a
+    re-import of a file that is already on the item's shape — a
+    PROMOTED shape in particular — has NOT been measured. What has been
+    measured (2026-09-01) is the budget refusal a second component of
+    the same type meets once the first has landed, and every plugin
+    guard against re-importing an attached file exists so that this
+    request is never sent at all. So the fake refuses it loudly and says
+    what it is, rather than dressing an unmeasured case up as the
+    measured 400. A subclass of ``ComponentBudgetExceeded`` so a test
+    that only wants "refused" can stay coarse.
+    """
+
+
+class ImportWithoutAFileId(AssertionError):
+    """An import sent with ``fileId=None``.
+
+    Loud on purpose. ``file.getClipMainMediaFile`` builds
+    ``{"file_id": None}`` for a clip with no ``file``, and the fake used
+    to model that request as a full SUCCESS — it landed ``{"id": None}``
+    on the shape and promoted it — so the plugin's refusal of a
+    file-less anchor could be deleted with the suite still green. What
+    a real Vidispine does with ``{"fileId": None}`` is not measured; a
+    fake that accepts it certifies nothing either way.
+    """
+
+
+class UnknownShape(AssertionError):
+    """A budget declared against a shape this fake never created.
+
+    Loud on purpose: silently ignoring the declaration is exactly how the
+    pre-story stub let ``updatePlaceholderComponentCount`` be a no-op, and
+    a no-op contract cannot fail for the right reason.
+    """
+
+
 class VidispineFake:
     """Shared configuration and call log for the ingest-side helper doubles.
 
@@ -411,7 +461,8 @@ class VidispineFake:
     Configure:
     - ``set_import_response(response)`` — what the next
       ``importFileToPlaceholder`` / ``doImportToPlaceholder`` returns
-      (queue; ``default_import_response`` once it is empty);
+      (queue; a minted ``{"jobId": "VX-JOB-DEFAULT-<n>"}`` once it is
+      empty — see ``next_import_response``);
     - ``set_original_shape(item_id, shape_id, files, placeholder=False)``
       — the "original" shapes ``getItemShapesFromNames`` reports for an
       item, the files on each, and whether the shape is a PLACEHOLDER
@@ -432,17 +483,44 @@ class VidispineFake:
     """
 
     import_responses = []
-    default_import_response = {"jobId": "VX-JOB-DEFAULT"}
+    # The default answer's job id is MINTED, one per response — see
+    # `next_import_response`.
+    DEFAULT_JOB_ID_PREFIX = "VX-JOB-DEFAULT"
+    _default_job_counter = 0
     items = {}
     item_shapes = {}
     calls = []
     faults = []
+    # The COMPONENT BUDGET (see "The component budget" below): what a
+    # placeholder shape was told to expect, and what has actually LANDED
+    # against it — nothing in between, because Vidispine keeps nothing in
+    # between (measured 2026-09-02). Before this, `doImportToPlaceholder`
+    # promoted the placeholder on any `jobId`, ignored
+    # `updatePlaceholderComponentCount` entirely and never let a component
+    # land in a binary slot — so both production defects this story fixes
+    # were structurally unobservable in the suite.
+    component_jobs = {}
+    file_paths = {}
+    job_statuses = {}
+    non_deducible_files = set()
+    audio_anchor_files = set()
+    hold_component_jobs = False
+    hold_container_jobs = False
+    settle_after_polls = 1
+    stalled_jobs = set()
     _placeholder_counter = 0
     # Story 3.2: pool workers reach the two compound class-state operations
     # below (`fault_point`'s scan-then-pop, `new_placeholder_id`'s
     # read-increment-format) from up to `workers` threads at once. The GIL
     # makes a single list.append atomic, not these.
-    _lock = threading.Lock()
+    # An RLock, not a Lock: the budget helpers below both TAKE the lock
+    # and call each other (`refuse_if_budget_full` -> `_budget`/`slots_for`,
+    # `promote_if_complete` -> `_budget`/`slots_for`), and every one of
+    # them must be guarded — story 3.2 runs them from pool workers, and
+    # the FR-4 waiver claims all new state is under `_lock`. With a plain
+    # Lock, guarding them all would deadlock on the nesting; leaving the
+    # inner ones unguarded is what the waiver said was not the case.
+    _lock = threading.RLock()
 
     @classmethod
     def reset(cls):
@@ -452,7 +530,17 @@ class VidispineFake:
             cls.item_shapes.clear()
             cls.calls.clear()
             cls.faults.clear()
+            cls.component_jobs.clear()
+            cls.file_paths.clear()
+            cls.job_statuses.clear()
+            cls.non_deducible_files.clear()
+            cls.audio_anchor_files.clear()
+            cls.hold_component_jobs = False
+            cls.hold_container_jobs = False
+            cls.settle_after_polls = 1
+            cls.stalled_jobs.clear()
             cls._placeholder_counter = 0
+            cls._default_job_counter = 0
 
     @classmethod
     def fail_next(cls, call_name, error=None):
@@ -510,7 +598,17 @@ class VidispineFake:
         with cls._lock:
             if cls.import_responses:
                 return cls.import_responses.pop(0)
-            return dict(cls.default_import_response)
+            # A UNIQUE id per default answer. It was the one constant
+            # `VX-JOB-DEFAULT`, and every import now registers a job
+            # under its id: two pool workers importing single-component
+            # clips with no queued response both registered under the
+            # SAME key, so worker B's `component_jobs[...]` overwrote
+            # worker A's before A settled it — A's settle landed B's
+            # file, B's settle found the job already settled, and A's
+            # placeholder never promoted. Sequentially the overwrite is
+            # harmless, which is why only a pooled run could see it.
+            cls._default_job_counter += 1
+            return {"jobId": f"{cls.DEFAULT_JOB_ID_PREFIX}-{cls._default_job_counter}"}
 
     @classmethod
     def set_item(cls, item_id, item=None):
@@ -571,6 +669,450 @@ class VidispineFake:
         wanted = placeholder == "true"
         return [shape for shape in shapes if bool(shape.get("placeholder")) is wanted]
 
+    # ---------------------------------------------------------------
+    # The component budget
+    # ---------------------------------------------------------------
+    #
+    # Vidispine promotes a placeholder shape only when every component
+    # slot the placeholder was told to expect has been FILLED. Three
+    # things follow, and the plugin's two defects live in all three:
+    #
+    # 1. `updatePlaceholderComponentCount` is a CONTRACT, not a no-op.
+    #    A slot that is declared and never filled leaves the shape a
+    #    placeholder for ever — no `original` tag, no transcode.
+    # 2. A component that would overflow the declared budget is REFUSED
+    #    with a 400 (`ComponentBudgetExceeded`).
+    # 3. The anchor's own container import fills the container slot AND
+    #    — only when Vidispine can deduce its essence — a video one. A
+    #    source it cannot decode lands in a BINARY slot instead, which
+    #    satisfies the container and fills no video slot at all.
+    #    `set_non_deducible(file_id)` is how a fixture declares one.
+    #
+    # Files are attached when the JOB LANDS, never when the request is
+    # made: the whole of defect B is the gap between the two. Promotion
+    # is evaluated ONLY when the anchor's container import lands, because
+    # in production that is the only job that ever evaluates it — which is
+    # what makes the anchor's wait for the extras load bearing here.
+
+    @classmethod
+    def set_non_deducible(cls, *file_ids):
+        """Declare source files Vidispine's shape deduction cannot read."""
+        with cls._lock:
+            cls.non_deducible_files.update(file_ids)
+
+    @classmethod
+    def set_audio_anchor(cls, *file_ids):
+        """Declare main files whose essence is AUDIO, not video.
+
+        A P2 clip's anchor can be an audio track, and
+        `Clip._count_media_components` counts it in the AUDIO budget — so
+        the fake has to be able to fill an audio slot from a container
+        import, or that branch of the count could be mutated with the
+        suite still green.
+        """
+        with cls._lock:
+            cls.audio_anchor_files.update(file_ids)
+
+    # "Leave it as it is" for `hold_jobs(settle_after_polls=...)`: distinct
+    # from `None`, which is a real value meaning "never settles".
+    KEEP = object()
+
+    @classmethod
+    def hold_jobs(cls, settle_after_polls=KEEP, containers=False):
+        """Make extra-component jobs settle only when the test says so.
+
+        Component imports then answer with a job that reports
+        ``inProgress()`` until it has been polled ``settle_after_polls``
+        times; ``None`` means never. That is what makes defect B's race
+        reproducible with no threads and no clock: the anchor either
+        waits for those jobs or it closes an incomplete component set.
+
+        Every argument is STICKY within a test: `containers=True` is
+        never turned back off by a later call, and `settle_after_polls`
+        is changed only when the call names it. Both used to be plain
+        assignments, so `hold_jobs(settle_after_polls=None)` followed by
+        `hold_jobs(containers=True)` silently turned "never settles"
+        into "settles after one poll" — and the reverse order turned the
+        container hold off. `reset()` is what clears them, between tests.
+        """
+        with cls._lock:
+            cls.hold_component_jobs = True
+            cls.hold_container_jobs = cls.hold_container_jobs or containers
+            if settle_after_polls is not cls.KEEP:
+                cls.settle_after_polls = settle_after_polls
+
+    @classmethod
+    def stall_jobs(cls, *job_ids):
+        """Named jobs that never settle, whatever the poll count.
+
+        Coarser than `hold_jobs` on purpose: it is how a test builds a
+        PARTIAL component set — some extras landed, one did not — which
+        is the state the resume path exists for.
+
+        A named job is stalled WHATEVER its component: `register_component_job`
+        checks `stalled_jobs` independently of the container hold, and so
+        does `poll_component_job`. That is why this takes no `containers`
+        flag — one was here, had no caller, and could not have changed
+        the outcome for the job it named.
+        """
+        with cls._lock:
+            cls.hold_component_jobs = True
+            cls.stalled_jobs.update(job_ids)
+
+    @classmethod
+    def placeholder_shape(cls, item_id):
+        with cls._lock:
+            for shape in cls.item_shapes.get(item_id, []):
+                if shape.get("placeholder"):
+                    return shape
+            return None
+
+    @classmethod
+    def _budget(cls, shape):
+        # An UNDECLARED budget names the container slot and NOTHING else,
+        # and that is deliberate: a slot with no entry here is a slot with
+        # no limit, so a shape nobody declared a budget for refuses
+        # nothing. The single-component path is exactly that shape — it
+        # never calls `updatePlaceholderComponentCount` — and a default of
+        # `video: 0` would have it refused by the fake for a rule
+        # production has never applied to it. What the container entry
+        # DOES buy is promotion: one container component and the
+        # placeholder is complete, which is the pre-story behaviour for
+        # every single-component import.
+        with cls._lock:
+            return shape.setdefault("budget", {"container": 1})
+
+    @classmethod
+    def declare_component_budget(cls, item_id, shape_id, container, video, audio):
+        """``updatePlaceholderComponentCount``, with the MEASURED semantics.
+
+        Re-declaring REPLACES the declaration; it does not accumulate,
+        and it does not give a consumed slot back. Measured on prod
+        2026-09-01 WITH A CONTROL ARM, on throwaway items and files since
+        removed: control (no re-declaration) — import A lands, import B
+        is refused with the exact ``400 … VIDEO_COMPONENT``, so the
+        budget is enforced and consumed; measured (re-declaring the same
+        budget between the two) — B is refused too, so the declaration
+        was replaced rather than added to. Hence ``budget`` is
+        overwritten here while ``landed`` is deliberately left alone: a
+        resume may safely re-declare, and re-declaring buys it no extra
+        room.
+
+        (An earlier attempt concluded "accumulates" and was WRONG: its
+        two imports were 117 ms apart with job A still ``READY``, so it
+        measured latency, not the budget.)
+        """
+        with cls._lock:
+            for shape in cls.item_shapes.get(item_id, []):
+                if shape["id"] != shape_id:
+                    continue
+                shape["budget"] = {
+                    "container": container or 0,
+                    "video": video or 0,
+                    "audio": audio or 0,
+                }
+                return
+        raise UnknownShape(
+            f"updatePlaceholderComponentCount declared a budget against "
+            f"{shape_id!r} on {item_id!r}, which this fake never created — "
+            f"a declaration that lands nowhere cannot hold anything to it"
+        )
+
+    @classmethod
+    def slots_for(cls, component, file_id):
+        """The slots one import claims: container imports DEDUCE.
+
+        An extra component fills the slot it was imported as. The main
+        file fills the container slot plus whatever Vidispine's shape
+        deduction extracts from it: a video slot normally, an AUDIO one
+        when the anchor is an audio track (`set_audio_anchor`), and a
+        BINARY one — which fills no essence slot at all — when the source
+        cannot be decoded (`set_non_deducible`).
+        """
+        if component != "container":
+            return [component]
+        with cls._lock:
+            if file_id in cls.non_deducible_files:
+                deduced = "binary"
+            elif file_id in cls.audio_anchor_files:
+                deduced = "audio"
+            else:
+                deduced = "video"
+        return ["container", deduced]
+
+    @classmethod
+    def refuse_if_budget_full(cls, item_id, component, file_id):
+        """Refuse this import the way Vidispine does — at REQUEST time,
+        against what has LANDED — or let it through.
+
+        Measured, both halves. 2026-09-01: a slot is consumed when the
+        component LANDS, not when the import is requested — two imports
+        fired 93–117 ms apart are both accepted, and the same import sent
+        again AFTER the first landed is refused with the 400 below.
+        2026-09-02: a job that lands into a budget already full ATTACHES
+        ANYWAY — both jobs `FINISHED`, no error, no warning, two video
+        components on a shape declared for one. So there is no
+        reservation to keep: this reads `landed`, nothing is written,
+        and `_land_component` checks nothing. (Until 2026-09-02 this fake
+        CLAIMED a slot here, which made an in-flight duplicate look like
+        a 400 and manufactured the proof of a wrong resume guard.)
+
+        A file already attached to ANY shape of the item trips
+        ``DuplicateImportOfAnAttachedFile`` first, placeholder or not: a
+        landing that PROMOTED the shape used to make this fake blind to
+        it, because the budget check only looked at a still-placeholder
+        shape, and a duplicate into a promoted shape was then silently
+        accepted — precisely the request the plugin's resume guards exist
+        never to send. What Vidispine itself answers there is NOT
+        measured, and the tripwire's text says so instead of quoting the
+        400 (``removeItemShape`` is record-only in this fake, so a shape
+        removed by a test still trips it — model a removal by editing
+        ``item_shapes``).
+        """
+        with cls._lock:
+            for shape in cls.item_shapes.get(item_id, []):
+                if any(entry.get("id") == file_id for entry in shape.get("files", [])):
+                    raise DuplicateImportOfAnAttachedFile(
+                        f"{file_id} is already attached to shape {shape['id']} of "
+                        f"{item_id} (a {component} component) and was sent for "
+                        f"import AGAIN — what Vidispine does with this request "
+                        f"is UNMEASURED; the plugin's resume guards exist so it "
+                        f"is never sent"
+                    )
+        shape = cls.placeholder_shape(item_id)
+        if shape is None:
+            return None
+        # Under the lock because `_budget` is a `setdefault` — a WRITE —
+        # and because the read of `landed` must not interleave with a
+        # landing on another pool worker. (An RLock, so the nested
+        # acquires in `_budget` and `slots_for` are free.)
+        with cls._lock:
+            budget = cls._budget(shape)
+            landed = shape.setdefault("landed", {})
+            for slot in cls.slots_for(component, file_id):
+                if slot not in budget:
+                    continue
+                if landed.get(slot, 0) >= budget[slot]:
+                    raise ComponentBudgetExceeded(
+                        f'400 {{"invalidInput": {{"explanation": "No more '
+                        f'components of that type is accepted", "value": '
+                        f'"{slot.upper()}_COMPONENT"}}}} — {item_id} declared '
+                        f"{slot}={budget[slot]}, {landed.get(slot, 0)} landed"
+                    )
+        return shape
+
+    @classmethod
+    def register_component_job(cls, job_id, item_id, component, file_id):
+        """Record the job an import started, settling it unless held."""
+        with cls._lock:
+            # `or component == "container"` USED to be here, which made a
+            # container job impossible to hold — so the one import that
+            # must never be duplicated, the anchor, could not be put in
+            # flight and the guard against re-importing it was untestable.
+            # `hold_container_jobs` keeps every existing fixture's
+            # behaviour (the anchor settles at once) and lets a test that
+            # needs the anchor pending ask for it.
+            held = cls.hold_component_jobs and (
+                component != "container" or cls.hold_container_jobs
+            )
+            settle_now = not held and job_id not in cls.stalled_jobs
+            cls.component_jobs[job_id] = {
+                "item_id": item_id,
+                "component": component,
+                "file_id": file_id,
+                "settled": False,
+                "polls": 0,
+            }
+            # INSIDE the lock (an RLock, so the nested acquires in
+            # `settle_component_job` / `_land_component` are free): with
+            # the settle outside it, another worker could re-register
+            # the same id between this write and the settle, and the
+            # settle landed the OTHER worker's file.
+            if settle_now:
+                cls.settle_component_job(job_id)
+
+    @classmethod
+    def component_jobs_for_item(cls, item_id):
+        """The component import jobs this fake still has for an item.
+
+        What ``JobHelper.getAllJobsForItem`` answers, and the reason the
+        RESUME path is observable at all: a run that starts while the
+        previous run's component jobs are still IN FLIGHT sees those
+        files missing from the shape (the job has not attached them yet)
+        and would import them a second time.
+        """
+        with cls._lock:
+            return [
+                (job_id, dict(job))
+                for job_id, job in cls.component_jobs.items()
+                if job["item_id"] == item_id
+            ]
+
+    # The storage root a component job's source URI is built under. It
+    # carries SPACES on purpose: the production root is
+    # `/mnt/PAD_Storage/AA - RUSHES TAPELESS`, so `getSourceFilePath()`
+    # answers a PERCENT-ENCODED `file://` URI and a comparison against
+    # the raw string matches nothing — silently. A fake with a
+    # space-free root could not fail that.
+    JOB_SOURCE_ROOT = "/mnt/PAD_Storage/AA - RUSHES TAPELESS"
+
+    @classmethod
+    def set_file_path(cls, file_id, path):
+        """The storage-relative path Vidispine knows this file by.
+
+        The plugin's import sends only a ``fileId``, so the fake has to
+        be told the path separately — exactly as Vidispine knows it and
+        the plugin does not. Without it a job cannot answer
+        ``getSourceFilePath()``, which is how a resume identifies the
+        component a running job is importing (job DATA does not carry it;
+        measured 2026-09-01 on the 6.2.1 server).
+        """
+        with cls._lock:
+            cls.file_paths[file_id] = path
+
+    @classmethod
+    def component_job_source_uri(cls, job_id):
+        """``VSJob.getSourceFilePath()``: a percent-encoded ``file://`` URI.
+
+        ``None`` when the test never registered a path for the file —
+        which is the fake's model of the production job whose source
+        cannot be read, and must leave the caller on its fail-safe.
+        """
+        with cls._lock:
+            job = cls.component_jobs.get(job_id)
+            path = cls.file_paths.get(job["file_id"]) if job else None
+        if not path:
+            return None
+        absolute = f"{cls.JOB_SOURCE_ROOT}/{str(path).lstrip('/')}"
+        return "file://" + quote(absolute)
+
+    @classmethod
+    def set_job_status(cls, job_id, status):
+        """The string ``VSJob.getStatus()`` answers for this job.
+
+        The plugin decides "is this job still coming" from the STATUS,
+        not from ``inProgress()`` — which on the 6.2.1 server answers
+        False for ``WAITING``, an ordinary status on a busy Vidispine.
+        A fake that exposed only ``inProgress()`` could never execute
+        that layer, so the whole status mapping could be reverted to the
+        measured-wrong reading with the suite still green.
+
+        Unset means the fake answers no status at all, which is the OTHER
+        real case: a job object from a Vidispine that did not report one,
+        where the plugin falls back to ``inProgress()``.
+        """
+        with cls._lock:
+            cls.job_statuses[job_id] = status
+
+    @classmethod
+    def job_status(cls, job_id):
+        with cls._lock:
+            return cls.job_statuses.get(job_id)
+
+    @classmethod
+    def component_job_item(cls, job_id):
+        """``VSJob.getTargetItem()``."""
+        with cls._lock:
+            job = cls.component_jobs.get(job_id)
+        return job["item_id"] if job else None
+
+    @classmethod
+    def poll_component_job(cls, job_id):
+        """``FakeJob.inProgress()``: True until the job has settled."""
+        with cls._lock:
+            job = cls.component_jobs.get(job_id)
+            if job is None or job["settled"]:
+                return False
+            job["polls"] += 1
+            if job_id in cls.stalled_jobs:
+                return True
+            due = cls.settle_after_polls is not None and (
+                job["polls"] >= cls.settle_after_polls
+            )
+        if due:
+            cls.settle_component_job(job_id)
+            return False
+        return True
+
+    @classmethod
+    def settle_component_job(cls, job_id=None):
+        """Land a held job's file on its shape (all of them if unnamed)."""
+        job_ids = [job_id] if job_id is not None else list(cls.component_jobs)
+        for one in job_ids:
+            with cls._lock:
+                job = cls.component_jobs.get(one)
+                if job is None or job["settled"]:
+                    continue
+                job["settled"] = True
+            cls._land_component(job)
+
+    @classmethod
+    def fail_component_job(cls, job_id):
+        """A job that STOPS without attaching — Vidispine's FAILED/ABORTED.
+
+        ``inProgress()`` answers False from here on and the file never
+        reaches the shape, which is the exact shape of the mistake the
+        wait must not make: "it stopped" is not "it landed".
+        """
+        with cls._lock:
+            job = cls.component_jobs.get(job_id)
+            if job is not None:
+                job["settled"] = True
+
+    @classmethod
+    def _land_component(cls, job):
+        """Attach the job's file to the item's placeholder shape.
+
+        With NO placeholder shape the landing is dropped silently — the
+        job still settles, nothing is attached. That is the fake's
+        answer for an item nothing declared a shape on, and for a job
+        that lands after the shape promoted; neither is a measured
+        Vidispine behaviour, so a test that reaches here on purpose
+        must assert the shape state it expects, not rely on this.
+        """
+        shape = cls.placeholder_shape(job["item_id"])
+        if shape is None:
+            return
+        with cls._lock:
+            landed = shape.setdefault("landed", {})
+            # UNCONDITIONAL, past any budget (measured 2026-09-02): a job
+            # that lands into a full budget attaches its file all the
+            # same, and the shape ends over-full. Nothing here refuses.
+            for slot in cls.slots_for(job["component"], job["file_id"]):
+                landed[slot] = landed.get(slot, 0) + 1
+            # On the SHAPE's own file list, which is what
+            # `getItemShapesFromNames(...).getAllFiles()` reads: while the
+            # shape is still a placeholder that list IS the production
+            # state this story is about — an item holding all its media on
+            # a placeholder that was never promoted.
+            shape.setdefault("files", []).append(
+                {"id": job["file_id"], "storage": "VX-41"}
+            )
+        if job["component"] == "container":
+            cls.promote_if_complete(job["item_id"])
+
+    @classmethod
+    def promote_if_complete(cls, item_id):
+        """The anchor's job: promote only when every slot is filled.
+
+        An unfilled slot leaves the placeholder exactly as production
+        leaves it — holding all of the clip's media, tagged nothing,
+        transcoded never, and with no error anywhere. An OVER-full slot
+        (a duplicate that landed, 2026-09-02) counts as filled here —
+        whether Vidispine promotes an over-full shape is NOT measured;
+        `>=` is the reading consistent with what was seen.
+        """
+        with cls._lock:
+            shape = cls.placeholder_shape(item_id)
+            if shape is None:
+                return False
+            budget = cls._budget(shape)
+            landed = shape.setdefault("landed", {})
+            if any(landed.get(slot, 0) < needed for slot, needed in budget.items()):
+                return False
+            shape["placeholder"] = False
+            return True
+
     @classmethod
     def new_placeholder_id(cls):
         # Story 3.2: minted from up to `workers` pool threads at once. The
@@ -602,6 +1144,46 @@ class FakeJob:
 
     def getId(self):
         return self._job_id
+
+    def inProgress(self):
+        """The terminal test the anchor's wait polls.
+
+        A job this fake never registered (the single-component import, a
+        bare `getJob`) is terminal: only a HELD component job answers
+        True, and only until the test lets it settle.
+        """
+        return VidispineFake.poll_component_job(self._job_id)
+
+    def getStatus(self):
+        """``VSJob.getStatus()`` — only when a test set one.
+
+        ``None`` otherwise, so the ``inProgress()`` fallback stays
+        reachable and both halves of the rule are exercised.
+        """
+        return VidispineFake.job_status(self._job_id)
+
+    def getSourceFilePath(self):
+        """``VSJob.getSourceFilePath()`` — a percent-encoded ``file://`` URI.
+
+        This is how the resume path learns WHICH file a still-running job
+        is importing. It is deliberately NOT ``getDataByKey``: measured
+        on the 6.2.1 server 2026-09-01, a real ``PLACEHOLDER_IMPORT``
+        job's ``data`` carries no ``sourceFileId`` and no ``fileIds`` at
+        all (VX-696013 carries only ``item``; VX-696024 only
+        ``errorMessage``, ``item``, ``transcodeProgress``,
+        ``transcodeWallTime``), so a fake answering those keys would
+        certify a lookup that can never work in production.
+        """
+        return VidispineFake.component_job_source_uri(self._job_id)
+
+    def getFilename(self):
+        """``VSJob.getFilename()`` — the source's basename, unencoded."""
+        uri = VidispineFake.component_job_source_uri(self._job_id)
+        return os.path.basename(unquote(uri)) if uri else None
+
+    def getTargetItem(self):
+        """``VSJob.getTargetItem()`` — the item the job is importing into."""
+        return VidispineFake.component_job_item(self._job_id)
 
 
 class FakeIngestGroup:
@@ -748,8 +1330,13 @@ class ItemAPIFake:
             "updatePlaceholderComponentCount",
             item_id=item_id,
             shape_id=shape_id,
+            container=container,
             video=video,
             audio=audio,
+        )
+        # Not a no-op: this is the CONTRACT the shape is then held to.
+        VidispineFake.declare_component_budget(
+            item_id, shape_id, container, video, audio
         )
 
     def doImportToPlaceholder(
@@ -769,12 +1356,29 @@ class ItemAPIFake:
             component=component,
             query=query,
         )
-        response = VidispineFake.next_import_response()
-        if response.get("jobId") and component == "container":
-            VidispineFake.fill_placeholder_shapes(
-                item_id, [{"id": "VX-IMPORTED-FILE", "storage": "VX-41"}]
+        if not (query or {}).get("fileId"):
+            raise ImportWithoutAFileId(
+                f"doImportToPlaceholder on {item_id!r} was sent with no "
+                f"fileId ({query!r}) — the plugin must refuse a file-less "
+                f"import before sending it"
             )
+        response = VidispineFake.next_import_response()
         VidispineFake.fault_point("doImportToPlaceholder")
+        job_id = response.get("jobId")
+        if job_id:
+            # The budget check writes nothing (measured: no reservation
+            # exists), so its place in the sequence is only about which
+            # request the 400 is attributed to. Kept after the queued
+            # response and the fault point: an import that answered
+            # without a job id started nothing, and a fault models a call
+            # that died — neither reached the check.
+            file_id = (query or {}).get("fileId")
+            VidispineFake.refuse_if_budget_full(item_id, component, file_id)
+            # The file is attached by the JOB, not by the request — the
+            # whole of defect B is the gap between the two. A container
+            # import additionally EVALUATES the placeholder when it lands,
+            # and that is the only evaluation there ever is.
+            VidispineFake.register_component_job(job_id, item_id, component, file_id)
         return response
 
 
@@ -823,15 +1427,39 @@ class IngestHelperFake(_HelperFake):
         VidispineFake.record(
             "importFileToPlaceholder", item_id=item_id, file_id=file_id
         )
+        if not file_id:
+            raise ImportWithoutAFileId(
+                f"importFileToPlaceholder on {item_id!r} was sent with "
+                f"file_id=None — the plugin must refuse a file-less import "
+                f"before sending it"
+            )
         response = VidispineFake.next_import_response()
-        if response.get("jobId"):
+        job_id = response.get("jobId")
+        if job_id:
             # A successful import attaches the file and the placeholder
             # shape becomes a real one. Modelling that is what lets a
             # SECOND run be exercised against the state production really
-            # reaches (see VidispineFake.fill_placeholder_shapes).
-            VidispineFake.fill_placeholder_shapes(
-                item_id, [{"id": file_id, "storage": "VX-41"}]
-            )
+            # reaches.
+            #
+            # Through the SAME two phases as `doImportToPlaceholder`, and
+            # not by attaching the file inline: the request starts a job,
+            # the JOB attaches the file, and the gap between the two is
+            # where the single-component resume lives. Attaching inline
+            # made a container job from this path impossible to hold, so
+            # `hold_jobs(containers=True)` could not put the ONE import
+            # that must never be duplicated — the anchor of a one-file
+            # clip — in flight, and the guard against re-importing it was
+            # unobservable end to end. An unheld job settles inside
+            # `register_component_job`, which lands the file and promotes
+            # the shape exactly as before: every existing fixture sees
+            # the same state it always did.
+            #
+            # BEFORE the fault point, deliberately, and unlike
+            # `doImportToPlaceholder`: this call's fault models a process
+            # that died with the Vidispine write already committed, which
+            # is the only half that can orphan anything.
+            VidispineFake.refuse_if_budget_full(item_id, "container", file_id)
+            VidispineFake.register_component_job(job_id, item_id, "container", file_id)
         VidispineFake.fault_point("importFileToPlaceholder")
         return response
 
@@ -841,9 +1469,25 @@ class JobHelperFake(_HelperFake):
         VidispineFake.record("getJob", job_id=job_id)
         return FakeJob(job_id)
 
-    def getAllJobsForItem(self, item_id):
-        VidispineFake.record("getAllJobsForItem", item_id=item_id)
-        return []
+    def getAllJobsForItem(self, item_id, job_type=None, max_hits=0):
+        """The item's import jobs — the RESUME path's other input.
+
+        ``job_type``/``max_hits`` are the real signature
+        (``portal.vidispine.ijob.JobHelper``); accepting them is what
+        lets the plugin filter on ``PLACEHOLDER_IMPORT`` at all. A job
+        that has SETTLED is gone from the answer only in the sense that
+        it reports itself terminal — it is still listed, exactly as
+        Vidispine lists finished jobs, and it is ``inProgress()`` that
+        decides, never the listing.
+        """
+        VidispineFake.record("getAllJobsForItem", item_id=item_id, job_type=job_type)
+        jobs = [
+            FakeJob(job_id)
+            for job_id, _details in VidispineFake.component_jobs_for_item(item_id)
+        ]
+        if max_hits > 0:
+            jobs = jobs[:max_hits]
+        return jobs
 
 
 class GroupHelperFake(_HelperFake):

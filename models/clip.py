@@ -1,7 +1,8 @@
 import logging
 import re
+import time
 from collections.abc import Mapping
-from typing import Optional, Dict, List, Tuple, Any
+from typing import Any, Dict, FrozenSet, List, NamedTuple, Optional, Set, Tuple
 
 import os
 import urllib
@@ -50,6 +51,10 @@ from portal.plugins.TapelessIngest.models.settings import (
 )
 from portal.plugins.TapelessIngest.metadatas import XMLParser
 from portal.plugins.TapelessIngest.providers import PROVIDER_NAMES
+from portal.plugins.TapelessIngest.providers.providers import (
+    main_file_verdict_is_unknown,
+    yields_video_component,
+)
 from portal.plugins.TapelessIngest.scan.context import browse_root_path
 from portal.plugins.TapelessIngest.scan.extraction import extract_metadatas
 from portal.plugins.TapelessIngest.scan.ingestion import needs_hash_recovery
@@ -81,6 +86,264 @@ def job_id_from_response(response: Any) -> Optional[str]:
     if not isinstance(response, Mapping):
         return None
     return response.get("jobId") or None
+
+
+# ---------------------------------------------------------------------------
+# The wait for the extra components, and its two bounds
+# ---------------------------------------------------------------------------
+#
+# `_import_multi_component` imports every EXTRA component first and the
+# anchor last. It is the ANCHOR's job that evaluates the placeholder,
+# creates the shape and starts the transcode — and nothing re-evaluates a
+# placeholder afterwards. An anchor that reaches that step before the
+# last extra has attached its file sees an incomplete set, logs
+# "Skipping transcode", and the item keeps all its media on a shape that
+# is never promoted, never tagged `original` and never transcoded.
+# Measured on a 29-clip batch on 2026-08-31: the only 2 failures were the
+# only 2 clips whose anchor job finished before the last segment job
+# (16:37:31 vs 16:37:51; 16:58:50 vs 16:59:13). Codemill's own
+# `importFileToPlaceholder` carries the same race.
+#
+# THE BOUND IS PER ENTRY POINT, because what a wait costs is not the same
+# thing on both. The scan is a cron job that can afford to sit on a clip;
+# `views.py` holds a DRF request thread and its database connection for
+# the whole of it, so it gets a bound measured in "the caller is still
+# there", not in "this job is never coming back".
+#
+# Neither is a normal cost: an extra component import attaches an
+# ALREADY-HASHED file to a placeholder and settles in seconds. The 31-clip
+# STARLUX batch measured 2 to 5 minutes per clip END TO END, transcode
+# included, so five minutes is the outer edge of "wedged", not of "slow".
+EXTRA_COMPONENT_WAIT_SECONDS = 300.0
+REST_EXTRA_COMPONENT_WAIT_SECONDS = 30.0
+
+# ... and the per-clip bound alone is not enough, because a request does
+# not ingest ONE clip. `views.py`'s `__all__` branch runs a whole folder
+# through `Folder.ingest`, so a 50-clip folder against a wedged
+# Vidispine would hold that request thread and its database connection
+# for 50 x 30 s. One BUDGET is therefore shared by all of a request's
+# component waits, and every per-clip bound is clamped against what is
+# left of it: the first clips may spend the full 30 s, the ones after
+# them get whatever remains, and the ones past it do not wait at all.
+#
+# It is a COMPONENT-WAIT budget, not a request budget, and the name says
+# so: it bounds the waiting this story introduced and nothing else. The
+# scan pass, the metadata extraction, the collection resolution and every
+# other Vidispine call the request makes are outside it — a request can
+# still take longer than this, it just cannot spend longer than this
+# WAITING for components. That distinction is also why the budget is
+# passed as a DURATION and turned into a deadline at the start of the
+# INGEST leg (`Folder._ingest_pass`): opening it before the scan pass
+# would let a large healthy folder eat the whole budget in discovery and
+# leave every clip a 0 s bound.
+REST_COMPONENT_WAIT_BUDGET_SECONDS = 60.0
+
+# The poll BACKS OFF. A wedged Vidispine is the case this loop exists for
+# and it is exactly the case where hammering it every two seconds for five
+# minutes makes things worse; the interval grows to the ceiling and the
+# loop logs only when the pending set CHANGES, never once per iteration.
+EXTRA_COMPONENT_POLL_SECONDS = 2.0
+EXTRA_COMPONENT_POLL_BACKOFF = 1.5
+EXTRA_COMPONENT_POLL_MAX_SECONDS = 15.0
+
+# How many times the landing check is repeated once every component job
+# has reached a TERMINAL status. A terminal job is not a landed one — it
+# may have ended FAILED_TOTAL or ABORTED, attaching nothing — but neither
+# is a single read of the shape, which can legitimately race a job that
+# committed its attachment microseconds ago. Two reads, one FLOOR apart,
+# separate "it landed" from "it stopped without landing" without waiting
+# out the whole bound for a job that genuinely failed.
+#
+# The floor is its own constant and is deliberately NOT clamped to the
+# remaining bound: once the deadline has passed the ordinary poll sleep
+# clamps to 0, and two confirmations back to back absorb none of the
+# attachment race they exist for. The overshoot is bounded by
+# LANDING_CONFIRMATIONS x LANDING_CONFIRMATION_SECONDS.
+LANDING_CONFIRMATIONS = 2
+LANDING_CONFIRMATION_SECONDS = 1.0
+
+# Vidispine's job statuses, read off `VSJob.STATUSES` on this server.
+#
+# `VSJob.inProgress()` is NOT "has it stopped": verified in the vendor
+# bytecode on the 6.2.1 server, it answers True for STARTED, READY and
+# STARTED_ASYNCHRONOUS and False for everything else — including
+# **WAITING**, which is an ordinary status on a busy Vidispine and
+# exactly the condition this wait exists for. Reading it as "stopped"
+# emptied the pending set on the first pass, so the wait concluded
+# "never attached although every import job has stopped" after two
+# confirmations instead of using its bound, and the resume missed a
+# WAITING job and re-imported its component.
+#
+# So the STATUS decides, and `inProgress()` is only the fallback for a
+# job object that cannot give one.
+JOB_STATUSES_STILL_COMING = frozenset(
+    {"READY", "STARTED", "STARTED_ASYNCHRONOUS", "WAITING"}
+)
+JOB_STATUSES_TERMINAL = frozenset(
+    # `FAILED` is not in `VSJob.STATUSES` (which spells it FAILED_TOTAL)
+    # and is carried anyway: a status this set does not know is treated
+    # as still coming, and "FAILED" is the one spelling where that
+    # default would be actively wrong.
+    {"FINISHED", "FINISHED_WARNING", "FAILED_TOTAL", "FAILED", "ABORTED"}
+)
+
+# The component types an import can actually attach. ONE definition, read
+# by both the import loop and `_expected_file_ids`, because when they
+# disagreed a provider that returns a non-media extra — `xdcam` really
+# does build `{"type": "metadatas", ...}` with a `file_id` — put a file
+# id into `expected` that can never attach: `missing` was non-empty for
+# ever, the shape never reached the dead-end verdict, and every run
+# re-entered the resume.
+IMPORTABLE_COMPONENT_TYPES = frozenset({"audio", "video"})
+
+
+def importable_extras(extra_files: Any) -> List[Dict[str, Any]]:
+    """The extras an import can attach: the ones whose TYPE it can send.
+
+    Filtered on the type ALONE. A media-typed extra that carries no
+    ``file_id`` is deliberately still in here: it is a DEFECT to report,
+    not a filter criterion. Excluding it made it budget nothing, expect
+    nothing, import nothing and report nothing — and the clip came back
+    INGESTED with a span file silently missing from the item, which is
+    the same silence the whole story is about.
+
+    A non-media type IS a legitimate skip: `xdcam` builds
+    ``{"type": "metadatas", ..., "file_id": <real id>}`` for its sidecar
+    XML, no import ever sends it, and `ignore_sidecars=True` keeps
+    Vidispine from attaching it — so it can never be on the shape.
+    """
+    return [
+        media_file
+        for media_file in extra_files or ()
+        if isinstance(media_file, Mapping)
+        and media_file.get("type") in IMPORTABLE_COMPONENT_TYPES
+    ]
+
+
+def extras_without_a_file_id(extra_files: Any) -> List[Dict[str, Any]]:
+    """Media-typed extras Vidispine has no file id for — a REPORTABLE gap."""
+    return [
+        media_file
+        for media_file in importable_extras(extra_files)
+        if not media_file.get("file_id")
+    ]
+
+
+# The Vidispine job type an import to a placeholder runs as. The RESUME
+# path needs it: a run that starts while the previous run's component
+# jobs are still IN FLIGHT must not re-import a component whose job is
+# still running.
+PLACEHOLDER_IMPORT_JOB_TYPE = "PLACEHOLDER_IMPORT"
+
+
+# WHICH file a running job is importing is read off the job OBJECT, by
+# PATH — never off the job's `data` list.
+#
+# MEASURED on the 6.2.1 server 2026-09-01, on two real PLACEHOLDER_IMPORT
+# jobs of one multi-component RED clip (VX-696013, an extra component,
+# and VX-696024, the anchor, both on item VX-216268): the whole of their
+# `data` is `item` for the extra, and `errorMessage`, `item`,
+# `transcodeProgress`, `transcodeWallTime` for the anchor. There is NO
+# `sourceFileId` and NO `fileIds`. A first version of this code read
+# those two keys — they appear in the vendor's own test fixture — and
+# would therefore have answered "nothing is in flight" on this server for
+# ever, silently degrading to the re-import it exists to prevent.
+#
+# What the job object DOES expose is the source, through the accessor
+# family `get_related_jobs` already uses:
+#
+#   getSourceFilePath() -> 'file:///mnt/PAD_Storage/AA%20-%20RUSHES%20
+#                           TAPELESS/2026/.../K001_K003_0804O6_002.R3D'
+#   getFilename()       -> 'K001_K003_0804O6_002.R3D'
+#   getTargetItem()     -> 'VX-216268'
+#
+# so a component is identified by matching that path against the
+# provider's own `path` for each media file. The two sides are NOT
+# normalised the same way, which is what the pair below is for: only the
+# job side is a URI.
+
+
+def _normalised_media_path(value: Optional[str]) -> Optional[str]:
+    """A provider's own ``path`` as one comparable path string.
+
+    NOT unquoted. A provider path comes from ``VSFile.getPath()`` — a
+    bare filesystem path that was never percent-encoded — so unquoting it
+    would REWRITE a real filename containing a ``%`` sequence
+    (``100%25.R3D``, ``A%2FB.mov``) into something that is not the file,
+    and the comparison would then match the wrong media or nothing at
+    all.
+    """
+    if not value:
+        return None
+    path = str(value)
+    if not path.strip():
+        return None
+    return os.path.normpath(path)
+
+
+def _normalised_source_uri(value: Optional[str]) -> Optional[str]:
+    """A job's ``getSourceFilePath()`` as one comparable path string.
+
+    Parsed with ``urlsplit`` rather than by stripping a literal
+    ``file://``: that covers ``file://host/path`` (where the host is not
+    part of the path) and any other scheme this accessor might answer,
+    where a prefix strip would silently fold the host into the path.
+
+    Then UNQUOTED — this side really is a URI, the production storage
+    root is ``/mnt/PAD_Storage/AA - RUSHES TAPELESS``, and a comparison
+    against the raw value matches nothing and fails silently — and
+    normalised.
+
+    ``None`` for anything that leaves nothing to compare, which the
+    caller must treat as "this job identifies no component", never as
+    "it identifies none of mine".
+    """
+    if not value:
+        return None
+    raw = str(value)
+    parts = urllib.parse.urlsplit(raw)
+    # A bare POSIX path has no scheme; a Windows drive letter would parse
+    # as a one-character scheme, which is why the guard is on length.
+    if len(parts.scheme) > 1:
+        path = urllib.parse.unquote(parts.path)
+    else:
+        path = raw
+    if not path.strip():
+        return None
+    return os.path.normpath(path)
+
+
+def _sleep(seconds):
+    """The poll's only sleep, behind a module-level name.
+
+    Tests patch THIS, never `time.sleep` — monkeypatching the attribute
+    on the shared `time` module mutates it for the whole interpreter,
+    which is a cross-test hazard rather than a seam.
+    """
+    time.sleep(seconds)
+
+
+class PlaceholderShape(NamedTuple):
+    """What `_get_or_create_placeholder_shape` resolved, and its state.
+
+    ``shape_id`` is ``None`` when the item cannot be imported into at all
+    — either the placeholder is COMPLETE and still a placeholder (a dead
+    end no re-run can fix), or it holds a file that is not this clip's
+    (not a clean resume; refused rather than imported into). Otherwise it
+    names the shape to import into, and ``attached_file_ids`` says which
+    of this clip's files are ALREADY on it, so a resumed import skips
+    them instead of importing a file twice (or over-running the declared
+    budget with the duplicate).
+
+    ``created`` says whether this call MINTED the shape. A shape this run
+    just created cannot have a previous run's import jobs pointing at it,
+    which is what lets the resume path buy its job listing only for the
+    items that can actually need it.
+    """
+
+    shape_id: Optional[str]
+    attached_file_ids: FrozenSet[str] = frozenset()
+    created: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -1400,16 +1663,58 @@ class Clip(models.Model):
             )
 
     def _get_or_create_placeholder_shape(
-        self, user: Optional[User], item_helper: Any
-    ) -> Optional[str]:
-        """Get existing placeholder shape or create a new one.
+        self,
+        user: Optional[User],
+        item_helper: Any,
+        main_file: Optional[Dict[str, Any]] = None,
+        extra_files: Optional[List[Dict[str, Any]]] = None,
+    ) -> PlaceholderShape:
+        """Resolve the placeholder shape to import into, and say which.
+
+        THREE states, and they are not the same thing:
+
+        * no placeholder shape — create one (a fresh item, or one whose
+          real ``original`` shape a replace just removed);
+        * a placeholder holding NO file — reuse it. That is what makes
+          the FR-36 incomplete-import retry land on the same placeholder
+          instead of minting a second one, and it stays silent;
+        * a placeholder ALREADY HOLDING FILES — a previous import that
+          got some way in and stopped. This used to be one undifferentiated
+          ``log.info("Shape is not a placeholder")`` + ``return None``,
+          which ``import_file`` turned into a bare ``failed``: the scan
+          reported "31 failed, 0 errors" and every retry reproduced the
+          same silent exit. It is now split in two:
+
+          - INCOMPLETE (some of this clip's files are missing from the
+            shape) — RESUMABLE. Nothing is wrong with the shape; a
+            previous run simply did not get to the end. The missing
+            components are imported, then the anchor, and the item
+            promotes. A transient Vidispine slowdown must not turn into
+            permanent manual work.
+          - COMPLETE (every one of this clip's files is attached and the
+            shape is STILL a placeholder) — a dead end. Vidispine was
+            told to expect a component that nothing will ever fill, and
+            no re-run can change that, so the operator is told what is
+            attached, through the ERROR channel.
+
+          A placeholder holding a file that is NOT this clip's
+          (``attached - expected``) is neither: it is not a resume at
+          all. Importing into it would add this clip's media to some
+          other clip's item, so it is refused and reported.
+
+        A REAL (non-placeholder) ``original`` shape holding files never
+        reaches this method: ``import_file`` decides it at the FR-35 rung
+        above, and that skip is untouched.
 
         Args:
             user: User performing the operation
             item_helper: ItemHelperExtended instance
+            main_file: This clip's anchor media file, if known
+            extra_files: This clip's extra media files, if known
 
         Returns:
-            Shape ID string if successful, None if shape is not a placeholder
+            A ``PlaceholderShape``; its ``shape_id`` is ``None`` when the
+            item is a dead end.
         """
         original_shapes = item_helper.getItemShapesFromNames(
             self.item_id, ["original"], placeholder=True
@@ -1420,14 +1725,233 @@ class Clip(models.Model):
             response = item_helper.itemapi.createPlaceholderShape(
                 self.item_id, runasuser=user
             )
-            return response.decode("UTF-8")
+            return PlaceholderShape(response.decode("UTF-8"), created=True)
 
         shape = original_shapes[0]
-        if len(shape.getAllFiles()) > 0:
-            log.info(f"Importing {self.item_id}: Shape is not a placeholder")
-            return None
+        attached = frozenset(_file.getId() for _file in shape.getAllFiles())
+        if not attached:
+            return PlaceholderShape(shape.getId())
 
-        return shape.getId()
+        expected = self._expected_file_ids(main_file, extra_files)
+        anchor_id = main_file.get("file_id") if isinstance(main_file, Mapping) else None
+        if anchor_id and anchor_id in attached:
+            # THE ANCHOR HAS ALREADY LANDED and the shape is STILL a
+            # placeholder. Its import job is the only thing that ever
+            # evaluates the placeholder, and nothing re-evaluates one
+            # afterwards — so whatever is or is not attached beside it,
+            # no re-run can promote this item. This is a dead end even
+            # when extras are missing, and saying so here is what stops
+            # the resume re-importing the anchor: a second container
+            # import lands a second component and earns the measured
+            # 400.
+            missing_here = sorted(expected - attached)
+            message = (
+                f"Importing {self.item_id}: placeholder shape {shape.getId()} "
+                f"already holds this clip's anchor file {anchor_id} and is "
+                f"STILL a placeholder"
+                + (
+                    f", with {len(missing_here)} of its component(s) never "
+                    f"attached ({', '.join(missing_here)})"
+                    if missing_here
+                    else ""
+                )
+                + f"{self._component_budget_report(main_file, extra_files)}. The "
+                f"anchor's import job is the only thing that evaluates a "
+                f"placeholder and nothing re-evaluates one afterwards, so no "
+                f"re-run can promote this item and re-importing the anchor "
+                f"would only duplicate a component: the shape has to be "
+                f"removed by hand in the Vidispine admin before the clip can "
+                f"be ingested again"
+            )
+            log.error(message)
+            self.error = message
+            return PlaceholderShape(None)
+
+        foreign = sorted(attached - expected)
+        if foreign and self._expectation_is_complete(main_file, extra_files):
+            # NOT a resume. Whatever this shape is holding, it is not
+            # this clip's media, so importing into it would attach this
+            # clip's files to another clip's item — and the `expected`
+            # guard is what keeps that verdict off a caller that simply
+            # did not say which files it wanted (`expected` empty), which
+            # falls through to the dead-end rung below exactly as before.
+            message = (
+                f"Importing {self.item_id}: placeholder shape {shape.getId()} "
+                f"holds {len(foreign)} file(s) that are not this clip's "
+                f"({', '.join(foreign)}), so this is not a resume of this "
+                f"clip's import — nothing is imported into it. Check which "
+                f"item {', '.join(foreign)} belong(s) to before re-running: "
+                f"either this clip resolved onto the wrong item, or the shape "
+                f"has to be cleared by hand in the Vidispine admin"
+            )
+            log.error(message)
+            self.error = message
+            return PlaceholderShape(None)
+
+        missing = sorted(expected - attached)
+        if missing:
+            log.info(
+                f"Importing {self.item_id}: resuming placeholder shape "
+                f"{shape.getId()}, which a previous import left holding "
+                f"{len(attached)} of this clip's file(s); "
+                f"{len(missing)} still to import ({', '.join(missing)})"
+            )
+            return PlaceholderShape(shape.getId(), attached)
+
+        message = (
+            f"Importing {self.item_id}: placeholder shape {shape.getId()} already "
+            f"holds every file of this clip "
+            f"({', '.join(sorted(attached))}) and is STILL a placeholder, so "
+            f"Vidispine is waiting on a component slot nothing will ever fill"
+            f"{self._component_budget_report(main_file, extra_files)}. Nothing "
+            f"re-evaluates a placeholder once its anchor job has run, so no "
+            f"re-run can promote this item: the shape has to be removed by hand "
+            f"in the Vidispine admin before the clip can be ingested again"
+        )
+        log.error(message)
+        self.error = message
+        return PlaceholderShape(None)
+
+    @staticmethod
+    def _expected_file_ids(
+        main_file: Optional[Dict[str, Any]],
+        extra_files: Optional[List[Dict[str, Any]]],
+    ) -> FrozenSet[str]:
+        """Every Vidispine file id this clip's shape should end up holding.
+
+        The extras are filtered through ``importable_extras`` — the SAME
+        filter the import loop uses. When the two disagreed, a provider
+        returning a non-media extra (``xdcam``'s
+        ``{"type": "metadatas", ...}``, which carries a real ``file_id``)
+        put a file id in here that no import would ever attach: ``missing``
+        stayed non-empty for ever, so the shape never reached the
+        dead-end verdict and every run re-entered the resume.
+
+        Empty when the caller supplied no media files — the resume test
+        then finds nothing missing and a non-empty placeholder is treated
+        as the dead end it was before this story, which is the safe
+        direction for a caller that cannot say what it wanted.
+        """
+        ids = {
+            media_file["file_id"]
+            for media_file in importable_extras(extra_files)
+            if media_file.get("file_id")
+        }
+        if main_file and main_file.get("file_id"):
+            ids.add(main_file["file_id"])
+        return frozenset(ids)
+
+    @staticmethod
+    def _expectation_is_complete(
+        main_file: Optional[Dict[str, Any]],
+        extra_files: Optional[List[Dict[str, Any]]],
+    ) -> bool:
+        """Can the caller name EVERY file this shape should hold?
+
+        Only then may a file on the shape be called FOREIGN. An anchor
+        with no ``file_id`` — reachable on the REST path, where a clip is
+        built from a request body — would otherwise make the item's own
+        anchor file look like another clip's.
+        """
+        # The ANCHOR's file id is the whole question. A non-importable
+        # extra (`xdcam`'s `metadatas` dict) is not a gap in the
+        # expectation: no import ever sends it, `ignore_sidecars=True`
+        # keeps Vidispine from attaching it, so it can never appear on
+        # the shape and can never be mistaken for a foreign file.
+        return bool(main_file and main_file.get("file_id"))
+
+    def _component_budget_report(
+        self,
+        main_file: Optional[Dict[str, Any]],
+        extra_files: Optional[List[Dict[str, Any]]],
+    ) -> str:
+        """The component slots this clip needs, named, for the error above.
+
+        Empty when the caller did not supply the media files — the
+        message stays truthful, it just says less.
+        """
+        if not main_file:
+            return ""
+        audio_count, video_count = self._count_media_components(
+            main_file, extra_files or []
+        )
+        if main_file_verdict_is_unknown(main_file):
+            # `_count_media_components` folds None into True for the
+            # count; a diagnostic must not present that fold as a fact.
+            return (
+                f", where the component set it was told to expect is "
+                f"container=1, video={video_count or 0}, audio={audio_count or 0} "
+                f"— counting the anchor's own video component, which the "
+                f"provider could NOT vouch for"
+            )
+        return (
+            f", where the component set it was told to expect is container=1, "
+            f"video={video_count or 0}, audio={audio_count or 0}"
+        )
+
+    def _record_job(self, job_id: str, job_helper: Any) -> None:
+        """Record the import job this run rides on — the ID first.
+
+        The ``job`` SETTER does ``self.job_id = job.getId()``. The GETTER
+        catches ``NotFoundError``; the setter never did, so a ``getJob``
+        answering None — or raising for a job Vidispine has already
+        purged — aborted the clip's ingest with an ``AttributeError`` on
+        the SUCCESS path of the resume: the branch that has just
+        correctly decided NOT to start a second import.
+
+        The id is written WHATEVER happens, before the fetch is even
+        attempted. It is the only part of the job the row keeps
+        (``INGEST_STATE_FIELDS`` persists ``job_id``, not the object), and
+        swallowing it would leave the row job-less — which is exactly
+        what the ``retry_incomplete`` rung reads as "never imported" and
+        brings straight back here to fire the second import this branch
+        just refused to send.
+
+        Both entry points call this on EVERY import, fresh or resumed:
+        the fresh sites did ``self.job = job_helper.getJob(job_id)`` raw,
+        which is worse than the resume case — the import has already
+        been SENT, so an ``AttributeError`` there left a row with no
+        ``job_id`` while a real container import ran, and
+        ``retry_incomplete`` fired a duplicate on the next run.
+
+        The cache is written on every arm, ``None`` on the failing ones.
+        The ``job`` getter is ``hasattr(self, "_job")``-gated and refetches
+        through a FRESH ``JobHelper`` catching only ``NotFoundError`` —
+        so a swallowed ``RuntimeError`` here re-raised on the next
+        ``clip.job`` read (``ClipSerializer.job``, on the REST path), and
+        a second ``_record_job`` on the same instance (a clip object CAN
+        be imported twice in one process) kept the FIRST call's object
+        under the second call's id. And the id is kept as sent, never
+        re-read off the object: the setter's ``self.job_id = job.getId()``
+        would silently replace it if the helper normalised ids.
+        """
+        self.job_id = job_id
+        self._job = None
+        try:
+            job = job_helper.getJob(job_id)
+        except NotFoundError as error:
+            # Its own arm, with its own wording: Vidispine SAID the job
+            # is gone, which is a different fact from a read that failed.
+            log.warning(
+                f"Importing {self.item_id}: job {job_id} is not known to "
+                f"Vidispine (purged? {error}) — the job id is recorded on "
+                f"the clip anyway"
+            )
+            return
+        except Exception as error:  # noqa: BLE001 - an unreadable job is "no job"
+            log.warning(
+                f"Importing {self.item_id}: job {job_id} could not be read "
+                f"({error}) — the job id is recorded on the clip anyway"
+            )
+            return
+        if job is None:
+            log.warning(
+                f"Importing {self.item_id}: job {job_id} is not known to "
+                f"Vidispine (purged? getJob answered nothing) — the job id is "
+                f"recorded on the clip anyway"
+            )
+            return
+        self._job = job
 
     def _import_single_component(
         self,
@@ -1436,6 +1960,7 @@ class Clip(models.Model):
         no_transcode: Optional[bool],
         ingest_helper: Any,
         job_helper: Any,
+        in_flight_jobs: Any = (),
     ) -> bool:
         """Import a single-component (no extra files) clip.
 
@@ -1445,10 +1970,47 @@ class Clip(models.Model):
             no_transcode: Whether to skip transcoding
             ingest_helper: TapelessIngestHelper instance
             job_helper: JobHelper instance
+            in_flight_jobs: Import jobs already running for this file
+                (``Clip._in_flight_component_files``). A single-component
+                clip has no component wait, but it has the same
+                duplicate-import hazard: an interrupted run leaves the
+                placeholder EMPTY while its job runs, so the shape is
+                reused silently and the retry rung fires a second
+                container import into it.
 
         Returns:
             True if import was successful, False otherwise
         """
+        if not main_file_id:
+            # The same refusal `_import_multi_component` makes for its
+            # anchor. `getFileIdFromFullPath` answers None for a file
+            # Vidispine does not know and `file.getClipMainMediaFile`
+            # builds `{"file_id": None}` for a clip with no `file`, so
+            # this is reachable — and sending `{"fileId": None}` would
+            # either 400 or, worse, import something else.
+            message = (
+                f"Importing {self.item_id}: the anchor has no Vidispine file "
+                f"id, so there is nothing to import it from — the clip is not "
+                f"ingested and nothing is attached"
+            )
+            log.error(message)
+            self.error = message
+            return False
+
+        running = list(in_flight_jobs or ())
+        if running:
+            # Not a failure, and not a second import either: the file IS
+            # being imported, by a job this run did not start. Recording
+            # it is what puts the job id back on the row the interrupted
+            # run never wrote.
+            log.info(
+                f"Importing {self.item_id}: {main_file_id} is already being "
+                f"imported by {', '.join(running)} from an earlier run — "
+                f"recording that job instead of starting a second import"
+            )
+            self._record_job(running[0], job_helper)
+            return True
+
         log.info(f"Importing {self.item_id}: Start importing single-component shape")
 
         res = ingest_helper.importFileToPlaceholder(
@@ -1462,7 +2024,11 @@ class Clip(models.Model):
 
         job_id = job_id_from_response(res)
         if job_id:
-            self.job = job_helper.getJob(job_id)
+            # Through `_record_job`, not the raw setter: the import has
+            # already been SENT, so a `getJob` that answers None or raises
+            # must cost a warning, never the id — a job-less row here is
+            # a duplicate container import on the next run.
+            self._record_job(job_id, job_helper)
             return True
 
         log.error(
@@ -1472,23 +2038,538 @@ class Clip(models.Model):
         return False
 
     def _count_media_components(
-        self, all_files: List[Dict[str, Any]]
+        self, main_file: Dict[str, Any], extra_files: List[Dict[str, Any]]
     ) -> Tuple[Optional[int], Optional[int]]:
-        """Count audio and video components in file list.
+        """The component budget the placeholder shape must declare.
+
+        Every EXTRA file contributes one component of its own type. The
+        MAIN file contributes whatever Vidispine's shape deduction
+        extracts from it — a container component plus, NORMALLY, a video
+        one.
+
+        "Normally" is the whole point, and it is where this deliberately
+        DEPARTS from Codemill's ``ItemHelper.importFileToPlaceholder``,
+        which declares ``video=len(extraFileIds['video']) + 1`` flat. A
+        source Vidispine cannot decode yields a ``binaryComponent``: it
+        satisfies the container slot (proved by the 10 single-segment
+        drop-frame clips, which promote normally) and fills NO video
+        slot, so the extra slot is never filled and the shape stays a
+        placeholder for ever — no ``original`` tag, no transcode, no
+        error anywhere. Signature on all 31 stuck clips of the 2026
+        STARLUX shoot: ``files == videoComponents + 1``,
+        ``containerComponent`` absent, ``binaryComponent`` present.
+        Codemill's own import path fails identically; do NOT "realign" it
+        on their source without reintroducing this. (The anchor job of
+        such a clip carries ``errorMessage = "Input stream index out of
+        bounds"`` in its job data — read off VX-696024 on 2026-09-01, and
+        the first explicit Vidispine error text we have for the
+        non-deducible case. It is on the JOB, which is why no ingest ever
+        surfaced it.)
+
+        The other direction is just as wrong: declaring ``len(extras)``
+        unconditionally makes a DEDUCIBLE anchor's own video component
+        overflow the budget and Vidispine answers ``400 {"invalidInput":
+        {"explanation": "No more components of that type is accepted",
+        "value": "VIDEO_COMPONENT"}}`` (measured 2026-08-31). Hence a
+        BRANCH, never a constant — and the PROVIDER owns the condition
+        (``yields_video_component``), so this method knows nothing about
+        codecs, timecodes or drop-frame flags.
+
+        ``.get("type")``, not ``["type"]``: this method is also read by
+        the diagnostic in ``_component_budget_report``, and a provider
+        dict missing a key must not turn an error message into a
+        ``KeyError``.
 
         Args:
-            all_files: List of file dictionaries with 'type' keys
+            main_file: The anchor media file dictionary
+            extra_files: The extra media file dictionaries
 
         Returns:
             Tuple of (audio_count, video_count), where counts are None if zero
         """
-        audio_count = sum(file["type"] == "audio" for file in all_files)
-        video_count = sum(file["type"] == "video" for file in all_files)
+        importable = importable_extras(extra_files)
+        audio_count = sum(file.get("type") == "audio" for file in importable)
+        video_count = sum(file.get("type") == "video" for file in importable)
+
+        # `importable_extras`, not the raw list: an extra the import loop
+        # will not send must not be budgeted a slot nothing will fill —
+        # which is defect A again, by another route.
+        main_type = main_file.get("type") if isinstance(main_file, Mapping) else None
+        if main_type == "audio":
+            audio_count += 1
+        elif main_type == "video" and yields_video_component(main_file):
+            video_count += 1
 
         return (
             None if audio_count == 0 else audio_count,
             None if video_count == 0 else video_count,
         )
+
+    def _placeholder_file_ids(self, item_helper: Any) -> Optional[Set[str]]:
+        """The file ids currently attached to this item's ORIGINAL shape.
+
+        ``None`` means "could not tell", which the wait treats exactly
+        like a job it could not read: not landed.
+
+        "No placeholder shape" is NOT by itself "could not tell". The
+        shape query is a three-state FILTER (see ``ItemAPIEnhanced``:
+        ``placeholder=true`` returns only placeholder shapes, the
+        default returns only non-placeholder ones), so an item whose
+        shape has been PROMOTED answers the first query with nothing —
+        and its files are all there, which is the opposite of unknown.
+        Telling the two apart costs a second query only in the case
+        where the first came back empty, and reading a promoted shape's
+        files as "unknown" would fail a clip whose import succeeded.
+        """
+        try:
+            shapes = item_helper.getItemShapesFromNames(
+                self.item_id, ["original"], placeholder=True
+            )
+            if not shapes:
+                shapes = item_helper.getItemShapesFromNames(self.item_id, ["original"])
+        except Exception as error:  # noqa: BLE001 - a read that fails is "unknown"
+            log.warning(
+                f"Importing {self.item_id}: cannot read the placeholder shape "
+                f"({error}) — treating its components as not landed"
+            )
+            return None
+        if not shapes:
+            return None
+        return {_file.getId() for _file in shapes[0].getAllFiles()}
+
+    def _placeholder_still_open(self, item_helper: Any) -> Optional[bool]:
+        """Whether this item's ORIGINAL shape is still a placeholder.
+
+        ``True`` means a placeholder shape is there; ``False`` means the
+        shape has been PROMOTED (no placeholder, a non-placeholder one
+        in its place); ``None`` means "could not tell" — the query
+        raised, or answered nothing on BOTH states of the three-state
+        filter (see ``_placeholder_file_ids`` for the filter). The two
+        queries are the same pair that method issues, for the same
+        reason: "no placeholder shape" alone is not "promoted".
+        """
+        try:
+            placeholders = item_helper.getItemShapesFromNames(
+                self.item_id, ["original"], placeholder=True
+            )
+            if placeholders:
+                return True
+            promoted = item_helper.getItemShapesFromNames(self.item_id, ["original"])
+        except Exception as error:  # noqa: BLE001 - a read that fails is "unknown"
+            log.warning(
+                f"Importing {self.item_id}: cannot read whether the placeholder "
+                f"shape promoted ({error})"
+            )
+            return None
+        return False if promoted else None
+
+    def _in_flight_component_files(
+        self, job_helper: Any, media_files: List[Dict[str, Any]]
+    ) -> Dict[str, List[str]]:
+        """This item's still-running placeholder imports, by media file id.
+
+        The RESUME path's other half. A run that starts while the
+        PREVIOUS run's component jobs are still in flight sees those
+        files missing from the shape — the job has not attached them yet
+        — and would import them a second time. Vidispine checks the
+        budget at REQUEST time against the files already LANDED and
+        never at landing (measured 2026-09-01 and 2026-09-02, with a
+        control arm), so the duplicate is accepted and lands too: the
+        shape ends with two components for one declared, SILENTLY. Only
+        when the first has already landed does the second get the ``400 …
+        _COMPONENT``; either way the resumable case turns into a failure
+        the resume exists to avoid.
+
+        Read off ``getAllJobsForItem``, which the plugin already uses
+        (``Clip.jobs``), filtered to ``PLACEHOLDER_IMPORT``. Which
+        component a job is importing is identified by its SOURCE PATH,
+        not by its job data — see the comment above
+        ``_normalised_media_path`` for the measurement that settles it.
+
+        Three rules, in order, and the reason there are three is that the
+        two sides name a file differently. ``getSourceFilePath()`` is an
+        ABSOLUTE path under the storage root
+        (``/mnt/PAD_Storage/AA - RUSHES TAPELESS/2026/…``) while a
+        provider's ``path`` is what ``VSFile.getPath()`` gave it, which
+        is storage-RELATIVE. So: exact match, then "the job's path ends
+        with this file's path" (component-aligned, so ``…/a_002.R3D``
+        never satisfies ``b_002.R3D``), then equal basenames. The last
+        rule is loose on its own and safe here for two structural
+        reasons: the jobs are already filtered to THIS item, and the
+        candidates are already filtered to THIS clip's own media files —
+        two of which never share a basename.
+
+        FAIL-SAFE in every unknown: a listing that raises, a job that
+        raises, a job with no readable source, a source matching nothing.
+        None of them is skipped, so the caller falls back to today's
+        behaviour (import it), whose worst case is the pre-existing 400 —
+        loud, reported and recoverable — rather than a component that is
+        never imported because an accessor was missing.
+
+        Returns:
+            ``{file_id: [job_id, ...]}`` for jobs still IN PROGRESS —
+            every one of them, because a file with two running imports is
+            the case that most needs waiting on.
+        """
+        candidates = [
+            (
+                _normalised_media_path(media_file.get("path")),
+                media_file.get("file_id"),
+            )
+            for media_file in media_files or ()
+            if isinstance(media_file, Mapping)
+            and media_file.get("path")
+            and media_file.get("file_id")
+        ]
+        if not candidates:
+            return {}
+        try:
+            jobs = job_helper.getAllJobsForItem(
+                self.item_id, job_type=PLACEHOLDER_IMPORT_JOB_TYPE
+            )
+        except (
+            Exception
+        ) as error:  # noqa: BLE001 - a listing that fails is "none known"
+            log.warning(
+                f"Importing {self.item_id}: cannot list the item's import jobs "
+                f"({error}) — resuming on the attached files alone, so a "
+                f"component whose job is still in flight may be re-imported "
+                f"and land twice"
+            )
+            return {}
+        in_flight: Dict[str, List[str]] = {}
+        for job in jobs or ():
+            try:
+                # `_job_has_stopped` and NOT `inProgress()`: the latter
+                # answers False for WAITING, so a component queued behind
+                # a busy Vidispine looked finished and its file was
+                # re-imported. An unknown answer is NOT counted as in
+                # flight — the resume's fail-safe is to import, whose
+                # worst case is the loud 400.
+                if self._job_has_stopped(job) is not False:
+                    continue
+                job_id = job.getId()
+                target = self._job_target_item(job)
+                if target and target != self.item_id:
+                    # `getAllJobsForItem` already filters, but a job that
+                    # NAMES another item is not this item's by any
+                    # reading, and skipping a component on its word would
+                    # be the one unsafe direction here.
+                    continue
+                file_id = self._job_matches_a_media_file(job, candidates)
+                if file_id is None:
+                    continue
+                # EVERY running job for the file, not the first. Duplicate
+                # imports are the hazard this whole lookup exists for, so
+                # a file with two jobs already running is exactly the case
+                # that most needs both of them waited on — `setdefault`
+                # dropped the second and the anchor could close the set
+                # while it was still attaching.
+                in_flight.setdefault(file_id, [])
+                if job_id not in in_flight[file_id]:
+                    in_flight[file_id].append(job_id)
+            except (
+                Exception
+            ) as error:  # noqa: BLE001 - one unreadable job is not the listing
+                log.warning(
+                    f"Importing {self.item_id}: cannot read one of the item's "
+                    f"import jobs ({error}) — it is not counted as in flight"
+                )
+        return in_flight
+
+    @staticmethod
+    def _job_status(job: Any) -> Optional[str]:
+        """``getStatus()`` as an upper-case string, or ``None``."""
+        accessor = getattr(job, "getStatus", None)
+        if not callable(accessor):
+            return None
+        status = accessor()
+        return str(status).strip().upper() if status else None
+
+    @classmethod
+    def _job_has_stopped(cls, job: Any) -> Optional[bool]:
+        """Has this job reached a TERMINAL status?
+
+        ``True`` terminal, ``False`` still coming, ``None`` "cannot tell"
+        — which the two callers resolve in OPPOSITE directions, because
+        the unsafe answer is not the same on both sides. The WAIT reads
+        an unknown as still coming (closing the component set on an
+        unknown outcome is what manufactures the unpromotable
+        placeholder); the RESUME reads it as not in flight (refusing to
+        import on an unknown would make one bad read permanently
+        unresumable).
+
+        `inProgress()` is only the FALLBACK, and never the rule: on this
+        server it answers False for WAITING, which is an ordinary status
+        on a busy Vidispine and precisely the state the wait exists for.
+        """
+        status = cls._job_status(job)
+        if status in JOB_STATUSES_TERMINAL:
+            return True
+        if status in JOB_STATUSES_STILL_COMING:
+            return False
+        if status is not None:
+            # A status neither set knows. Do not guess it into either
+            # bucket — say so, and let each caller apply its own
+            # fail-safe.
+            return None
+        accessor = getattr(job, "inProgress", None)
+        if callable(accessor):
+            return not accessor()
+        return None
+
+    @staticmethod
+    def _job_target_item(job: Any) -> Optional[str]:
+        """``getTargetItem()`` when the object has one, else ``None``."""
+        accessor = getattr(job, "getTargetItem", None)
+        if not callable(accessor):
+            return None
+        return accessor()
+
+    @staticmethod
+    def _job_matches_a_media_file(job: Any, candidates: List[Any]) -> Optional[str]:
+        """The file id this job is importing, or ``None`` if it cannot say.
+
+        ``candidates`` is ``[(normalised path, file_id), …]`` for THIS
+        clip's media files only.
+        """
+        source = None
+        accessor = getattr(job, "getSourceFilePath", None)
+        if callable(accessor):
+            source = _normalised_source_uri(accessor())
+        filename = None
+        accessor = getattr(job, "getFilename", None)
+        if callable(accessor):
+            filename = accessor() or None
+        if source is None and filename is None:
+            # Neither accessor exists or both are empty: this job says
+            # nothing about which component it is importing.
+            return None
+        source_base = os.path.basename(source) if source else filename
+
+        # The three rules are applied IN ORDER OVER ALL CANDIDATES, not
+        # per candidate: evaluated inside one loop, a basename match on
+        # an early candidate wins over an EXACT match on a later one,
+        # which is the opposite of the documented precedence.
+        usable = [(path, file_id) for path, file_id in candidates if path]
+        if source is not None:
+            for path, file_id in usable:
+                if source == path:
+                    return file_id
+            for path, file_id in usable:
+                # Component-ALIGNED suffix: the job's path is absolute
+                # under the storage root, the provider's is relative to
+                # it. `endswith(path)` alone would let `.../xa_002.R3D`
+                # satisfy `a_002.R3D`.
+                if source.endswith(os.sep + path):
+                    return file_id
+        if source_base:
+            for path, file_id in usable:
+                if source_base == os.path.basename(path):
+                    return file_id
+        return None
+
+    def _component_job_running(
+        self, job_id: str, job_helper: Any, unreadable: Set[str]
+    ) -> bool:
+        """Is this component's import job still running?
+
+        "Running" means "has NOT reached a terminal status", read off
+        ``getStatus()`` — never off ``inProgress()``, which on this
+        server answers False for WAITING and would empty the pending set
+        on the first pass for a component merely queued behind a busy
+        Vidispine (`JOB_STATUSES_STILL_COMING`).
+
+        A job that cannot be read counts as STILL RUNNING, and that is
+        one rule with three arms now: ``getJob`` raising, ``getJob``
+        answering ``None``, and a job whose status neither status set
+        knows. "I could not tell" is not "it finished" — the bound stops
+        the poll either way, and the alternative is closing the component
+        set on a job whose outcome is unknown.
+
+        ``unreadable`` dedupes the warning: a wedged Vidispine is polled
+        many times and must not produce many identical lines.
+        """
+        try:
+            job = job_helper.getJob(job_id)
+        except Exception as error:  # noqa: BLE001 - any read failure is "unknown"
+            if job_id not in unreadable:
+                unreadable.add(job_id)
+                log.warning(
+                    f"Importing {self.item_id}: cannot read component job "
+                    f"{job_id} ({error}) — treating it as still running"
+                )
+            return True
+        if job is None:
+            if job_id not in unreadable:
+                unreadable.add(job_id)
+                log.warning(
+                    f"Importing {self.item_id}: component job {job_id} could not "
+                    f"be found — treating it as still running"
+                )
+            return True
+        stopped = self._job_has_stopped(job)
+        if stopped is None:
+            if job_id not in unreadable:
+                unreadable.add(job_id)
+                log.warning(
+                    f"Importing {self.item_id}: component job {job_id} reports "
+                    f"the unmodelled status {self._job_status(job)!r} — treating "
+                    f"it as still running"
+                )
+            return True
+        unreadable.discard(job_id)
+        return not stopped
+
+    def _wait_for_components_to_land(
+        self,
+        job_ids: List[str],
+        expected_file_ids: Set[str],
+        job_helper: Any,
+        item_helper: Any,
+        bound: float,
+        bound_description: str = "",
+    ) -> Optional[str]:
+        """Block until every extra component has LANDED, or say why not.
+
+        LANDED, not stopped. ``inProgress()`` is the vendor's own terminal
+        test and it is right for "has this job stopped" and wrong for
+        "did it work": it goes false for ``FAILED`` and ``ABORTED`` too,
+        and treating those as success re-creates the incomplete component
+        set this whole story removes. The honest check is the shape's own
+        attached files, so both have to hold — every job stopped AND
+        every file on the shape.
+
+        ``JobHelper`` has no ``waitForJob`` (checked on the 6.2.1
+        server), so this is a bounded poll. It dedupes the job ids, backs
+        off, and logs only when the pending set CHANGES: a wedged
+        Vidispine is precisely the case this runs for, and it must not be
+        hammered or drown the report.
+
+        Returns:
+            ``None`` when everything landed, otherwise the operator-facing
+            reason it did not.
+        """
+        deadline = time.monotonic() + bound
+        pending = list(dict.fromkeys(job_ids))
+        expected = set(expected_file_ids)
+        interval = EXTRA_COMPONENT_POLL_SECONDS
+        unreadable: Set[str] = set()
+        confirmations = LANDING_CONFIRMATIONS
+        reported = None
+
+        attached = None
+        missing = None
+        last_pending_count = None
+
+        while True:
+            pending = [
+                job_id
+                for job_id in pending
+                if self._component_job_running(job_id, job_helper, unreadable)
+            ]
+            # The shape is re-read only when the pending set SHRANK (or
+            # emptied), never once per pass. Nothing but a job finishing
+            # attaches a file, so a pass in which every job is still
+            # running has nothing new to see — and the poll backs off
+            # while the shape read did not, so a five-minute wait spent
+            # one shape query every couple of seconds on an answer it
+            # already had.
+            if last_pending_count is None or len(pending) != last_pending_count:
+                last_pending_count = len(pending)
+                attached = self._placeholder_file_ids(item_helper)
+                missing = sorted(expected - attached) if attached is not None else None
+
+            if not pending and missing == []:
+                return None
+
+            if not pending:
+                # Every job has reached a terminal status and the files
+                # are not all there. One more look (a job can commit its
+                # attachment between the two reads); after that it
+                # stopped without landing.
+                confirmations -= 1
+                if confirmations > 0:
+                    # Re-read next pass, whatever the pending count did.
+                    last_pending_count = None
+                if confirmations <= 0:
+                    if missing is None:
+                        # The shape could not be READ. Saying components
+                        # "never attached although every job stopped"
+                        # would name a cause this run never observed —
+                        # and when `job_ids` was empty there were no jobs
+                        # to stop in the first place.
+                        return (
+                            f"the placeholder shape could not be read, so "
+                            f"whether this clip's {len(expected)} extra "
+                            f"component(s) attached is unknown — the anchor is "
+                            f"NOT imported, because closing a component set on "
+                            f"an unknown state leaves a placeholder nothing can "
+                            f"promote"
+                        )
+                    return (
+                        f"{len(missing)} extra component(s) never attached their "
+                        f"file"
+                        + (
+                            " although every import job has stopped"
+                            if job_ids
+                            else " and no import job was running for them"
+                        )
+                        + f" ({', '.join(missing)}) — a job that ends "
+                        f"FAILED_TOTAL or ABORTED stops without attaching, and "
+                        f"an anchor closing an incomplete component set leaves "
+                        f"a placeholder nothing can promote"
+                    )
+
+            state = (tuple(pending), tuple(missing) if missing else ())
+            if state != reported:
+                reported = state
+                log.info(
+                    f"Importing {self.item_id}: waiting for {len(pending)} extra "
+                    f"component job(s) to land before importing the anchor "
+                    f"(jobs: {', '.join(pending) or 'none still running'}; "
+                    f"files not yet attached: "
+                    f"{', '.join(missing) if missing else 'unknown'})"
+                )
+
+            # Only a job that is STILL RUNNING can expire the bound. With
+            # nothing pending the confirmation counter above already
+            # guarantees termination, and letting the deadline pre-empt it
+            # would report "0 jobs still running" for a job that failed.
+            if pending and time.monotonic() >= deadline:
+                return (
+                    f"{len(pending)} extra component job(s) were still running "
+                    f"after {bound:.0f}s{bound_description} "
+                    f"({', '.join(pending) or 'none'}; files "
+                    f"not yet attached: "
+                    f"{', '.join(missing) if missing else 'unknown'}) — the "
+                    f"anchor is NOT imported, because an anchor that closes an "
+                    f"incomplete component set leaves a placeholder nothing can "
+                    f"promote. The components already attached are kept, so the "
+                    f"next run resumes this item rather than starting over"
+                )
+
+            if pending:
+                # Clamped to what is LEFT of the bound: a 15 s ceiling on
+                # a 30 s REST bound would otherwise overshoot the
+                # deadline by most of a poll, and on that path the
+                # overshoot is a request thread and its database
+                # connection held past the budget the entry point set.
+                # `_sleep`, not `time.sleep`: the seam tests patch is
+                # this module's own name.
+                _sleep(max(0.0, min(interval, deadline - time.monotonic())))
+                interval = min(
+                    interval * EXTRA_COMPONENT_POLL_BACKOFF,
+                    EXTRA_COMPONENT_POLL_MAX_SECONDS,
+                )
+            else:
+                # The CONFIRMATION floor, deliberately NOT clamped to the
+                # remaining bound. Past the deadline the clamp above is
+                # 0, so the confirmations would run back to back and
+                # absorb none of the attachment race they exist for — the
+                # one case they are here to get right. Bounded by
+                # LANDING_CONFIRMATIONS x this.
+                _sleep(LANDING_CONFIRMATION_SECONDS)
 
     def _import_multi_component(
         self,
@@ -1500,6 +2581,10 @@ class Clip(models.Model):
         user: Optional[User],
         item_helper: Any,
         job_helper: Any,
+        attached_file_ids: FrozenSet[str] = frozenset(),
+        component_wait_seconds: Optional[float] = None,
+        component_wait_deadline: Optional[float] = None,
+        in_flight_component_files: Optional[Dict[str, List[str]]] = None,
     ) -> bool:
         """Import a multi-component (with extra files) clip.
 
@@ -1512,19 +2597,187 @@ class Clip(models.Model):
             user: User performing the operation
             item_helper: ItemHelperExtended instance
             job_helper: JobHelper instance
+            attached_file_ids: Files a previous, unfinished import already
+                attached to this placeholder — imported again they would
+                duplicate a component and overflow the declared budget
+            component_wait_seconds: How long to wait for the extra
+                components to LAND before giving up on the anchor. The
+                bound is per ENTRY POINT (``None`` = the scan's).
+            component_wait_deadline: A ``time.monotonic()`` instant the
+                per-clip bound is CLAMPED against — the whole-request
+                budget ``views.py`` sets, so N clips of one request
+                cannot cost N x the per-clip bound. ``None`` on the scan
+                path, which holds nothing anyone is waiting on.
+            in_flight_component_files: ``{file_id: [job_id, ...]}`` for this
+                item's component imports still RUNNING from a previous
+                run. Those files are not on the shape yet and must not be
+                imported again — the duplicate would be accepted and land
+                as a second component, silently (measured 2026-09-02) —
+                but their jobs DO have to be waited for.
 
         Returns:
             True if import was successful
         """
         log.info(f"Importing {self.item_id}: Start importing multi-component shape")
 
-        main_file_id = main_file["file_id"]
+        main_file_id = (
+            main_file.get("file_id") if isinstance(main_file, Mapping) else None
+        )
+        if not main_file_id:
+            # `getFileIdFromFullPath` answers None for a file Vidispine
+            # does not know, and `red.getClipMainMediaFile` answers None
+            # for a clip with no `file` — so this is reachable, and
+            # sending `{"fileId": None}` would either 400 or, worse,
+            # import something else. It is also what would make the
+            # anchor's own file look FOREIGN to the resume, since
+            # `_expected_file_ids` cannot name it.
+            message = (
+                f"Importing {self.item_id}: the anchor "
+                f"{main_file.get('path') if isinstance(main_file, Mapping) else main_file!r} "
+                f"has no Vidispine file id, so there is nothing to import it "
+                f"from — the clip is not ingested and nothing is attached"
+            )
+            log.error(message)
+            self.error = message
+            return False
+        nameless = extras_without_a_file_id(extra_files)
+        if nameless:
+            # A media-typed extra Vidispine has no file id for cannot be
+            # imported, and until now it was simply filtered away: not
+            # budgeted, not expected, not imported and not reported, so
+            # the clip came back INGESTED with a span file missing from
+            # the item. That is the same silence this whole story is
+            # about, so it is a failure with a name.
+            message = (
+                f"Importing {self.item_id}: {len(nameless)} media file(s) of "
+                f"this clip have no Vidispine file id "
+                f"({', '.join(str(f.get('path')) for f in nameless)}) — they "
+                f"cannot be imported, and ingesting the rest would leave the "
+                f"item silently short of media. Nothing is imported; re-scan "
+                f"once Vidispine knows the file(s)"
+            )
+            log.error(message)
+            self.error = message
+            return False
+
+        # THE ANCHOR IS SUBJECT TO BOTH RESUME GUARDS TOO. It was not:
+        # `attached_file_ids` and `in_flight` were consulted only inside
+        # the extras loop and the anchor import was unconditional, so a
+        # placeholder whose container import had landed (an interrupted
+        # run whose anchor went first) was resumed and the anchor
+        # imported a SECOND time — the duplicate component and the
+        # measured 400 the resume exists to avoid.
+        #
+        # `_get_or_create_placeholder_shape` already refuses an attached
+        # anchor a rung earlier, and this is the same verdict re-stated
+        # where the import happens: the two are deliberately redundant,
+        # because this method is also called directly and a future
+        # refactor of the classifier must not silently re-open the hole.
+        #
+        # IT IS DECIDED FIRST, before the declaration and before a single
+        # extra is imported. Stated after the extras loop — where it was
+        # — the refusal was announced only once this run had already
+        # re-declared the component count and sent every missing extra
+        # import into a shape it was about to call a dead end: those
+        # components LAND, and a landed component consumes a slot on a
+        # placeholder nothing can ever promote. The verdict was right and
+        # the harm was already done.
+        #
+        # `shape_id` is guarded in the message: on the direct-call path
+        # the redundancy exists for, nothing guarantees a caller named
+        # one. And the budget verdict is appended here too — it is
+        # logged after `_count_media_components`, which this refusal now
+        # precedes, so without it the one grep-able line naming the
+        # declared set would be lost on exactly this exit.
+        shape_description = f"shape {shape_id}" if shape_id else "its placeholder shape"
+        if main_file_id and main_file_id in attached_file_ids:
+            message = (
+                f"Importing {self.item_id}: the anchor {main_file_id} is already "
+                f"attached to {shape_description}, so its import job has already "
+                f"evaluated this placeholder — importing it again would only "
+                f"duplicate a component and be refused. Nothing re-evaluates a "
+                f"placeholder, so this item cannot be promoted by a re-run"
+                f"{self._component_budget_report(main_file, extra_files)}"
+            )
+            log.error(message)
+            self.error = message
+            return False
+
+        # THE CLASSIFIER'S OTHER RUNG, re-stated for the same reason: a
+        # shape holding a file that is not this clip's is not a resume of
+        # this clip's import, and a direct caller handing such a shape in
+        # must be refused BEFORE anything is imported into it — or this
+        # clip's files are attached to another clip's item. The anchor's
+        # own id is known here (checked above), so the expectation is
+        # complete and a foreign file really is foreign.
+        foreign = sorted(
+            attached_file_ids - self._expected_file_ids(main_file, extra_files)
+        )
+        if foreign:
+            message = (
+                f"Importing {self.item_id}: {shape_description} holds "
+                f"{len(foreign)} file(s) that are not this clip's "
+                f"({', '.join(foreign)}), so this is not a resume of this "
+                f"clip's import — nothing is imported into it"
+                f"{self._component_budget_report(main_file, extra_files)}"
+            )
+            log.error(message)
+            self.error = message
+            return False
+
+        # THE UN-EVIDENCED VERDICT IS REFUSED, NOT GUESSED (ruled
+        # 2026-09-02, spec D6). A provider that has the question and no
+        # answer — `red` on an unreadable `Abs TC` — declares `None`, and
+        # a budget built on it is a guess in one of two directions:
+        # over-declared, and the shape is a placeholder for ever with no
+        # error anywhere (defect A); under-declared, and Vidispine
+        # refuses the anchor with the 400. Neither is a declaration.
+        # Before ANY import: the extras would otherwise land in a shape
+        # whose budget nobody can vouch for. An ABSENT key is not this —
+        # that is a provider that never had the question, and it keeps
+        # the backward-compatible True (`yields_video_component`).
+        #
+        # Only when this run would DECLARE. A shape that already holds a
+        # file keeps the declaration the run that started the import
+        # made (below), so the verdict is not consulted on a resume — and
+        # refusing there would strand an import whose budget was set by
+        # a run that COULD read the metadata, on the strength of a
+        # re-extraction that no longer can.
+        if not attached_file_ids and main_file_verdict_is_unknown(main_file):
+            main_file_path = main_file.get("path") or "(no path)"
+            message = (
+                f"Importing {self.item_id}: the provider could not tell whether "
+                f"the anchor {main_file_path} contributes a video component of "
+                f"its own (see the provider's warning for what it could not "
+                f"read), so the component budget cannot be declared without "
+                f"guessing. Over-declaring leaves the shape a placeholder for "
+                f"ever and under-declaring is refused by Vidispine, so nothing "
+                f"is imported. Fix the clip's metadata and re-run"
+            )
+            log.error(message)
+            self.error = message
+            return False
+
         query = {"fileId": main_file_id, "tag": "lowres"}
         if no_transcode:
             query["no-transcode"] = no_transcode
 
-        all_files = extra_files + [main_file]
-        audio_count, video_count = self._count_media_components(all_files)
+        in_flight = dict(in_flight_component_files or {})
+
+        audio_count, video_count = self._count_media_components(main_file, extra_files)
+
+        # The deduction verdict, on one grep-able line. Its ABSENCE is what
+        # made the original diagnosis take three days: an over-declared
+        # budget is invisible in every log the plugin wrote, because
+        # nothing recorded what was declared or why.
+        log.info(
+            f"Importing {self.item_id}: component budget for anchor "
+            f"{main_file.get('path')} — the provider says it "
+            f"{'DOES' if yields_video_component(main_file) else 'does NOT'} "
+            f"yield a video component of its own, so with {len(extra_files)} "
+            f"extra file(s) the declaration is container=1, video={video_count}, "
+            f"audio={audio_count}"
+        )
 
         # Codemill declares the component count first, then imports every extra
         # component, and imports the main file LAST — the main import is what
@@ -1532,7 +2785,47 @@ class Clip(models.Model):
         # that order. It differs on the count itself: Codemill only ever handles
         # spanned video (``video=len(extra) + 1``), whereas an extra here can be
         # a P2 audio track, so the count is taken per type.
-        if shape_id:
+        # DECLARE ON EVERY RUN THAT FINDS NO FILE ON THE SHAPE, and never
+        # on a run that finds one. The rule is the measured one
+        # (2026-09-01, with a control arm): a component slot is consumed
+        # when a file LANDS, and re-declaring REPLACES the declaration
+        # without giving a consumed slot back. So:
+        #
+        # * a file on the shape means a slot was consumed against the
+        #   CURRENT declaration, and re-declaring a different budget
+        #   under consumed slots is not measured — so we do not. The
+        #   verdict really can move between runs (it is derived from
+        #   `metadatas["timecode"]`, which a re-extraction rewrites, and
+        #   an unreadable value is declared `None` — refused before any
+        #   import on a first run, not consulted on a resume), and a
+        #   budget overwritten under claimed slots is exactly the
+        #   permanently unpromotable placeholder this story removes;
+        # * a shape holding NO file has consumed nothing, so re-declaring
+        #   is free — an in-flight job has claimed nothing yet, and there
+        #   is no declaration any slot was consumed against. It is also
+        #   REQUIRED: the previous run may have taken the SINGLE-component
+        #   path (the provider saw no extras — an index/filesystem desync
+        #   is a documented condition), which never declares at all, and
+        #   left its container job in flight. Gating on that job as
+        #   "prior work" skipped the declaration and imported the extras
+        #   into a shape whose budget was never set — the unpromotable
+        #   placeholder again, produced by the fix itself.
+        #
+        # Hence the ONLY evidence that a slot was consumed is a file
+        # attached to the shape. The job listing is not consulted here.
+        prior_run_declared = bool(attached_file_ids)
+        if shape_id and prior_run_declared:
+            log.info(
+                f"Importing {self.item_id}: resuming into shape {shape_id}, "
+                f"which already holds {len(attached_file_ids)} file(s) — a "
+                f"landed file consumed a slot against the count declared by "
+                f"the run that started this import, so that declaration is "
+                f"kept rather than replaced (container=1, video={video_count}, "
+                f"audio={audio_count} is what THIS run would have declared; "
+                f"{len(in_flight)} file(s) still being imported by an earlier "
+                f"run)"
+            )
+        elif shape_id:
             log.info(
                 f"Importing {self.item_id}: Found shape {shape_id}, updating components count to {video_count} video components and {audio_count} audio component"
             )
@@ -1559,24 +2852,216 @@ class Clip(models.Model):
         # clip that means transcoding a single audio track to a video preset.
         # ``ignore_sidecars`` has no Codemill counterpart: it postdates 2.2.0 and
         # is what the single-component path already passes.
-        for extra_file in extra_files:
-            if extra_file["type"] in ["audio", "video"]:
-                q = {"fileId": extra_file["file_id"]}
+        component_job_ids: List[str] = []
+        component_failures: List[str] = []
+        expected_file_ids: Set[str] = set()
+        # COMPONENTS covered by a job — started by this run or found
+        # running from an earlier one. Counted apart from the JOB ids,
+        # because one job can cover several files and the anchor's job
+        # can be in the list too: the operator-facing messages below
+        # must not report a job count as a component count.
+        components_with_a_job = 0
+        already_attached = 0
+        for extra_file in importable_extras(extra_files):
+            expected_file_ids.add(extra_file["file_id"])
+            if extra_file["file_id"] in attached_file_ids:
+                # RESUME: a previous run already attached this component.
+                # Importing it again would add a second component of the
+                # same type and overflow the budget just declared.
                 log.info(
-                    f"Importing {self.item_id}: Import file {extra_file['file_id']}:{extra_file['path']} to component {extra_file['type']}..."
+                    f"Importing {self.item_id}: component "
+                    f"{extra_file['file_id']}:{extra_file['path']} is already "
+                    f"attached to {shape_description} — not importing it again"
                 )
-                component_res = item_helper.itemapi.doImportToPlaceholder(
-                    item_id=self.item_id,
-                    query=q,
-                    component=extra_file["type"],
-                    runasuser=user,
-                    ignore_sidecars=True,
+                already_attached += 1
+                continue
+            running_jobs = list(in_flight.get(extra_file["file_id"]) or ())
+            if running_jobs:
+                # RESUME, the other half: the previous run's import for
+                # this component has not attached its file yet, but it is
+                # still coming. Vidispine checks the budget at REQUEST
+                # time only, against the files already LANDED (measured
+                # 2026-09-02): a second import of the same file is
+                # ACCEPTED while the first is in flight, and both land —
+                # a duplicate component, silently; and it is the 400 if
+                # the first has landed by then. Either way the resumable
+                # case turns into a mess the resume exists to avoid. Wait
+                # for the job that is already running instead of starting
+                # a rival.
+                log.info(
+                    f"Importing {self.item_id}: component "
+                    f"{extra_file['file_id']}:{extra_file['path']} is still "
+                    f"being imported by {', '.join(running_jobs)} from an "
+                    f"earlier run — waiting for that job instead of importing "
+                    f"it again"
                 )
-                component_job_id = job_id_from_response(component_res)
-                if component_job_id:
-                    log.info(f"... and got job {component_job_id}")
-                else:
-                    log.info("... but got no job in response")
+                component_job_ids.extend(running_jobs)
+                components_with_a_job += 1
+                continue
+            q = {"fileId": extra_file["file_id"]}
+            log.info(
+                f"Importing {self.item_id}: Import file {extra_file['file_id']}:{extra_file['path']} to component {extra_file['type']}..."
+            )
+            component_res = item_helper.itemapi.doImportToPlaceholder(
+                item_id=self.item_id,
+                query=q,
+                component=extra_file["type"],
+                runasuser=user,
+                ignore_sidecars=True,
+            )
+            component_job_id = job_id_from_response(component_res)
+            if component_job_id:
+                log.info(f"... and got job {component_job_id}")
+                component_job_ids.append(component_job_id)
+                components_with_a_job += 1
+            else:
+                log.info("... but got no job in response")
+                component_failures.append(
+                    f"{extra_file['file_id']}:{extra_file['path']}"
+                )
+
+        anchor_jobs = list(in_flight.get(main_file_id) or ()) if main_file_id else []
+        if anchor_jobs:
+            # The anchor's own import is STILL RUNNING from an earlier
+            # run. Starting a rival would duplicate the container
+            # component; the honest move is to let that job finish and
+            # see whether it promotes the shape.
+            log.info(
+                f"Importing {self.item_id}: the anchor {main_file_id} is still "
+                f"being imported by {', '.join(anchor_jobs)} from an earlier "
+                f"run — waiting for that job rather than starting a second "
+                f"import"
+            )
+            if len(anchor_jobs) > 1:
+                # Two running imports of the anchor is already the
+                # duplicate this run refuses to add to. All are waited
+                # for; the row can record only one, so say which.
+                log.warning(
+                    f"Importing {self.item_id}: {len(anchor_jobs)} import jobs "
+                    f"are running for the anchor {main_file_id} "
+                    f"({', '.join(anchor_jobs)}) — every one of them is waited "
+                    f"for, and {anchor_jobs[0]} is the one recorded on the clip"
+                )
+            expected_file_ids.add(main_file_id)
+            component_job_ids.extend(anchor_jobs)
+
+        # ONE JOB ID, ONCE. `_in_flight_component_files` lists every
+        # running import per FILE, so a single job reported for several
+        # files lands here several times, and the anchor's own job can
+        # already be in the list from the extras loop. The wait dedupes
+        # internally, but the operator-facing message below COUNTS this
+        # list — undeduped it over-states how many component jobs
+        # actually started.
+        component_job_ids = list(dict.fromkeys(component_job_ids))
+
+        # A component whose import started no job will never attach its
+        # file, so the set the anchor is about to close can never be
+        # complete. Importing the anchor anyway is what manufactures the
+        # unpromotable placeholder this method exists to stop producing.
+        # The components that DID land stay attached, so the next run
+        # resumes rather than starting over.
+        if component_failures:
+            message = (
+                f"Importing {self.item_id}: {len(component_failures)} extra "
+                f"component import(s) started no job "
+                f"({', '.join(component_failures)}) — the anchor is NOT "
+                f"imported, because an anchor closing an incomplete component "
+                f"set leaves a placeholder nothing can ever promote. The next "
+                f"run resumes this item"
+            )
+            log.error(message)
+            self.error = message
+            return False
+
+        # THE WAIT (defect B). `doImportToPlaceholder` returns a job per
+        # component and this loop used to log the id and drop it. It is
+        # the ANCHOR's job that decides whether the placeholder is
+        # complete, creates the shape and starts the transcode, so it must
+        # not run before the last component has attached its file: on a
+        # 29-clip batch (2026-08-31) the only 2 failures were the only 2
+        # clips whose anchor job finished first. Codemill's code carries
+        # the same race.
+        #
+        # An expired wait is a FAILURE, not a fallback: importing the
+        # anchor anyway is precisely the race being removed.
+        bound = (
+            EXTRA_COMPONENT_WAIT_SECONDS
+            if component_wait_seconds is None
+            else component_wait_seconds
+        )
+        bound_description = ""
+        if component_wait_deadline is not None:
+            # The WHOLE-REQUEST budget. `views.py` ingests a folder, not
+            # a clip, so the per-clip bound alone would let a 50-clip
+            # folder hold a request thread and its database connection
+            # for 50 x the bound. Each clip may spend the shorter of its
+            # own bound and what is left of the request's.
+            remaining = max(0.0, component_wait_deadline - time.monotonic())
+            if remaining < bound:
+                bound = remaining
+                bound_description = (
+                    ", which is all that was left of this request's "
+                    "component-wait budget"
+                )
+        not_landed = self._wait_for_components_to_land(
+            component_job_ids,
+            expected_file_ids,
+            job_helper,
+            item_helper,
+            bound,
+            bound_description,
+        )
+        if not_landed:
+            message = f"Importing {self.item_id}: {not_landed}"
+            log.error(message)
+            self.error = message
+            return False
+
+        if anchor_jobs:
+            # Its own job did the import; there is nothing left for this
+            # run to send. But LANDED is not PROMOTED: the wait answers
+            # the first, and only the anchor's job answers the second —
+            # and that job has already evaluated the placeholder, against
+            # whatever had landed at that instant. Nothing re-evaluates a
+            # placeholder (spec D7), so if the shape is still one now it
+            # is a DEAD END, and counting the clip ingested would report
+            # a success that will never come. Read the shape and say so,
+            # LOUDLY — and do NOT record the job: `is_incomplete_import`
+            # only revisits a clip with no job id, and the anchor-attached
+            # rung above reports this item every run, as it should.
+            anchor_job_list = ", ".join(anchor_jobs)
+            still_open = self._placeholder_still_open(item_helper)
+            if still_open is None:
+                message = (
+                    f"Importing {self.item_id}: the anchor was imported by "
+                    f"{anchor_job_list}, which has now landed, but whether its "
+                    f"job promoted the placeholder cannot be read (the shape "
+                    f"query answered nothing on either state) — the next run "
+                    f"re-examines this item"
+                )
+                log.error(message)
+                self.error = message
+                return False
+            if still_open:
+                message = (
+                    f"Importing {self.item_id}: the anchor was imported by "
+                    f"{anchor_job_list}, which has now landed, and the shape is "
+                    f"still a placeholder — that job evaluated the placeholder "
+                    f"before every component had landed, and nothing "
+                    f"re-evaluates a placeholder, so this item cannot be "
+                    f"promoted by a re-run. Its files are on the placeholder; "
+                    f"the item must be deleted and the clip re-ingested"
+                )
+                log.error(message)
+                self.error = message
+                return False
+            log.info(
+                f"Importing {self.item_id}: the anchor was imported by "
+                f"{anchor_job_list}, which has now landed and promoted the "
+                f"shape — nothing more to send"
+            )
+            self._record_job(anchor_jobs[0], job_helper)
+            return True
 
         log.info(
             f"Finally, import file {main_file_id} to item {self.item_id}...(user groups are {user_groups})"
@@ -1598,7 +3083,9 @@ class Clip(models.Model):
 
         job_id = job_id_from_response(res)
         if job_id:
-            self.job = job_helper.getJob(job_id)
+            # Through `_record_job`: the anchor import has been SENT, so
+            # an unfetchable job must cost a warning, never the id.
+            self._record_job(job_id, job_helper)
 
         log.info(f"Retranscoding shape with item {self.item_id} and shape {shape_id}")
 
@@ -1606,10 +3093,17 @@ class Clip(models.Model):
         # True here — as this method unconditionally did — is how a clip
         # could be reported ingested with a NULL job_id and no import.
         if not job_id:
-            log.error(
-                f"Importing {self.item_id}: multi-component import response "
-                f"carried no job id ({res!r}) — no import job was started"
+            message = (
+                f"Importing {self.item_id}: the ANCHOR's import response carried "
+                f"no job id ({res!r}), so nothing will evaluate the placeholder "
+                f"— {components_with_a_job} extra component(s) are covered by "
+                f"import job(s) {', '.join(component_job_ids) or 'none'}, "
+                f"{already_attached} were already attached by an earlier run, "
+                f"and their files stay on the placeholder, so the next run "
+                f"resumes this item"
             )
+            log.error(message)
+            self.error = message
             return False
         return True
 
@@ -1620,6 +3114,8 @@ class Clip(models.Model):
         replace: bool = False,
         legacy_storages: Optional[List[str]] = None,
         retry_incomplete: bool = False,
+        component_wait_seconds: Optional[float] = None,
+        component_wait_deadline: Optional[float] = None,
     ) -> Dict[str, bool]:
         """Import clip files into Vidispine, creating or updating an item.
 
@@ -1641,6 +3137,17 @@ class Clip(models.Model):
                 an item that really holds original files still comes back
                 ``skipped`` instead of having its shape removed and
                 re-imported.
+            component_wait_seconds: How long a MULTI-component import may
+                wait for its extra components to land before giving up on
+                the anchor. ``None`` takes the scan's generous bound;
+                ``views.py`` passes a short one, because a REST call holds
+                a request thread and its database connection for the whole
+                of the wait where the cron holds nothing anyone is
+                waiting on.
+            component_wait_deadline: The ``time.monotonic()`` instant the
+                WHOLE request's component budget expires at, which every
+                per-clip bound is clamped against. ``None`` on the scan
+                path (see ``_import_multi_component``).
 
         Returns:
             Dictionary with status flags:
@@ -1649,6 +3156,12 @@ class Clip(models.Model):
                 - replaced: True if original files were replaced
                 - ingested: True if import succeeded
         """
+        # A clip object can be imported twice in one process (the retry
+        # rung, the tests' two-run scenarios), and `self.error` is what
+        # `Folder.ingest` now reads to decide what reaches the operator's
+        # report. Carrying the PREVIOUS attempt's reason into this one
+        # would attribute an old failure to a new verdict.
+        self.error = ""
         result = {
             "skipped": False,
             "failed": False,
@@ -1728,15 +3241,50 @@ class Clip(models.Model):
         _, default_ingest_group = _gh.getUserIngestGroups()
         user_groups = [urllib.parse.quote(str(default_ingest_group))]
 
-        shape_id = self._get_or_create_placeholder_shape(user, _ith)
+        placeholder = self._get_or_create_placeholder_shape(
+            user, _ith, main_file=main_file, extra_files=extra_files
+        )
+        shape_id = placeholder.shape_id
         if shape_id is None:
             result["failed"] = True
             return result
 
+        # A shape this call just MINTED cannot have an earlier run's
+        # import jobs pointing at it, so the job listing is bought only
+        # for an item that could actually be mid-resume — which is what
+        # keeps the happy path at exactly the Vidispine calls it made
+        # before this story.
+        #
+        # It is computed for BOTH branches. Computed only in the
+        # multi-component one, it left the single-component path outside
+        # the resume guards entirely: an interrupted import leaves a
+        # placeholder that is still EMPTY while its job runs, the empty
+        # placeholder is reused silently, and the `retry_incomplete` rung
+        # brings the next scan straight back here to fire a second
+        # container import. The ANCHOR is in the list either way — it is
+        # the one import that cannot be duplicated safely.
+        in_flight = (
+            {}
+            if placeholder.created
+            # `importable_extras`, the SAME filter the import loop and
+            # `_expected_file_ids` use: a non-media extra (`xdcam`'s
+            # `metadatas` dict) is never imported, so a running job
+            # matching its basename must not be read as one of this
+            # clip's component imports.
+            else self._in_flight_component_files(
+                _ijh, list(importable_extras(extra_files)) + [main_file]
+            )
+        )
+
         # Import based on component count
         if len(extra_files) == 0:
             imported = self._import_single_component(
-                main_file_id, user_groups, no_transcode, _igh, _ijh
+                main_file_id,
+                user_groups,
+                no_transcode,
+                _igh,
+                _ijh,
+                in_flight_jobs=in_flight.get(main_file_id) or (),
             )
         else:
             imported = self._import_multi_component(
@@ -1748,6 +3296,10 @@ class Clip(models.Model):
                 user,
                 _ith,
                 _ijh,
+                attached_file_ids=placeholder.attached_file_ids,
+                component_wait_seconds=component_wait_seconds,
+                component_wait_deadline=component_wait_deadline,
+                in_flight_component_files=in_flight,
             )
 
         # FR-36: an import with no job id is a FAILURE, never an ingest.
@@ -1757,9 +3309,13 @@ class Clip(models.Model):
         if imported:
             result["ingested"] = True
         else:
+            # Truthful: the multi-component path can now fail with several
+            # component jobs STARTED, so the old flat "no import job was
+            # started" would have been a lie about half the failures. The
+            # helper's own reason wins whenever it recorded one.
             log.error(
-                f"Importing {self.item_id}: no import job was started, counting "
-                f"this clip failed"
+                f"Importing {self.item_id}: counting this clip failed — "
+                f"{self.error or 'no import job was started'}"
             )
             result["failed"] = True
         return result
@@ -1785,6 +3341,8 @@ class Clip(models.Model):
         legacy_storages: Optional[List[str]] = None,
         expect_persisted: bool = True,
         retry_incomplete: bool = False,
+        component_wait_seconds: Optional[float] = None,
+        component_wait_deadline: Optional[float] = None,
     ) -> Dict[str, bool]:
         """Convenience method that wraps import_file for ingest operations.
 
@@ -1799,6 +3357,10 @@ class Clip(models.Model):
                 which ingests a clip built from a request body, does not)
             retry_incomplete: Whether this clip's last import left a
                 placeholder and no job (see ``import_file``)
+            component_wait_seconds: The entry point's wait bound for a
+                multi-component import (see ``import_file``)
+            component_wait_deadline: The whole-request budget every
+                per-clip bound is clamped against (see ``import_file``)
 
         Returns:
             Dictionary with status flags from import_file operation
@@ -1809,6 +3371,8 @@ class Clip(models.Model):
             replace=replace,
             legacy_storages=legacy_storages,
             retry_incomplete=retry_incomplete,
+            component_wait_seconds=component_wait_seconds,
+            component_wait_deadline=component_wait_deadline,
         )
         self.persist_ingest_state(expect_persisted=expect_persisted)
         if folder:

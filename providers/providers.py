@@ -4,6 +4,7 @@
 import logging
 import os
 import re
+from collections.abc import Mapping
 
 from portal.vidispine.iitem import ItemHelper, IngestHelper
 from portal.vidispine.istorage import StorageHelper
@@ -18,6 +19,93 @@ from portal.plugins.TapelessIngest.scan.context import browse_root_path
 from portal.plugins.TapelessIngest.utilities import build_nested
 
 log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# The main media file's own essence contribution
+# ---------------------------------------------------------------------------
+#
+# `Clip._import_multi_component` declares, up front, how many components
+# the placeholder shape must expect before Vidispine will promote it.
+# Every EXTRA file contributes one component of its own type; the MAIN
+# file contributes whatever Vidispine's shape deduction extracts from it,
+# which is normally a container component plus a video one.
+#
+# It is not always a video one. A source Vidispine cannot decode yields a
+# `binaryComponent` instead: that satisfies the container slot and fills
+# NO video slot, so a declaration that assumed otherwise leaves one video
+# slot unfilled and the shape a placeholder for ever — no `original` tag,
+# no transcode, no error anywhere (measured on 110/110 drop-frame-flagged
+# `.R3D` files of the 2026 STARLUX shoot).
+#
+# Which sources those are is FORMAT knowledge, so the PROVIDER answers it
+# and `models/clip.py` stays format-agnostic: a main-file dict may carry
+# `MAIN_FILE_YIELDS_VIDEO`. Absent, it means True — which is BACKWARD
+# COMPATIBILITY, not a claim that True is the safe answer. True is what
+# every provider declared implicitly before this key existed, so a
+# provider that never thought about the question keeps exactly today's
+# count; it is emphatically not the harmless direction, because
+# over-declaring is the SILENT failure above and under-declaring is the
+# loud one (Vidispine refuses the anchor with `400 {"invalidInput":
+# {"explanation": "No more components of that type is accepted", "value":
+# "VIDEO_COMPONENT"}}`, measured 2026-08-31, and the clip is reported
+# failed). Only a provider that can actually ANSWER the question should
+# depart from the default.
+#
+# The key deliberately does NOT spell the reader's name: a dict dumped
+# into a log line has to be unambiguous about which half of the pair it
+# is, and `{'yields_video_component': False}` beside a function of the
+# same name reads as a bound method that was not called.
+MAIN_FILE_YIELDS_VIDEO = "main_file_yields_video_component"
+
+
+def yields_video_component(main_file):
+    """Whether ``main_file``'s own essence will fill a video slot.
+
+    The default is ``True`` for BACKWARD COMPATIBILITY: a P2, XDCAM or
+    Ikegami anchor does deduce, and ``True`` is what every anchor was
+    counted as before this key existed. Anything that is not a mapping,
+    and an explicit ``None`` ("the provider could not tell"), read as
+    ``True`` for that reason and no other — this function does NOT claim
+    ``True`` is the safe direction. The two errors are not symmetric and
+    neither is safe: OVER-declaring (counting a video slot the anchor
+    never fills) is defect A, which is SILENT — the shape stays a
+    placeholder for ever with no error anywhere; UNDER-declaring is LOUD
+    — Vidispine refuses the anchor with ``400 … VIDEO_COMPONENT`` and the
+    clip is reported failed. The default therefore keeps the behaviour a
+    caller already had rather than guessing on its behalf, and a provider
+    that can genuinely answer the question is expected to say so.
+
+    Any other value is coerced with ``bool``, so a provider answering
+    ``0``/``""`` is taken at its word rather than crashing an import.
+    """
+    if not isinstance(main_file, Mapping):
+        return True
+    declared = main_file.get(MAIN_FILE_YIELDS_VIDEO, True)
+    if declared is None:
+        return True
+    return bool(declared)
+
+
+def main_file_verdict_is_unknown(main_file):
+    """Whether the provider DECLARED that it could not tell.
+
+    An explicit ``None`` under ``MAIN_FILE_YIELDS_VIDEO`` is a provider
+    that has the question and no evidence to answer it — ``red`` on an
+    unreadable ``Abs TC``. It is distinct from an ABSENT key, which is a
+    provider that never had the question and keeps the backward-
+    compatible ``True``. ``yields_video_component`` above folds both
+    into ``True`` for the callers that only need A count (a diagnostic,
+    a log line); the multi-component import reads THIS before declaring
+    a budget, because a budget is a claim and a claim without evidence
+    is the silent over-declaration this key exists to end (ruled
+    2026-09-02, spec D6).
+    """
+    if not isinstance(main_file, Mapping):
+        return False
+    return (
+        MAIN_FILE_YIELDS_VIDEO in main_file
+        and main_file[MAIN_FILE_YIELDS_VIDEO] is None
+    )
 
 
 class Provider:
@@ -312,6 +400,17 @@ class Provider:
         return {}
 
     def getClipMainMediaFile(self, clip):
+        """The clip's ANCHOR media file, as a dict, or ``None``.
+
+        Keys the ingest reads: ``file_id``, ``path``, ``type`` and —
+        optionally — ``MAIN_FILE_YIELDS_VIDEO``, which declares whether
+        Vidispine will extract a video component of its own from this
+        file. Omit it and it reads ``True`` (``yields_video_component``),
+        which is the answer for every anchor Vidispine can decode.
+
+        Overriding THIS hook is how a provider narrows the answer; see
+        ``providers/red.py``, which derives it from REDline's ``Abs TC``.
+        """
         return None
 
     def getClipMediaFiles(self, clip):

@@ -22,6 +22,7 @@ from portal.plugins.TapelessIngest.models.clip import (
 from portal.plugins.TapelessIngest.models.settings import Settings
 
 from portal.plugins.TapelessIngest.providers.providers import (
+    MAIN_FILE_YIELDS_VIDEO,
     Provider as BaseProvider,
 )
 
@@ -40,6 +41,39 @@ REDLINE_FALLBACK_PATHS = (
     "/usr/bin/REDline",
     "/opt/red/REDline",
 )
+
+# The two whole-field shapes REDline prints for `Abs TC`, and the ONLY
+# two this provider claims to understand.
+#
+# `00:59:47:14` is the ordinary one. `00.48.41.06` — dot separators —
+# carries the flag conventionally called drop-frame, and is deliberately
+# treated as a SIGNAL rather than as drop-frame SEMANTICS: the same flag
+# appears at 50 fps, where drop-frame is not defined. What it predicts,
+# measured 110/110 on the 2026 STARLUX shoot, is that Vidispine's shape
+# deduction extracts no essence from the `.R3D` and answers with a
+# binaryComponent instead of a video one (open Codemill ticket on the
+# decoder).
+#
+# Both patterns are anchored end to end on purpose: the WHOLE field is
+# matched, never a substring. A substring test ("does it contain a dot")
+# would classify a path, a date or a truncated field as non-deducible,
+# and departing from the pre-existing declaration on a field this
+# provider cannot actually read is a guess — so anything matching NEITHER
+# pattern falls back to `True` (today's declaration) with a WARNING. That
+# fallback is compatibility, not safety: over-declaring is the silent
+# failure (defect A) and under-declaring is the loud 400. It is the right
+# fallback only because a value this provider cannot parse is no evidence
+# at all, and `Abs TC` is a REQUIRED column, so the case is unreachable
+# through a real scan.
+#
+# `;` — the SMPTE separator conventionally used for drop-frame — is NOT
+# matched, deliberately: across 110/110 `.R3D` files of the 2026 STARLUX
+# shoot this REDline build printed dots and never a semicolon, so a `;`
+# arm would be an unmeasured guess. It would land in the fallback above,
+# warn, and keep today's declaration — which is the honest answer for a
+# shape this provider has never observed.
+DEDUCIBLE_TIMECODE = re.compile(r"\d{2}:\d{2}:\d{2}:\d{2}")
+UNDEDUCIBLE_TIMECODE = re.compile(r"\d{2}\.\d{2}\.\d{2}\.\d{2}")
 
 # The columns getAllClipMetadatas reads out of --printMeta 3.
 REDLINE_REQUIRED_COLUMNS = (
@@ -329,7 +363,83 @@ class Provider(BaseProvider):
             "order": 0,
             "file_id": file_id,
             "path": path,
+            MAIN_FILE_YIELDS_VIDEO: self.anchor_yields_video_component(clip, path),
         }
+
+    @classmethod
+    def anchor_yields_video_component(cls, clip, path=None):
+        """Whether this anchor will fill a video slot of its own.
+
+        Read off ``metadatas["timecode"]``, which is REDline's ``Abs TC``
+        — a REQUIRED column (``REDLINE_REQUIRED_COLUMNS``), so a clip
+        without it raised long before it got here — persisted as a
+        ``ClipMetadata`` row by the scan. No new REDline call, no extra
+        query (``getClipAdditionalMediaFiles`` already dereferences
+        ``clip.metadatas`` on this same path), and no migration.
+
+        Only the two shapes this provider has actually observed decide
+        anything. A missing value, a non-string, or a string matching
+        neither answers ``None`` — "could not tell" — WITH A WARNING. It
+        used to answer ``True``, the pre-existing declaration, on the
+        argument that a field this provider cannot parse is no evidence
+        about the anchor's essence; that is true, and it is exactly why
+        ``True`` was wrong: a budget declared without evidence is
+        defect A (silent over-declaration) or the loud ``400 …
+        VIDEO_COMPONENT`` (under-declaration), and a guess cannot know
+        which. Ruled 2026-09-02 (spec D6): the provider says it could not
+        tell, and the multi-component import refuses to declare on that
+        — the clip is reported failed with the reason, nothing is
+        imported. The single-component path never reads the verdict.
+
+        The verdict on the DEDUCIBLE majority is logged at DEBUG: it is
+        one line per clip on every non-RED-drop-frame ingest, and the
+        line that had to exist is the one naming the departure.
+        """
+        metadatas = getattr(clip, "metadatas", None) or {}
+        try:
+            timecode = metadatas.get("timecode")
+        except AttributeError:
+            timecode = None
+        if isinstance(timecode, str):
+            # `.strip()`: REDline's CSV can carry surrounding whitespace,
+            # and a stray space would send an otherwise perfectly
+            # readable timecode to the fallback below — the SILENT
+            # over-declaration.
+            timecode = timecode.strip()
+            if UNDEDUCIBLE_TIMECODE.fullmatch(timecode):
+                log.info(
+                    "red: anchor %s has timecode %r (dot-separated) — Vidispine "
+                    "deduces no video component from it, so the placeholder "
+                    "budget must not declare a video slot for it",
+                    path,
+                    timecode,
+                )
+                return False
+            if DEDUCIBLE_TIMECODE.fullmatch(timecode):
+                log.debug(
+                    "red: anchor %s has timecode %r — it contributes a video "
+                    "component of its own",
+                    path,
+                    timecode,
+                )
+                return True
+        # `%s` names the CLIP, not only the path: on the REST path a
+        # `Clip(**validated_data)` can arrive with a `metadatas` dict
+        # that has no `timecode` at all, and that path has no operator
+        # report — this line in `portal.log` is the only trace, so it has
+        # to be greppable by umid.
+        log.warning(
+            "red: clip %s, anchor %s has an unreadable timecode %r — this "
+            "provider cannot tell whether the anchor contributes a video "
+            "component, so it declares nothing: a multi-component import of "
+            "this clip will be refused rather than declare a guessed budget. "
+            "Only %s and %s are understood",
+            getattr(clip, "umid", None),
+            path,
+            timecode,
+            DEDUCIBLE_TIMECODE.pattern,
+            UNDEDUCIBLE_TIMECODE.pattern,
+        )
         return None
 
     @staticmethod

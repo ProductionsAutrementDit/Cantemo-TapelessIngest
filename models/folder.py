@@ -88,6 +88,21 @@ from portal.plugins.TapelessIngest.scan.verification import FolderListings
 log = logging.getLogger(__name__)
 
 
+# How many per-clip failure REASONS one folder may put into the operator's
+# report. The reasons exist because "31 failed, 0 errors" told an operator
+# nothing; the cap exists because the same wedged Vidispine that produces
+# one of them produces all of them, and a 200-clip card would then bury the
+# rest of the run's report — and the Slack message built from it — under
+# 200 identical lines. Past the cap the count is reported instead, so the
+# report is short but never silent about being short.
+# It is counted PER INGEST PASS, which is per folder and — in paged mode
+# — per page. That is where `response["errors"]` itself lives, so the cap
+# is scoped to the report it protects; a run over many folders can still
+# print up to the cap for each of them, which is the intent (one wedged
+# card must not silence the next folder's different failure).
+INGEST_ERROR_REPORT_CAP = 10
+
+
 def persist_scan_results(folder, plan, dry_run=False):
     """Execute one folder's persistence plan — the AD-6 write unit.
 
@@ -226,7 +241,18 @@ def providers_for_worker(ctx):
     return ctx.provider_registry
 
 
-def _folder_worker(folder, ctx, *, first, number, cursor, count_only, ingest):
+def _folder_worker(
+    folder,
+    ctx,
+    *,
+    first,
+    number,
+    cursor,
+    count_only,
+    ingest,
+    component_wait_seconds=None,
+    component_wait_budget=None,
+):
     """Run one folder's pipeline and freeze it into a ``FolderOutcome``.
 
     The body BOTH entry modes execute: tree mode reaches it through
@@ -239,11 +265,30 @@ def _folder_worker(folder, ctx, *, first, number, cursor, count_only, ingest):
     It may RAISE: the paged façades must keep failing where they always
     failed, and it is ``process_folder`` — the tree-mode wrapper — that
     owns the never-raising contract.
+
+    ``component_wait_seconds``/``component_wait_budget`` are the ENTRY
+    POINT's bounds on a multi-component import's wait for its extra
+    components (``Clip.import_file``): the per-clip bound, and the
+    DURATION all of this call's component waits share. They travel as EXPLICIT parameters
+    the whole way down — never as folder state — so that deleting the
+    kwarg anywhere on the chain is a signature change a test can see,
+    rather than a ``getattr`` that silently answers ``None`` and hands
+    every REST caller the cron's five-minute patience. They are
+    deliberately not ``RunOptions`` fields either: they are not a
+    property of the RUN, they are a property of who is holding the
+    caller — the cron holds nothing, ``views.py`` holds a request thread
+    and its database connection.
     """
     timer = PhaseTimer()
     if ingest:
         response = folder._ingest_pass(
-            ctx, first=first, number=number, cursor=cursor, timer=timer
+            ctx,
+            first=first,
+            number=number,
+            cursor=cursor,
+            timer=timer,
+            component_wait_seconds=component_wait_seconds,
+            component_wait_budget=component_wait_budget,
         )
     else:
         response = folder._scan_pass(
@@ -1520,10 +1565,32 @@ class Folder(models.Model):
         dry_run=False,
         *,
         context=None,
+        component_wait_seconds=None,
+        component_wait_budget=None,
     ):
         """Paged mode (AD-14): the scan keys plus the four ingest counters.
 
         A thin rebuilder since story 2.8, like ``scan``.
+
+        ``component_wait_seconds`` is the ENTRY POINT's bound on how long
+        a multi-component import may wait for its extra components to
+        land (``Clip.import_file``), and ``component_wait_budget`` is the
+        DURATION all of this call's component waits share, which each
+        per-clip bound is clamped against — without it a 50-clip folder
+        ingested over REST would hold a request thread for 50 x the
+        per-clip bound.
+
+        A DURATION, not a deadline, and that distinction is load
+        bearing: this method runs a full SCAN PASS before it ingests
+        anything, so a deadline opened by the caller would already have
+        been eaten by discovery on a large healthy folder, leaving every
+        multi-component clip a 0 s bound. ``_ingest_pass`` turns it into
+        a deadline at the start of the INGEST leg.
+
+        Both are passed straight down as parameters (see
+        ``_folder_worker``); neither is stored on the folder, and neither
+        is a ``RunOptions`` field. ``None``/``None`` is the scan's
+        generous default.
         """
         if context is None:
             # Paged mode: build the default context HERE so it carries this
@@ -1552,10 +1619,22 @@ class Folder(models.Model):
                 cursor=cursor,
                 count_only=False,
                 ingest=True,
+                component_wait_seconds=component_wait_seconds,
+                component_wait_budget=component_wait_budget,
             )
         )
 
-    def _ingest_pass(self, context, *, first, number, cursor, timer):
+    def _ingest_pass(
+        self,
+        context,
+        *,
+        first,
+        number,
+        cursor,
+        timer,
+        component_wait_seconds=None,
+        component_wait_budget=None,
+    ):
         """The scan pipeline plus the 2.5 ladder and the submission leg.
 
         A passed context's options are authoritative — see ``_scan_pass``.
@@ -1583,6 +1662,19 @@ class Folder(models.Model):
         # deliberately — it is what a dry run's ingest phase CONSISTS of,
         # and a rehearsal reporting 0.0s would be lying about its cost.
         with timer("ingest"):
+            # THE COMPONENT-WAIT DEADLINE IS OPENED HERE, not by the
+            # caller. `_scan_pass` above is a full discovery pass, and on
+            # a large healthy folder it can take longer than the whole
+            # budget — a deadline opened in `views.py` would already have
+            # expired by the time the first clip is imported, handing
+            # every multi-component clip a 0 s bound and calling that a
+            # wedged Vidispine. The entry point owns the DURATION; the
+            # ingest leg owns when it starts.
+            component_wait_deadline = (
+                None
+                if component_wait_budget is None
+                else time.monotonic() + component_wait_budget
+            )
             # The ladder (AD-15): decide who is worth a Vidispine call
             # BEFORE spending any. `has_hash` comes from the scan-cached
             # file only — Clip.file would buy one getFileById per clip.
@@ -1622,6 +1714,7 @@ class Folder(models.Model):
                     # The row exists: the scan's write unit wrote it before
                     # this point. Targeted update, not a full save (AD-6).
                     self.save(update_fields=["collection_id"])
+                failed_reasons = 0
                 for clip in to_ingest:
                     try:
                         result = clip.ingest(
@@ -1636,12 +1729,51 @@ class Folder(models.Model):
                             # skipped forever. This lifts THAT return only —
                             # an item holding real files is still skipped.
                             retry_incomplete=_incomplete_import(clip),
+                            # Per ENTRY POINT, not per run, and passed —
+                            # never read off `self`: `views.py` sets both,
+                            # the cron leaves both None. See
+                            # `_folder_worker` for why they are parameters.
+                            component_wait_seconds=component_wait_seconds,
+                            component_wait_deadline=component_wait_deadline,
                         )
                         for key, value in result.items():
                             if key not in response.keys():
                                 response[key] = 0
                             if value is True:
                                 response[key] += 1
+                        # THE ERROR CHANNEL. `response["errors"]` used to
+                        # be appended only in the `except` arm below, so a
+                        # clip that came back `{"failed": True}` without
+                        # raising contributed NOTHING to it: the run
+                        # printed "31 failed, 0 errors" and the operator's
+                        # report said nothing at all about why. `portal.log`
+                        # is not the operator's report (see the rule this
+                        # module states at the `_summarize_names` guard);
+                        # `Clip.error` is not either — it has no production
+                        # reader. THIS is the channel, and it is what
+                        # `_folder_worker` counts and the run summary
+                        # prints.
+                        #
+                        # Gated on the clip having RECORDED a reason: a
+                        # verdict with nothing to say (the pre-existing
+                        # FR-36 single-component "no job id" rung) keeps
+                        # its 2.5 behaviour rather than adding a line that
+                        # names no cause.
+                        #
+                        # CAPPED. A folder whose every clip fails the same
+                        # way — a wedged Vidispine is exactly that — would
+                        # otherwise put one line per clip into the report
+                        # and into the Slack message built from it. The
+                        # cap keeps the first `INGEST_ERROR_REPORT_CAP`
+                        # reasons, which are the ones that name the cause,
+                        # and closes with a count of what it did not
+                        # print, so the report is never silently short.
+                        if result.get("failed") and clip.error:
+                            failed_reasons += 1
+                            if failed_reasons <= INGEST_ERROR_REPORT_CAP:
+                                response["errors"].append(
+                                    f"Failed to ingest clip {clip}: {clip.error}"
+                                )
                     except Exception as e:
                         log.error(
                             f"Error ingesting clip {clip}: {e}",
@@ -1654,7 +1786,23 @@ class Folder(models.Model):
                         # unresolvable-item refusal (TapelessIngestException
                         # from create_item) lands here too, by design.
                         response["failed"] += 1
-                        response["errors"].append(f"Error ingesting clip {clip}: {e}")
+                        # The RAISING arm feeds the same counter and obeys
+                        # the same cap. It predates this story and was
+                        # uncapped, so a folder whose every clip raised
+                        # still flooded the report — and the two arms
+                        # counting separately would have let 2 x the cap
+                        # through.
+                        failed_reasons += 1
+                        if failed_reasons <= INGEST_ERROR_REPORT_CAP:
+                            response["errors"].append(
+                                f"Error ingesting clip {clip}: {e}"
+                            )
+                if failed_reasons > INGEST_ERROR_REPORT_CAP:
+                    response["errors"].append(
+                        f"{failed_reasons - INGEST_ERROR_REPORT_CAP} further "
+                        f"failed clip(s) in {self.path} reported the same way "
+                        f"and are not listed; see portal.log for each one"
+                    )
 
         return response
 

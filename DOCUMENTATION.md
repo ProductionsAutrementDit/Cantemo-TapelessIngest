@@ -166,6 +166,11 @@ Multi-file clips spanning across multiple media files.
 - **User Guide**: [USER_GUIDE.md](USER_GUIDE.md#spanned-clips)
 - **Provider Impl**: [PROVIDERS.md](PROVIDERS.md#spanned-clip-methods)
 
+### Multi-Component Import
+One item whose media is several files (span files, or a separate audio track); the ingest waits for the components to attach before importing the main file, and a failure leaves a resumable item.
+- **User Guide**: [USER_GUIDE.md](USER_GUIDE.md#multi-component-import)
+- **Provider Impl**: [PROVIDERS.md](PROVIDERS.md#the-main-files-own-video-component)
+
 ### Legacy Storage Migration
 Re-importing media from old storages using hash matching.
 - **Feature**: [README.md](README.md#legacy-storage-migration)

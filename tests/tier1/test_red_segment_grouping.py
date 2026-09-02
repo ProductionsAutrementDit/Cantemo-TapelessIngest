@@ -23,6 +23,7 @@ production clips anchored on a middle segment (``…_004.R3D``,
 neither layer does it.
 """
 
+import logging
 import re
 
 import pytest
@@ -38,6 +39,11 @@ from portal.plugins.TapelessIngest.models.clip import (
     segment_stem,
     segmented_extensions,
     segmented_extensions_by_provider,
+)
+from portal.plugins.TapelessIngest.providers.providers import (
+    MAIN_FILE_YIELDS_VIDEO,
+    main_file_verdict_is_unknown,
+    yields_video_component,
 )
 from portal.plugins.TapelessIngest.providers.red import (
     CARD_SUBPATH_REGEXP,
@@ -645,3 +651,187 @@ def test_the_filter_stays_inside_the_index_evaluators_modelled_subset():
     index = DiscoveryIndex(STORAGE_ID, FOLDER, [])
 
     assert index.hits_for(FOLDER, [_red()]) == ([], 0)
+
+
+# --------------------------------------------------------------------------
+# The anchor's own essence: whether it fills a video slot
+# --------------------------------------------------------------------------
+#
+# `Clip._import_multi_component` declares up front how many components
+# the placeholder must expect, and Vidispine promotes the shape only when
+# every declared slot is filled. An `.R3D` whose start timecode carries
+# the flag REDline prints with `.` separators yields a binaryComponent
+# rather than a video one: it satisfies the CONTAINER slot and fills no
+# video slot, so a declaration that counts it as a video contributor
+# leaves the item holding all its media on a placeholder for ever (31
+# clips of the 2026 STARLUX shoot, measured 2026-08-29..2026-09-01).
+#
+# The condition is FORMAT knowledge, so it is answered HERE and never in
+# `models/clip.py`. The separator is treated as a SIGNAL, deliberately
+# not as drop-frame semantics: the same flag appears at 50 fps, where
+# drop-frame is not defined.
+
+
+_ABSENT = object()
+
+
+def _anchor_clip(timecode):
+    clip = _ClipDouble("K001_K005_0804OG_001.R3D", None, "K001_K005_0804OG")
+    clip.metadatas = {"clipname": "K001_K005_0804OG"}
+    if timecode is not _ABSENT:
+        clip.metadatas["timecode"] = timecode
+    return clip
+
+
+def test_a_colon_separated_timecode_anchors_a_video_component():
+    """The ordinary clip: unchanged, and it is the majority case."""
+    main_file = _red().getClipMainMediaFile(_anchor_clip("00:59:47:14"))
+
+    assert main_file[MAIN_FILE_YIELDS_VIDEO] is True
+    assert yields_video_component(main_file) is True
+
+
+def test_a_dot_separated_timecode_anchors_no_video_component():
+    """The 110/110 STARLUX case, and the whole of defect A.
+
+    Mutation killed: answering ``True`` unconditionally, which is
+    Codemill's ``video=len(extraFileIds['video']) + 1`` by another route.
+    """
+    main_file = _red().getClipMainMediaFile(_anchor_clip("00.48.41.06"))
+
+    assert main_file[MAIN_FILE_YIELDS_VIDEO] is False
+    assert yields_video_component(main_file) is False
+
+
+@pytest.mark.parametrize(
+    "timecode",
+    [
+        "",
+        None,
+        _ABSENT,
+        17,
+        "00.48.41",
+        "not a timecode",
+        # A PATH carries dots and is the reason the match is anchored end
+        # to end: a substring test would call this one non-deducible.
+        "A001_C001.R3D",
+        # A CONFORMING PREFIX with a trailing annotation. These are what
+        # make the anchoring `fullmatch` and not `match`: the prefix of
+        # each is a well-formed timecode of one of the two shapes, so
+        # `re.match` would read a verdict off a value this provider has
+        # never observed and cannot interpret — the dot one silently
+        # DROPPING the anchor's video slot on a guess.
+        "00.48.41.06 (df)",
+        "00:59:47:14 (df)",
+    ],
+)
+def test_an_unreadable_timecode_answers_unknown_and_warns(timecode, caplog):
+    """`Abs TC` is a REQUIRED column, so most of these are unreachable
+    through the scan — but "I could not tell" must be SAID, not guessed
+    (ruled 2026-09-02, spec D6): the dict carries an explicit ``None``,
+    which `main_file_verdict_is_unknown` reads and the multi-component
+    import refuses to declare on. The backward-compatible reader still
+    folds it into ``True`` for the callers that only need a count.
+
+    Mutation killed: answering ``True`` (the pre-2026-09-02 fallback —
+    the SILENT over-declaration); answering ``False`` (the loud 400, on
+    a guess); matching the separator as a SUBSTRING (`"." in timecode`),
+    which turns every one of these into a non-deducible anchor.
+    """
+    with caplog.at_level(logging.WARNING):
+        main_file = _red().getClipMainMediaFile(_anchor_clip(timecode))
+
+    assert MAIN_FILE_YIELDS_VIDEO in main_file
+    assert main_file[MAIN_FILE_YIELDS_VIDEO] is None
+    assert main_file_verdict_is_unknown(main_file) is True
+    assert yields_video_component(main_file) is True
+    assert any(
+        "unreadable timecode" in record.getMessage()
+        and "will be refused" in record.getMessage()
+        for record in caplog.records
+        if record.levelno >= logging.WARNING
+    )
+
+
+@pytest.mark.parametrize(
+    "timecode,yields_video",
+    [
+        (" 00.48.41.06", False),
+        ("00.48.41.06\t", False),
+        ("00:59:47:14 ", True),
+        (" 00:59:47:14", True),
+    ],
+)
+def test_a_timecode_padded_with_whitespace_is_still_read(
+    timecode, yields_video, caplog
+):
+    """REDline's CSV can carry surrounding whitespace, and the padding is
+    not evidence about anything.
+
+    Mutation killed: dropping `timecode = timecode.strip()`. A stray
+    space then sends BOTH shapes to the un-evidenced fallback, which
+    answers ``None`` — the multi-component import then refuses a clip
+    that was perfectly readable. The WARNING is asserted and not only
+    the verdict, because it is the fallback's only other trace.
+    """
+    with caplog.at_level(logging.DEBUG):
+        main_file = _red().getClipMainMediaFile(_anchor_clip(timecode))
+
+    assert main_file[MAIN_FILE_YIELDS_VIDEO] is yields_video
+    assert yields_video_component(main_file) is yields_video
+    # READ, not guessed: the fallback is the only arm that warns.
+    assert not [
+        record for record in caplog.records if record.levelno >= logging.WARNING
+    ]
+
+
+def test_a_provider_that_never_declares_the_key_still_counts_its_anchor():
+    """The default that keeps P2, XDCAM, Ikegami and `file` at today's count.
+
+    Mutation killed: defaulting the reader to ``False``, which
+    under-declares every other provider's budget by one video slot;
+    reading an ABSENT key as "unknown", which would refuse every other
+    provider's multi-component clip.
+    """
+    main_file = {"type": "video", "file_id": "VX-1"}
+
+    assert yields_video_component(main_file) is True
+    assert main_file_verdict_is_unknown(main_file) is False
+
+
+@pytest.mark.parametrize(
+    "main_file,unknown",
+    [
+        ({MAIN_FILE_YIELDS_VIDEO: None}, True),
+        ({MAIN_FILE_YIELDS_VIDEO: True}, False),
+        ({MAIN_FILE_YIELDS_VIDEO: False}, False),
+        # `0` and `""` are a provider taking a position, not declining to.
+        ({MAIN_FILE_YIELDS_VIDEO: 0}, False),
+        ({MAIN_FILE_YIELDS_VIDEO: ""}, False),
+        ({}, False),
+        (None, False),
+    ],
+)
+def test_only_an_explicit_none_is_an_unknown_verdict(main_file, unknown):
+    """The refusal reads the RAW value: absent and falsy are positions,
+    ``None`` alone is "could not tell".
+
+    Mutation killed: `not main_file.get(KEY, True)` (refuses False —
+    every non-deducible RED anchor); `main_file.get(KEY) is None`
+    (refuses an absent key — every other provider).
+    """
+    assert main_file_verdict_is_unknown(main_file) is unknown
+
+
+@pytest.mark.parametrize("declared", [None, 0, "", "no"])
+def test_the_reader_coerces_whatever_a_provider_put_in_the_dict(declared):
+    """A non-boolean must not crash an import, and an explicit ``None``
+    ("the provider could not tell") reads as the safe default."""
+    main_file = {"type": "video", MAIN_FILE_YIELDS_VIDEO: declared}
+
+    assert yields_video_component(main_file) is (declared is None or bool(declared))
+
+
+def test_the_reader_survives_a_main_file_that_is_not_a_mapping():
+    """`getClipMainMediaFile` may answer ``None`` (the base hook does)."""
+    assert yields_video_component(None) is True
