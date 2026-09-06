@@ -82,3 +82,24 @@ def test_views_calls_only_methods_clips_really_have():
     assert "persist_metadatas" in called, called
     missing = [name for name in called if not hasattr(Clip, name)]
     assert not missing, f"views.py calls Clip methods that do not exist: {missing}"
+
+
+def test_every_shipped_provider_name_resolves_to_a_readable_module():
+    """The gate's providers digest degrades SILENTLY when it does not.
+
+    `providers/audio_files.py` declares `machine_name = "audio_file"`, so
+    the dotted path built from a machine_name is not always importable.
+    Where it is not, `module_versions` books an "unavailable" under a
+    group that still claims to cover it — "a narrow digest under a broad
+    name is worse than no digest".
+
+    Tier 1: this needs no DB, no tree and no index, only an import.
+    """
+    from portal.plugins.TapelessIngest.management.commands import (
+        verify_discovery_equivalence,
+    )
+    from portal.plugins.TapelessIngest.providers import PROVIDER_NAMES
+
+    for name in PROVIDER_NAMES:
+        label = verify_discovery_equivalence.provider_module(name)
+        assert verify_discovery_equivalence.read_module_source(label), label

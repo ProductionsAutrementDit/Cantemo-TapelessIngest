@@ -1884,9 +1884,13 @@ class Folder(models.Model):
                     f"Index discovery failed to prefetch {self.path} on "
                     f"storage {self.storage_id}: {e}"
                 ) from e
-            # portal.log, deliberately NOT `emit`: the equivalence gate
-            # compares the two modes' emitted lines, so index discovery
-            # must not add one of its own to the operator's report.
+            # portal.log, deliberately NOT `emit`: story 4.1's own
+            # composition test compares the two modes' EMITTED LINES
+            # (tests/tier2/test_index_discovery_equivalence.py), so index
+            # discovery must not add one of its own to the operator's
+            # report. Note this is NOT what the FR-4 gate compares — the
+            # story-4.2 harness compares AD-2 tuple SETS and puts
+            # counters, timings and log lines outside the relation.
             log.info(
                 "Index discovery: prefetched %d files in %d folders under %s "
                 "(page size %d)",

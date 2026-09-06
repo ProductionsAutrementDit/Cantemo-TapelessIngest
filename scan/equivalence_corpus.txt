@@ -47,4 +47,4 @@
 # times (legacy, legacy, index). Size the corpus to the maintenance
 # window accordingly.
 
-VX-41 | 2026 | Seed entry: the 2026 shoot tree, which contains the 2026-08-27 manual dry-run precedent (2026/AA_20260804_A350_STARLUX_SHOTOVER -- 71 folders, 244 clips, 42 RED cards, both modes identical by hand). Named at the PARENT because a scan root is never itself scanned. Ratification should decide whether the whole year is the right scope for a maintenance window or whether it needs narrowing to a named set of shoots' parents.
+VX-41 | 2026/AA_20260804_A350_STARLUX_SHOTOVER | Seed entry: the shoot the 2026-08-27 manual dry run covered by hand (71 folders, 244 clips, 42 RED cards, both modes identical). Named at the SHOOT, not at 2026: a scan root is never itself scanned, so this gates the 71 folders BELOW it -- exactly the population the manual precedent covered. Naming 2026 instead would gate every shoot of the year, three walks each, which is a maintenance-window run and a separate ratification decision. Ratification should confirm this shoot still exists on VX-41 and decide whether a second shoot with different card shapes is owed before the flip.

@@ -128,6 +128,13 @@ _SINGLE_FIELD_CLASSES = {
 DOCUMENT_REPORT_LIMIT = 50
 CONSOLE_REPORT_LIMIT = 10
 
+# E4: `emit` once per ENTRY is one line at the very END of a three-walk
+# pass over a shoot tree. The shipped corpus holds a single entry, so
+# that is total silence for the whole run — the slow-vs-hung ambiguity
+# the hook exists to prevent. Progress is therefore also emitted from
+# inside the walk, every this-many folders.
+PROGRESS_EVERY = 100
+
 
 class EquivalenceError(Exception):
     """The harness refuses to run, or cannot read the AD-2 tuple."""
@@ -167,9 +174,16 @@ def _segments_match(pattern, value) -> bool:
         return not value
     head = pattern[0]
     if head == "**":
-        if _segments_match(pattern[1:], value):
-            return True
-        return bool(value) and _segments_match(pattern, value[1:])
+        # `**` covers everything BELOW, so it consumes at least ONE
+        # segment. Letting it match zero made `2026/AA_x/**` — written to
+        # waive a shoot's card subtree — also cover the shoot folder
+        # itself, which is more than the line says and is the one thing
+        # an append-only waiver list must not do.
+        if not value:
+            return False
+        return _segments_match(pattern[1:], value[1:]) or _segments_match(
+            pattern, value[1:]
+        )
     if not value:
         return False
     if not fnmatch.fnmatchcase(value[0], head):
@@ -293,8 +307,14 @@ class Corpus:
 
 
 def normalize_corpus_path(path) -> str:
-    """Collapse ``//`` and a trailing separator, the way discovery does."""
-    return "/".join(part for part in str(path).split("/") if part)
+    """Collapse ``//``, a trailing separator and ``.``, as discovery does.
+
+    ``.`` has to go for the same reason ``..`` is refused outright: the
+    duplicate and nesting guards compare SEGMENT lists, so ``2026/./AA``
+    would not be recognised as the same subtree as ``2026/AA`` and the
+    corpus would scan it twice, double-weighting it in the verdict.
+    """
+    return "/".join(part for part in str(path).split("/") if part and part != ".")
 
 
 def load_corpus(text, *, source="<string>") -> Corpus:
@@ -312,6 +332,7 @@ def load_corpus(text, *, source="<string>") -> Corpus:
     """
     entries = []
     seen = {}
+    seen_directives = {}
     ratified = False
     ratification_note = ""
     for lineno, kind, payload in _rows(text):
@@ -323,6 +344,15 @@ def load_corpus(text, *, source="<string>") -> Corpus:
                     f"('#! name: value'), not a comment"
                 )
             name, value = match.group(1).lower(), match.group(2).strip()
+            if name in seen_directives:
+                # Last-wins would let a `ratified: no` at the top be
+                # quietly overridden further down the file, which is the
+                # one directive nobody may flip by accident.
+                raise CorpusError(
+                    f"{source}:{lineno}: {name!r} is already set at line "
+                    f"{seen_directives[name]}; a directive may appear once"
+                )
+            seen_directives[name] = lineno
             if name == "ratified":
                 if value.lower() not in ("yes", "no"):
                     raise CorpusError(
@@ -489,6 +519,13 @@ def load_waivers(text, *, source="<string>") -> Tuple[Waiver, ...]:
                     f"to match anything, so that a blanket waiver is written "
                     f"down as one"
                 )
+        if side == SIDE_ANY and folder == "*" and file_glob == "*" and provider == "*":
+            raise WaiverError(
+                f"{source}:{lineno}: this row waives EVERY divergence on "
+                f"every side, which makes the gate unable to fail; a waiver "
+                f"names the condition it suppresses (AD-2: one entry per "
+                f"Feature-G fix)"
+            )
         waivers.append(
             Waiver(
                 fr=fr,
@@ -528,6 +565,17 @@ def _required_field(value, what, where):
     if value is None:
         raise EquivalenceError(
             f"{where}: {what} is None, so its AD-2 tuple is unreadable"
+        )
+    if isinstance(value, (bool, int, float)):
+        # The same defect class one level down: `str(0)` and the string
+        # `"0"` compare EQUAL, so a numeric field on one path and a
+        # textual one on the other would certify agreement. `umid` may
+        # legitimately arrive as a UUID, which is why non-str is coerced
+        # at all — but never a number.
+        raise EquivalenceError(
+            f"{where}: {what} is a {type(value).__name__} ({value!r}); an "
+            f"AD-2 field is textual, and coercing a number here would let "
+            f"0 and '0' compare equal"
         )
     if not isinstance(value, str):
         value = str(value)
@@ -601,8 +649,9 @@ class TupleCollector:
     reproducible.
     """
 
-    def __init__(self, process_folder):
+    def __init__(self, process_folder, progress=None):
         self._process_folder = process_folder
+        self._progress = progress
         self.tuples = set()
         self.folder_paths = set()
         self.calls = 0
@@ -612,12 +661,17 @@ class TupleCollector:
         outcome = self._process_folder(*args, **kwargs)
         self.calls += 1
         result = outcome.result
-        self.folder_paths.add(result.folder_path)
         # All-or-nothing: built into a local list first, so a refusal
         # halfway through leaves the shared set untouched and the folder
-        # is booked as failed rather than as partially agreeing.
+        # is booked as failed rather than as partially agreeing. The
+        # FOLDER set is written after the same gate — a folder whose
+        # tuples could not be read must not turn up in `folder_paths`
+        # and take part in the descent comparison.
         found = [ad2_tuple(clip, result.folder_path) for clip in result.clips]
         self.tuples.update(found)
+        self.folder_paths.add(result.folder_path)
+        if self._progress is not None and self.calls % PROGRESS_EVERY == 0:
+            self._progress(self.calls)
         return outcome
 
 
@@ -734,12 +788,34 @@ def _capped(values, limit=DOCUMENT_REPORT_LIMIT):
     return values[:limit] + [f"... {len(values) - limit} more not shown"]
 
 
+def _capped_objects(values, render, limit=DOCUMENT_REPORT_LIMIT):
+    """The same bound over dataclasses, and it states its omission too.
+
+    The five divergence lists used a bare slice, so the canonical
+    document — the contract — truncated silently while `errors` and
+    `failed_folders` beside them said what they dropped. A reader could
+    only infer it by cross-checking `counts`, and AC 1 asks the verdict
+    to name every divergence.
+    """
+    values = list(values)
+    payload = [render(value) for value in values[:limit]]
+    if len(values) > limit:
+        payload.append(
+            {
+                "omitted": len(values) - limit,
+                "note": f"... {len(values) - limit} more not shown; see counts",
+            }
+        )
+    return payload
+
+
 def build_path_runner(
     *,
     context_for,
     process_folder,
     query_elastic,
     clock=time.monotonic,
+    emit=None,
 ) -> Callable[[CorpusEntry, str], PathRun]:
     """``(entry, mode) -> PathRun``: one whole subtree, one discovery path.
 
@@ -761,8 +837,22 @@ def build_path_runner(
       entry would come back with two empty sets that compare equal.
     """
 
+    def _folder_progress(entry, mode):
+        if emit is None:
+            return None
+
+        def progress(folder_count):
+            emit(
+                f"  {entry.storage_id} {entry.path} [{mode}]: "
+                f"{folder_count} folders walked"
+            )
+
+        return progress
+
     def run(entry: CorpusEntry, mode: str) -> PathRun:
         ctx = context_for(entry, mode)
+        if emit is not None:
+            emit(f"  {entry.storage_id} {entry.path} [{mode}]: starting")
         if ctx.options.discovery != mode:
             raise EquivalenceError(
                 f"the context built for {mode!r} reports "
@@ -770,7 +860,7 @@ def build_path_runner(
             )
         if not ctx.options.dry_run:
             raise EquivalenceError(
-                "the equivalence harness refuses a context whose dry_run is " "not set"
+                "the equivalence harness refuses a context whose dry_run " "is not set"
             )
         absolute = ctx.absolute_path_for(entry.storage_id, entry.path)
         if not absolute or not os.path.isdir(absolute):
@@ -786,8 +876,24 @@ def build_path_runner(
                 entry.path,
                 page_size=ctx.options.discovery_page_size,
             )
+            if not index.hit_count:
+                # A third clean-looking empty run. An index outage or a
+                # missing mapping returns zero hits over a tree that is
+                # demonstrably there (the isdir guard above just passed),
+                # and every legacy tuple would then become an
+                # `absent_from_index` divergence — the gate REJECTED for
+                # an instrument fault. Refuse instead: `compare_entry`
+                # books it as `errored`, which says "could not run".
+                raise EquivalenceError(
+                    f"index discovery prefetched 0 hits under "
+                    f"{entry.storage_id} {entry.path}, a tree that exists on "
+                    f"disk; that is an index fault, not evidence about "
+                    f"discovery"
+                )
             ctx = dataclass_replace(ctx, discovery_index=index)
-        collector = TupleCollector(process_folder)
+        collector = TupleCollector(
+            process_folder, progress=_folder_progress(entry, mode)
+        )
         dispatcher = SequentialDispatcher()
         started = clock()
         outcomes = walk_tree(
@@ -914,7 +1020,15 @@ class Divergence:
             ]
         )
 
-    def as_dict(self) -> Dict[str, Any]:
+    def as_dict(self, *, waivable=True) -> Dict[str, Any]:
+        """``waivable=False`` for a divergence nobody may sign off.
+
+        A reference self-divergence is an INSTRUMENT FAULT and a withheld
+        one was never established, so printing a ready-to-ratify line
+        beside either is an invitation to permanently suppress a
+        difference the run did not prove. Only a charged gate-side
+        divergence carries a proposal.
+        """
         return {
             "side": self.side,
             "classification": self.classification,
@@ -925,7 +1039,9 @@ class Divergence:
                 if self.counterpart is not None
                 else None
             ),
-            "proposed_waiver": self.proposed_waiver(),
+            "proposed_waiver": (
+                self.proposed_waiver() if waivable and self.side in GATE_SIDES else None
+            ),
         }
 
 
@@ -1065,11 +1181,17 @@ class EntryVerdict:
     reference_second: Optional[PathRun] = None
     index: Optional[PathRun] = None
     reference_self_divergences: Tuple[Divergence, ...] = ()
+    reference_folder_self_divergences: Tuple[FolderDivergence, ...] = ()
     reference_error_divergences: Tuple[str, ...] = ()
     divergences: Tuple[Divergence, ...] = ()
     folder_divergences: Tuple[FolderDivergence, ...] = ()
     suppressed: Tuple[Tuple[Divergence, Waiver], ...] = ()
     withheld_divergences: Tuple[Divergence, ...] = ()
+    withheld_folder_divergences: Tuple[FolderDivergence, ...] = ()
+    # The folders whose reference reading moved between the two legacy
+    # runs. Everything under them is withheld; the rest of the entry
+    # still concludes, which is what the frozen block asks for.
+    withheld_folders: Tuple[str, ...] = ()
     error: Optional[str] = None
     elapsed: float = 0.0
 
@@ -1099,7 +1221,12 @@ class EntryVerdict:
             "folder_divergences": len(self.folder_divergences),
             "suppressed": len(self.suppressed),
             "withheld": len(self.withheld_divergences),
+            "withheld_folder_divergences": len(self.withheld_folder_divergences),
+            "withheld_folders": len(self.withheld_folders),
             "reference_self_divergences": len(self.reference_self_divergences),
+            "reference_folder_self_divergences": len(
+                self.reference_folder_self_divergences
+            ),
             "failed_folders": len(
                 set(f for run in self.runs for f in run.failed_folders)
             ),
@@ -1113,26 +1240,34 @@ class EntryVerdict:
             "note": self.entry.note,
             "status": self.status,
             "counts": self.counts(),
-            "reference_self_divergences": [
-                d.as_dict()
-                for d in self.reference_self_divergences[:DOCUMENT_REPORT_LIMIT]
-            ],
+            "reference_self_divergences": _capped_objects(
+                self.reference_self_divergences,
+                lambda d: d.as_dict(waivable=False),
+            ),
+            "reference_folder_self_divergences": _capped_objects(
+                self.reference_folder_self_divergences, lambda d: d.as_dict()
+            ),
             "reference_error_divergences": _capped(
                 sorted(self.reference_error_divergences)
             ),
-            "divergences": [
-                d.as_dict() for d in self.divergences[:DOCUMENT_REPORT_LIMIT]
-            ],
-            "folder_divergences": [
-                d.as_dict() for d in self.folder_divergences[:DOCUMENT_REPORT_LIMIT]
-            ],
-            "suppressed": [
-                {"divergence": d.as_dict(), "waiver": w.as_dict()}
-                for d, w in self.suppressed[:DOCUMENT_REPORT_LIMIT]
-            ],
-            "withheld_divergences": [
-                d.as_dict() for d in self.withheld_divergences[:DOCUMENT_REPORT_LIMIT]
-            ],
+            "divergences": _capped_objects(self.divergences, lambda d: d.as_dict()),
+            "folder_divergences": _capped_objects(
+                self.folder_divergences, lambda d: d.as_dict()
+            ),
+            "suppressed": _capped_objects(
+                self.suppressed,
+                lambda pair: {
+                    "divergence": pair[0].as_dict(),
+                    "waiver": pair[1].as_dict(),
+                },
+            ),
+            "withheld_divergences": _capped_objects(
+                self.withheld_divergences, lambda d: d.as_dict(waivable=False)
+            ),
+            "withheld_folder_divergences": _capped_objects(
+                self.withheld_folder_divergences, lambda d: d.as_dict()
+            ),
+            "withheld_folders": _capped(sorted(self.withheld_folders)),
             "errors": _capped(sorted(set(e for run in self.runs for e in run.errors))),
             "failed_folders": _capped(
                 sorted(set(f for run in self.runs for f in run.failed_folders))
@@ -1169,12 +1304,21 @@ class Verdict:
         for entry in self.entries:
             counts[entry.status] += 1
         counts["entries"] = len(self.entries)
+        # CHARGED only. Withheld divergences used to be summed into
+        # `folder_divergences`, which the command quotes in its REJECTED
+        # message and the console prints as the failure headline — a
+        # number describing what the run REFUSED to conclude, presented
+        # as what it found.
         counts["divergences"] = sum(len(e.divergences) for e in self.entries)
         counts["folder_divergences"] = sum(
             len(e.folder_divergences) for e in self.entries
         )
         counts["suppressed"] = sum(len(e.suppressed) for e in self.entries)
         counts["withheld"] = sum(len(e.withheld_divergences) for e in self.entries)
+        counts["withheld_folder_divergences"] = sum(
+            len(e.withheld_folder_divergences) for e in self.entries
+        )
+        counts["withheld_folders"] = sum(len(e.withheld_folders) for e in self.entries)
         counts["unmatched_waivers"] = len(self.unmatched_waivers)
         return counts
 
@@ -1212,13 +1356,21 @@ class Verdict:
         return payload
 
 
-def _apply_waivers(divergences, waivers, used):
+def _apply_waivers(divergences, waivers, used, *, suppress=True):
     """Split into charged and suppressed, marking EVERY matching waiver.
 
     Suppression stops at the first match (one attribution per
     divergence), but usage does not: an overlapping narrower waiver that
     also covers the divergence is doing its job, and reporting it as
     "matched nothing" would send a human to delete it.
+
+    ``suppress=False`` marks usage and suppresses NOTHING. It is how a
+    WITHHELD divergence is handled (RULED 2026-09-04): the run never
+    established that difference, so a waiver must not be able to delete
+    it from the document — the verdict would then claim a suppression for
+    something it did not prove, while `as_dict(waivable=False)` refuses
+    to even propose a waiver for it. The waiver is still marked used,
+    because the condition it describes WAS observed.
     """
     charged = []
     suppressed = []
@@ -1230,11 +1382,45 @@ def _apply_waivers(divergences, waivers, used):
         ]
         for position in matched:
             used[position] = True
-        if matched:
+        if matched and suppress:
             suppressed.append((divergence, waivers[matched[0]]))
         else:
             charged.append(divergence)
     return tuple(charged), tuple(suppressed)
+
+
+def unstable_folders(tuple_self_divergences, folder_self_divergences):
+    """The folders whose reference reading moved between the two runs.
+
+    A tuple that appeared in one legacy run and not the other taints its
+    OWNING folder; a folder walked by one run and not the other taints
+    that folder. Each taint carries down its own subtree (``_is_under``)
+    and no further.
+
+    Deliberately NOT the parent. Tainting the parent of a folder whose
+    descent drifted would take its whole sibling set with it — one flaky
+    card would withhold the entire shoot, which is the all-or-nothing
+    behaviour per-folder withholding exists to end. The parent's own
+    reading is covered by the tuple self-comparison: if ITS file list
+    drifted, that shows up as a tuple self-divergence owned by it.
+    """
+    folders = set()
+    for divergence in tuple_self_divergences:
+        folders.add(divergence.owning_folder_path)
+    for divergence in folder_self_divergences:
+        folders.add(divergence.folder_path)
+    return frozenset(folders)
+
+
+def _is_under(path, folders):
+    """Is ``path`` one of ``folders``, or below one of them?"""
+    if path in folders:
+        return True
+    parts = path.split("/")
+    for depth in range(1, len(parts)):
+        if "/".join(parts[:depth]) in folders:
+            return True
+    return False
 
 
 def compare_entry(entry, run_path, *, waivers=(), used=None, clock=time.monotonic):
@@ -1263,14 +1449,25 @@ def compare_entry(entry, run_path, *, waivers=(), used=None, clock=time.monotoni
     """
     used = [False] * len(waivers) if used is None else used
     started = clock()
+    reference = reference_second = index = None
     try:
         reference = run_path(entry, DISCOVERY_LEGACY)
         reference_second = run_path(entry, DISCOVERY_LEGACY)
         index = run_path(entry, DISCOVERY_INDEX)
     except Exception as e:
+        # Each run is bound as it succeeds. Assigning all three at once
+        # meant a failure on the THIRD walk discarded the two that had
+        # completed: the verdict then carried no counts, no errors and no
+        # failed folders for them, which is exactly the material a human
+        # needs to see why the entry could not conclude.
         return EntryVerdict(
             entry=entry,
             status=ENTRY_ERRORED,
+            reference=None if reference is None else reference.stripped(),
+            reference_second=(
+                None if reference_second is None else reference_second.stripped()
+            ),
+            index=None if index is None else index.stripped(),
             error=f"{type(e).__name__}: {e}",
             elapsed=clock() - started,
         )
@@ -1314,6 +1511,21 @@ def compare_entry(entry, run_path, *, waivers=(), used=None, clock=time.monotoni
         left_absent_class=CLASS_ABSENT_FROM_LEGACY,
         right_absent_class=CLASS_ABSENT_FROM_LEGACY,
     )
+    # And it must agree with itself about which FOLDERS it walked. This
+    # was the hole: legacy's unsorted `from`/`size` paging perturbs
+    # `hits`, `hits` decides `consumed_subdirs`, and `consumed_subdirs`
+    # decides the descent — so the reference can disagree with itself
+    # about the folder set while its tuples happen to survive. The
+    # difference was then compared against the INDEX path and charged to
+    # it as an unwaivable folder divergence, rejecting the gate for an
+    # instrument fault. The module claims that cannot happen
+    # structurally; now it cannot.
+    reference_folder_self_divergences = compare_folder_sets(
+        reference.folder_paths,
+        reference_second.folder_paths,
+        left_side=SIDE_REFERENCE_FIRST_ONLY,
+        right_side=SIDE_REFERENCE_SECOND_ONLY,
+    )
     # Two identical runs of the same path must also report the same
     # errors. A difference there means the instrument moved between the
     # two readings even where the tuples happened to survive it.
@@ -1322,35 +1534,60 @@ def compare_entry(entry, run_path, *, waivers=(), used=None, clock=time.monotoni
     )
     divergences = compare_tuple_sets(reference.tuples, index.tuples)
     folder_divergences = compare_folder_sets(reference.folder_paths, index.folder_paths)
-    # Waivers are matched against every divergence, withheld ones
-    # included: a waiver is "used" when the condition it describes was
-    # OBSERVED. Reporting a waiver as stale because the folder it covers
-    # happened to have an unstable reference this run would send a human
-    # to delete a waiver that is doing its job.
-    charged, suppressed = _apply_waivers(divergences, waivers, used)
-    if self_divergences or reference_error_divergences:
-        return EntryVerdict(
-            entry=entry,
-            status=ENTRY_UNSTABLE_REFERENCE,
-            reference=reference.stripped(),
-            reference_second=reference_second.stripped(),
-            index=index.stripped(),
-            reference_self_divergences=self_divergences,
-            reference_error_divergences=reference_error_divergences,
-            suppressed=suppressed,
-            withheld_divergences=charged,
-            folder_divergences=folder_divergences,
-            elapsed=clock() - started,
-        )
+    # Instability is withheld PER FOLDER, which is what the frozen block
+    # asks for: it "invalidates the run's verdict for the affected
+    # FOLDERS rather than the whole corpus". An error-set difference is
+    # the exception — an error string carries no folder, so nothing can
+    # be attributed and the whole entry is withheld.
+    entry_wide = bool(reference_error_divergences)
+    tainted = unstable_folders(self_divergences, reference_folder_self_divergences)
+
+    def withheld_for(path):
+        return entry_wide or _is_under(path, tainted)
+
+    # The split comes BEFORE the waivers (RULED 2026-09-04). Applying
+    # them first let a waiver delete a withheld divergence outright and
+    # book it as a suppression — the verdict claiming to have signed off
+    # a difference it explicitly refused to establish.
+    withheld = tuple(d for d in divergences if withheld_for(d.owning_folder_path))
+    chargeable = tuple(d for d in divergences if not withheld_for(d.owning_folder_path))
+    charged, suppressed = _apply_waivers(chargeable, waivers, used)
+    # Usage only: a waiver whose condition was observed inside an
+    # unstable folder is not stale, and must not be reported as such.
+    _apply_waivers(withheld, waivers, used, suppress=False)
+    charged_folders = tuple(
+        d for d in folder_divergences if not withheld_for(d.folder_path)
+    )
+    withheld_folder_divergences = tuple(
+        d for d in folder_divergences if withheld_for(d.folder_path)
+    )
+    concluded = [
+        folder for folder in reference.folder_paths if not withheld_for(folder)
+    ]
+
+    if not concluded:
+        # Nothing in this entry survived the withholding, so the entry
+        # itself proved nothing.
+        status = ENTRY_UNSTABLE_REFERENCE
+    elif charged or charged_folders:
+        status = ENTRY_DIVERGED
+    else:
+        status = ENTRY_AGREED
     return EntryVerdict(
         entry=entry,
-        status=(ENTRY_DIVERGED if (charged or folder_divergences) else ENTRY_AGREED),
+        status=status,
         reference=reference.stripped(),
         reference_second=reference_second.stripped(),
         index=index.stripped(),
+        reference_self_divergences=self_divergences,
+        reference_folder_self_divergences=reference_folder_self_divergences,
+        reference_error_divergences=reference_error_divergences,
         divergences=charged,
-        folder_divergences=folder_divergences,
+        folder_divergences=charged_folders,
         suppressed=suppressed,
+        withheld_divergences=withheld,
+        withheld_folder_divergences=withheld_folder_divergences,
+        withheld_folders=tuple(sorted(tainted)),
         elapsed=clock() - started,
     )
 
@@ -1370,18 +1607,28 @@ def verdict_status(entries) -> str:
     folder at 100 hits and production has folders far above that, so
     instability is the expected steady state — a mechanism that escalated
     it to the whole run would permanently block the very flip it exists
-    to make safe. A run therefore stays ``accepted`` when the entries
-    that DID conclude all agreed, with the withheld count stated beside
-    it; it becomes ``unstable_reference`` only when NOTHING concluded.
+    to make safe.
+
+    ``errored`` is treated the SAME way, and that is a change: it used to
+    be checked before "did anything conclude", so nineteen agreements
+    plus one archived-away path exited 3 while nineteen agreements plus
+    one unstable entry exited 0. Both are "part of the corpus proved
+    nothing", and a legitimately media-free subtree made the gate
+    permanently red with no way out short of editing the corpus. A run
+    stays ``accepted`` when the entries that DID conclude all agreed,
+    with the errored and withheld counts stated beside it; it becomes
+    ``errored`` — not ``unstable_reference`` — when nothing concluded and
+    something was broken, because a corpus typo and a flaky reference
+    must still not look alike to CI.
     """
     statuses = [entry.status for entry in entries]
     if ENTRY_DIVERGED in statuses:
         return STATUS_REJECTED
+    if ENTRY_AGREED in statuses:
+        return STATUS_ACCEPTED
     if ENTRY_ERRORED in statuses:
         return STATUS_ERRORED
-    if ENTRY_AGREED not in statuses:
-        return STATUS_UNSTABLE_REFERENCE
-    return STATUS_ACCEPTED
+    return STATUS_UNSTABLE_REFERENCE
 
 
 def run_equivalence(
@@ -1424,7 +1671,8 @@ def run_equivalence(
                 f"{entry.storage_id} {entry.path}: {verdict_entry.status} "
                 f"(reference {counts['reference_tuples']} tuple(s), index "
                 f"{counts['index_tuples']}, {counts['divergences']} "
-                f"divergence(s))"
+                f"divergence(s) charged, {counts['withheld']} withheld over "
+                f"{counts['withheld_folders']} unstable folder(s))"
             )
     entries = tuple(entries)
     elapsed = clock() - started
@@ -1538,12 +1786,23 @@ def render_verdict(verdict) -> Sequence[str]:
         f"{totals['entries']} entr(ies), "
         f"ratified={'yes' if verdict.corpus.ratified else 'no'}"
     )
+    if verdict.corpus.ratification_note:
+        lines.append(f"ratification-note: {verdict.corpus.ratification_note}")
     for name, value in sorted((verdict.scope or {}).items()):
         lines.append(f"scope[{name}]: {value}")
     for name, value in sorted((verdict.discovery_versions or {}).items()):
         if isinstance(value, dict):
             covers = ", ".join(value.get("covers", ()))
             lines.append(f"discovery[{name}]: {value.get('digest')} covers {covers}")
+            # A digest over SOME of what the group claims looks perfectly
+            # legitimate; the JSON said so and the console did not.
+            unavailable = value.get("unavailable")
+            if unavailable:
+                lines.append(
+                    f"  WARNING: {name} could not read "
+                    f"{', '.join(unavailable)} — this digest covers LESS "
+                    f"than it claims"
+                )
         else:
             lines.append(f"discovery[{name}]: {value}")
     lines.append(
@@ -1553,9 +1812,11 @@ def render_verdict(verdict) -> Sequence[str]:
     )
     lines.append(
         f"divergences {totals['divergences']} charged, "
-        f"{totals['folder_divergences']} folder-set, "
+        f"{totals['folder_divergences']} folder-set charged, "
         f"{totals['suppressed']} suppressed by waiver, "
-        f"{totals['withheld']} withheld (unstable reference)"
+        f"{totals['withheld']} withheld + "
+        f"{totals['withheld_folder_divergences']} folder-set withheld over "
+        f"{totals['withheld_folders']} unstable folder(s)"
     )
     for entry in verdict.entries:
         counts = entry.counts()
@@ -1588,8 +1849,21 @@ def render_verdict(verdict) -> Sequence[str]:
         )
         _render_capped(
             lines,
+            (
+                f"[{d.side}] {d.folder_path}"
+                for d in entry.reference_folder_self_divergences
+            ),
+            "      reference self-divergence, folder walked once ",
+        )
+        _render_capped(
+            lines,
             entry.reference_error_divergences,
             "      reference error-divergence: ",
+        )
+        _render_capped(
+            lines,
+            entry.withheld_folders,
+            "      WITHHELD folder (unstable reference): ",
         )
         _render_capped(
             lines,
@@ -1599,10 +1873,27 @@ def render_verdict(verdict) -> Sequence[str]:
         _render_capped(
             lines,
             (
+                f"WITHHELD [{d.side}] {d.folder_path}"
+                for d in entry.withheld_folder_divergences
+            ),
+            "      ",
+        )
+        _render_capped(
+            lines,
+            (
                 f"WITHHELD [{d.side}/{d.classification}] {d.verified_file_path}"
                 for d in entry.withheld_divergences
             ),
             "      ",
+        )
+        _render_capped(
+            lines,
+            (
+                f"[{d.side}/{d.classification}] {d.verified_file_path} "
+                f"<- waiver line {w.lineno} ({w.fr})"
+                for d, w in entry.suppressed
+            ),
+            "      suppressed by waiver: ",
         )
         shown = entry.divergences[:CONSOLE_REPORT_LIMIT]
         for divergence in shown:

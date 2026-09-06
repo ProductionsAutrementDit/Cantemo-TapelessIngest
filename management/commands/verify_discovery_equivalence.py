@@ -34,6 +34,8 @@ import importlib
 import inspect
 import json
 import logging
+import os
+import tempfile
 
 from django.core.management.base import BaseCommand, CommandError
 
@@ -78,6 +80,9 @@ PLUGIN = "portal.plugins.TapelessIngest"
 #   providers  the registry actually used by THIS run, resolved from
 #            `--providers` rather than assumed, since three of the
 #            tuple's five fields come out of them.
+#   instrument the harness itself. A change to the comparison logic left
+#            no trace in the verdict at all, which is the one module
+#            whose movement invalidates every conclusion in the document.
 VERSION_GROUPS = {
     "legacy": (f"{PLUGIN}.models.folder",),
     "index": (f"{PLUGIN}.scan.discovery",),
@@ -87,8 +92,30 @@ VERSION_GROUPS = {
         f"{PLUGIN}.scan.coordinator",
         f"{PLUGIN}.scan.extraction",
         f"{PLUGIN}.scan.verification",
+        # Which providers get instantiated and which storage root the
+        # filesystem verification runs against — both decide tuple
+        # fields, and both were outside every digest.
+        f"{PLUGIN}.scan.adapters",
+        f"{PLUGIN}.scan.context",
     ),
+    "instrument": (f"{PLUGIN}.scan.equivalence",),
 }
+
+# The base class every provider inherits `getExtensions`,
+# `getSegmentedExtensions`, `getSubPaths` and `getMetadatasFromFile` from
+# (so it decides `provider_name` and `umid` for every provider that does
+# not override them), and the registry whose ORDER decides which provider
+# claims a file. Both belong to the providers digest.
+PROVIDER_SHARED = (f"{PLUGIN}.providers", f"{PLUGIN}.providers.providers")
+
+# A provider's machine_name is USUALLY its module name, and where it is
+# not the digest silently degraded to "unavailable" under a name that
+# claimed to cover it.
+PROVIDER_MODULES = {"audio_file": "audio_files"}
+
+
+def provider_module(name):
+    return f"{PLUGIN}.providers.{PROVIDER_MODULES.get(name, name)}"
 
 
 def _command_error(message, returncode):
@@ -102,7 +129,16 @@ def _command_error(message, returncode):
     try:
         return CommandError(message, returncode=returncode)
     except TypeError:
-        return CommandError(message)
+        # The four-code contract is no longer in force, and a run whose
+        # exit status silently became "1" would tell CI a corpus typo was
+        # a discovery divergence. Say so where an operator can see it.
+        log.error(
+            "this Django does not support CommandError(returncode=): the "
+            "gate's exit status collapses to 1, so exit code %d cannot be "
+            "distinguished by CI",
+            returncode,
+        )
+        return CommandError(f"[exit {returncode}] {message}")
 
 
 def discovery_page_size(value):
@@ -132,6 +168,44 @@ def discovery_page_size(value):
     return page_size
 
 
+def _write_atomically(path, text):
+    """Write via a sibling temp file and ``os.replace``.
+
+    A plain ``open(..., "w")`` truncates first, so a crash mid-write
+    leaves a short JSON document that looks complete to everything except
+    a parser — and the whole point of the file is to be diffable evidence
+    someone trusts later.
+    """
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    handle = tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", dir=directory, delete=False, suffix=".tmp"
+    )
+    try:
+        with handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(handle.name, path)
+    except BaseException:
+        try:
+            os.unlink(handle.name)
+        except OSError:
+            pass
+        raise
+
+
+def out_path(value):
+    """argparse ``type=`` for --out: a non-empty path.
+
+    ``--out ""`` is falsy, so it used to be skipped in silence and the
+    operator believed evidence had been written to a file that never
+    existed.
+    """
+    if not value.strip():
+        raise argparse.ArgumentTypeError("--out cannot be empty")
+    return value
+
+
 def read_module_source(label):
     """``inspect.getsource`` over a dotted module name, and it may raise.
 
@@ -145,7 +219,9 @@ def read_module_source(label):
 def discovery_versions(provider_names):
     """The digests, including the providers this run actually resolved."""
     groups = dict(VERSION_GROUPS)
-    groups["providers"] = tuple(f"{PLUGIN}.providers.{name}" for name in provider_names)
+    groups["providers"] = PROVIDER_SHARED + tuple(
+        provider_module(name) for name in provider_names
+    )
     return equivalence.module_versions(groups, read_module_source)
 
 
@@ -167,6 +243,7 @@ class Command(BaseCommand):
         )
         parser.add_argument(
             "--out",
+            type=out_path,
             default=None,
             help="Write the canonical JSON verdict here; it is printed to "
             "stdout either way. Two runs over unchanged data write "
@@ -198,6 +275,12 @@ class Command(BaseCommand):
     def handle(self, *cmd_args, **options):
         corpus_path = options["corpus"]
         waivers_path = options["waivers"]
+        # `build_provider_registry` de-duplicates, `scope` and the
+        # providers digest did not: `--providers red red` produced the
+        # same effective registry as `--providers red` under a different
+        # digest, so two runs that proved the same thing wrote
+        # non-comparable documents.
+        providers = list(dict.fromkeys(options["providers"]))
 
         # Fail-fast (AD-10): a corpus or waiver defect aborts before any
         # storage resolution, index query or filesystem work. The page
@@ -228,16 +311,26 @@ class Command(BaseCommand):
         # (AD-2/AD-4). `context_factory` rebinds only options.discovery,
         # and refuses an unresolved storage or a missing registry before
         # anything walks.
-        base_context = adapters.build_context(
-            corpus.storage_ids,
-            user=None,
-            # Not a flag. See the module docstring.
-            dry_run=True,
-            providers=options["providers"],
-            legacy_storages=LEGACY_STORAGES,
-            replace=False,
-            discovery_page_size=options["discovery_page_size"],
-        )
+        try:
+            base_context = adapters.build_context(
+                corpus.storage_ids,
+                user=None,
+                # Not a flag. See the module docstring.
+                dry_run=True,
+                providers=providers,
+                legacy_storages=LEGACY_STORAGES,
+                replace=False,
+                discovery_page_size=options["discovery_page_size"],
+            )
+        except Exception as e:
+            # An unknown provider name or an unreachable storage is the
+            # OPERATOR being wrong. Outside a try it left a traceback and
+            # Django's default exit 1 — indistinguishable, to the only
+            # consumer that matters, from a real discovery divergence.
+            raise _command_error(
+                f"cannot build the run context: {type(e).__name__}: {e}",
+                EXIT_USAGE,
+            ) from None
         try:
             context_for = equivalence.context_factory(base_context)
         except equivalence.EquivalenceError as e:
@@ -246,13 +339,17 @@ class Command(BaseCommand):
             context_for=context_for,
             process_folder=self._process_folder(),
             query_elastic=query_elastic,
+            # E4 again: the per-ENTRY line lands only when an entry ends,
+            # and the shipped corpus holds one entry. Progress has to
+            # come from inside the walk.
+            emit=self.stdout.write,
         )
 
         # C3: what this run was NARROWED to. A run over one provider
         # otherwise produces a document indistinguishable from a
         # full-registry one.
         scope = {
-            "providers": sorted(options["providers"]),
+            "providers": sorted(providers),
             "discovery_page_size": options["discovery_page_size"],
             "legacy_storages": sorted(LEGACY_STORAGES),
             "storage_roots": {
@@ -271,12 +368,14 @@ class Command(BaseCommand):
             len(waivers),
             waivers_path,
         )
-        started_at = datetime.datetime.now().isoformat(timespec="seconds")
+        started_at = datetime.datetime.now(datetime.timezone.utc).isoformat(
+            timespec="seconds"
+        )
         verdict = equivalence.run_equivalence(
             corpus,
             run_path,
             waivers=waivers,
-            discovery_versions=discovery_versions(options["providers"]),
+            discovery_versions=discovery_versions(providers),
             scope=scope,
             # E4: three walks per entry over an 8,000-folder tree is
             # hours of silence otherwise.
@@ -288,21 +387,25 @@ class Command(BaseCommand):
             indent=2,
             sort_keys=True,
         )
-        if options["out"]:
-            try:
-                with open(options["out"], "w", encoding="utf-8") as handle:
-                    handle.write(document + "\n")
-            except OSError as e:
-                # The verdict still goes to stdout below: a run that
-                # PROVED something must not lose its evidence to a bad
-                # --out path.
-                self.stderr.write(f"cannot write the verdict to {options['out']}: {e}")
         for line in equivalence.render_verdict(verdict):
             self.stdout.write(line)
         # Never in the canonical document (it would make every pair of
         # runs differ), always on the console.
         self.stdout.write(f"started {started_at}, elapsed {verdict.elapsed:.1f}s")
         self.stdout.write(document)
+        # The evidence is on stdout before this point, so a --out failure
+        # can be fatal without costing the run's findings. It IS fatal: a
+        # verdict file that was asked for and not produced would otherwise
+        # leave CI recording a green gate with no artifact behind it.
+        if options["out"]:
+            try:
+                _write_atomically(options["out"], document + "\n")
+            except OSError as e:
+                raise _command_error(
+                    f"cannot write the verdict to {options['out']}: {e} "
+                    f"(the verdict itself is on stdout above)",
+                    EXIT_USAGE,
+                ) from None
 
         totals = verdict.totals()
         if verdict.status == equivalence.STATUS_REJECTED:
@@ -323,19 +426,47 @@ class Command(BaseCommand):
         if verdict.status == equivalence.STATUS_UNSTABLE_REFERENCE:
             raise _command_error(
                 f"discovery equivalence WITHHELD over {corpus.source} "
-                f"({corpus.digest}): every entry's legacy reference "
-                f"disagreed with itself, so nothing was proven",
+                f"({corpus.digest}): no entry concluded — every one of them "
+                f"was withheld for a legacy reference that disagreed with "
+                f"itself, so nothing was proven",
                 EXIT_WITHHELD,
             )
-        if totals[equivalence.ENTRY_UNSTABLE_REFERENCE]:
+        if verdict.status != equivalence.STATUS_ACCEPTED:
+            # Four statuses today. A fifth added later must not reach CI
+            # as a green gate because this ladder ran out of branches.
+            raise _command_error(
+                f"unknown verdict status {verdict.status!r}; this command "
+                f"does not know whether that is a pass",
+                EXIT_USAGE,
+            )
+        if not corpus.ratified:
+            # F1, and the exit code is the whole contract: an accepted
+            # rehearsal that exits 0 IS a gate as far as CI can tell.
+            raise _command_error(
+                f"discovery equivalence WITHHELD over {corpus.source} "
+                f"({corpus.digest}): the entries agreed, but the corpus is "
+                f"NOT RATIFIED — no human has confirmed it covers the "
+                f"population FR-4 must be proven over, so this is a "
+                f"rehearsal and must not read as the gate",
+                EXIT_WITHHELD,
+            )
+        if (
+            totals[equivalence.ENTRY_UNSTABLE_REFERENCE]
+            or totals[equivalence.ENTRY_ERRORED]
+            or totals["withheld_folders"]
+        ):
             # ACCEPTED, but not over the whole corpus — and that has to
             # be said out loud rather than inferred from the totals.
             self.stdout.write(
                 f"accepted over {totals[equivalence.ENTRY_AGREED]} of "
                 f"{totals['entries']} entr(ies); "
                 f"{totals[equivalence.ENTRY_UNSTABLE_REFERENCE]} withheld for "
-                f"an unstable legacy reference"
+                f"an unstable legacy reference, "
+                f"{totals[equivalence.ENTRY_ERRORED]} errored, "
+                f"{totals['withheld_folders']} folder(s) withheld inside "
+                f"entries that otherwise concluded"
             )
+        log.info("discovery equivalence ACCEPTED (exit %d)", EXIT_ACCEPTED)
 
     def _process_folder(self):
         """Imported lazily so ``--help`` never pulls in the ORM."""

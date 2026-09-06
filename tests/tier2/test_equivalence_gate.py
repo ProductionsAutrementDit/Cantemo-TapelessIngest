@@ -41,6 +41,9 @@ from django.core.management import call_command
 from django.core.management.base import CommandError
 
 from portal.plugins.TapelessIngest.helpers import TapelessIngestException
+from portal.plugins.TapelessIngest.management.commands import (
+    verify_discovery_equivalence,
+)
 from portal.plugins.TapelessIngest.models.clip import Clip, ClipMetadata
 from portal.plugins.TapelessIngest.models.folder import Folder, process_folder
 from portal.plugins.TapelessIngest.providers.red import CARD_SUBPATH_REGEXP
@@ -550,9 +553,12 @@ def test_an_entry_whose_prefetch_dies_is_errored_and_the_run_continues(
     assert fine.reference.tuple_count == EXPECTED_TUPLES
     assert gone.status == equivalence.ENTRY_ERRORED
     assert "ConnectionResetError" in gone.error
-    # E2: a corpus/environment failure has a status of its own, distinct
+    # E2: a corpus/environment failure keeps a status of its own, distinct
     # from a flaky reference — CI reads the exit code and nothing else.
-    assert verdict.status == equivalence.STATUS_ERRORED
+    # RULED 2026-09-04: it withdraws its own entry without sinking a
+    # corpus whose other entry concluded.
+    assert verdict.status == equivalence.STATUS_ACCEPTED
+    assert verdict.totals()[equivalence.ENTRY_ERRORED] == 1
 
 
 def test_a_corpus_naming_a_vanished_folder_is_never_agreement(
@@ -704,9 +710,19 @@ def test_the_harness_refuses_a_context_that_would_write(
 # ---------------------------------------------------------------------------
 
 
-def _files(tmp_path, corpus_text, waiver_text=""):
+def _files(tmp_path, corpus_text, waiver_text="", ratified=True):
+    """Corpus + waiver files for a `call_command` test.
+
+    Ratified by DEFAULT. An accepted run over an unratified corpus exits
+    `EXIT_WITHHELD` (RULED 2026-09-04: the exit code is the whole
+    contract, so a rehearsal must not be able to green CI), and every
+    test here except the ratification one is about the gate's mechanics
+    rather than about that rule.
+    """
     corpus_file = tmp_path / "corpus.txt"
     waiver_file = tmp_path / "waivers.txt"
+    if ratified:
+        corpus_text = "#! ratified: yes\n" + corpus_text
     corpus_file.write_text(corpus_text, encoding="utf-8")
     waiver_file.write_text(waiver_text, encoding="utf-8")
     return str(corpus_file), str(waiver_file)
@@ -749,7 +765,7 @@ def test_the_command_runs_the_gate_and_writes_a_machine_readable_verdict(
     assert scope["storage_roots"][STORAGE_ID]
     assert (scope["walk"], scope["shape"]) == ("sequential", "scan")
     versions = document["discovery_versions"]
-    assert set(versions) == {"legacy", "index", "shared", "providers"}
+    assert set(versions) == {"legacy", "index", "shared", "providers", "instrument"}
     # C2: each digest travels with the sources it CLAIMS to cover, and
     # "legacy" covers the from/size page loop, not just build_search_doc.
     assert "portal.plugins.TapelessIngest.models.folder" in versions["legacy"]["covers"]
@@ -757,10 +773,44 @@ def test_the_command_runs_the_gate_and_writes_a_machine_readable_verdict(
     assert (
         "portal.plugins.TapelessIngest.scan.extraction" in versions["shared"]["covers"]
     )
-    # The fixture provider is a test double with no module of its own, so
-    # E7's degradation is exercised here rather than hypothesised.
-    assert versions["providers"]["digest"].startswith(equivalence.SOURCE_UNAVAILABLE)
-    assert "verdict: accepted" in stdout.getvalue()
+    # Which providers get instantiated and which storage root the
+    # verification runs against both decide tuple fields, and both used
+    # to be outside every digest.
+    for label in (
+        "portal.plugins.TapelessIngest.scan.adapters",
+        "portal.plugins.TapelessIngest.scan.context",
+    ):
+        assert label in versions["shared"]["covers"]
+    # The harness itself. A change to the comparison logic left no trace
+    # in the verdict at all.
+    assert versions["instrument"]["covers"] == [
+        "portal.plugins.TapelessIngest.scan.equivalence"
+    ]
+    # The claim must be PINNED, not merely stated: a group that silently
+    # failed to read a source it names carries a digest over less than it
+    # claims, which the module calls worse than no digest.
+    for name in ("legacy", "index", "shared", "instrument"):
+        assert versions[name]["digest"].startswith("sha256:"), name
+        assert "unavailable" not in versions[name], name
+    # The providers group still digests the base class and the registry
+    # order, both of which decide provider_name and umid — so it is a
+    # real digest even though the FIXTURE provider is a double with no
+    # module of its own. That degradation is named, not swallowed.
+    assert versions["providers"]["digest"].startswith("sha256:")
+    for label in (
+        "portal.plugins.TapelessIngest.providers",
+        "portal.plugins.TapelessIngest.providers.providers",
+    ):
+        assert label in versions["providers"]["covers"]
+    assert any(
+        card_provider.machine_name in entry
+        for entry in versions["providers"]["unavailable"]
+    )
+    output = stdout.getvalue()
+    assert "verdict: accepted" in output
+    # And a partial read is visible to the human reading the console,
+    # not only to a reader of the JSON.
+    assert "covers LESS than it claims" in output
 
 
 def test_the_command_refuses_an_unparseable_corpus_before_touching_anything(
@@ -909,36 +959,51 @@ def test_with_timings_is_opt_in_and_makes_the_document_non_reproducible(
     assert document["started_at"]
 
 
-def test_the_command_reports_progress_per_entry_and_warns_about_ratification(
+def test_an_unratified_run_reports_progress_and_is_withheld_not_accepted(
     migrated_db, two_roots, card_provider, tmp_path
 ):
     """E4 and F1, on the console a human actually watches."""
     corpus_file, waiver_file = _files(
         tmp_path,
         f"{STORAGE_ID} | {ROOT} | one\n{STORAGE_ID} | {SMALL_ROOT} | two\n",
+        ratified=False,
     )
     stdout = io.StringIO()
 
-    call_command(
-        "verify_discovery_equivalence",
-        "--corpus",
-        corpus_file,
-        "--waivers",
-        waiver_file,
-        "--providers",
-        card_provider.machine_name,
-        stdout=stdout,
-    )
+    # RULED 2026-09-04: the entries agree, but the corpus is not
+    # ratified, so the run is WITHHELD. A console warning nobody's CI
+    # reads was the only thing standing between a rehearsal and a green
+    # gate — and the exit code is the whole contract.
+    with pytest.raises(CommandError) as excinfo:
+        call_command(
+            "verify_discovery_equivalence",
+            "--corpus",
+            corpus_file,
+            "--waivers",
+            waiver_file,
+            "--providers",
+            card_provider.machine_name,
+            stdout=stdout,
+        )
 
+    assert getattr(excinfo.value, "returncode", None) == (
+        verify_discovery_equivalence.EXIT_WITHHELD
+    )
+    assert "NOT RATIFIED" in str(excinfo.value)
     output = stdout.getvalue()
+    # E4: progress lands per ENTRY and from inside the walk, so a
+    # three-walk pass over a shoot tree is not silent.
     assert "[1/2] VX-41 2026: agreed" in output
     assert "[2/2] VX-41 2025: agreed" in output
-    # F1: the shipped default is unratified and so is this ad-hoc file.
+    assert "VX-41 2026 [legacy]: starting" in output
+    assert "VX-41 2026 [index]: starting" in output
+    # F1: the warning is still said out loud, before the run and again in
+    # the rendering.
     assert "NOT RATIFIED" in output
     assert "started " in output and "elapsed " in output
 
 
-def test_the_four_gate_outcomes_carry_four_distinct_exit_codes(
+def test_the_five_exit_codes_are_distinct_and_an_errored_run_carries_its_own(
     migrated_db, tree, card_provider, tmp_path
 ):
     """E2: CI reads the exit code and nothing else.
@@ -1006,3 +1071,923 @@ def test_a_defective_page_size_fails_at_parse_time_before_any_storage_call(
         )
 
     assert storage_fake.get_storage_calls == before
+
+
+# ---------------------------------------------------------------------------
+# The exit code IS the contract (code review 2026-09-04)
+# ---------------------------------------------------------------------------
+
+
+def test_a_wholly_unstable_run_reaches_ci_as_withheld_not_as_a_rejection(
+    migrated_db, drifting_tree, card_provider, tmp_path
+):
+    """The command's WITHHELD branch had no test at all.
+
+    Both tests that produced `unstable_reference` called
+    `run_equivalence` directly, so nothing exercised the layer CI reads.
+    Giving that branch `EXIT_REJECTED` — or deleting it, which drops the
+    run to exit 0 — passed the whole suite.
+    """
+    corpus_file, waiver_file = _files(tmp_path, f"{STORAGE_ID} | {ROOT} | n\n")
+
+    with pytest.raises(CommandError) as excinfo:
+        call_command(
+            "verify_discovery_equivalence",
+            "--corpus",
+            corpus_file,
+            "--waivers",
+            waiver_file,
+            "--providers",
+            card_provider.machine_name,
+            stdout=io.StringIO(),
+        )
+
+    assert getattr(excinfo.value, "returncode", None) == (
+        verify_discovery_equivalence.EXIT_WITHHELD
+    )
+    assert "WITHHELD" in str(excinfo.value)
+    assert "nothing was proven" in str(excinfo.value)
+
+
+def test_a_run_whose_other_entry_concluded_is_accepted_and_says_so(
+    migrated_db, mixed_tree, card_provider, tmp_path
+):
+    """RULED 2026-09-04: partial acceptance is STATED, not inferred."""
+    corpus_file, waiver_file = _files(
+        tmp_path,
+        f"{STORAGE_ID} | {ROOT} | paged\n{STORAGE_ID} | {SMALL_ROOT} | single page\n",
+    )
+    stdout = io.StringIO()
+
+    call_command(
+        "verify_discovery_equivalence",
+        "--corpus",
+        corpus_file,
+        "--waivers",
+        waiver_file,
+        "--providers",
+        card_provider.machine_name,
+        stdout=stdout,
+    )
+
+    output = stdout.getvalue()
+    assert "verdict: accepted" in output
+    assert "accepted over 1 of 2 entr(ies)" in output
+    assert "withheld for an unstable legacy reference" in output
+
+
+def test_a_rejected_gate_carries_the_rejected_code_not_just_the_word(
+    migrated_db, tree, card_provider, tmp_path
+):
+    """The rejected and usage paths were matched by MESSAGE text only.
+
+    Passing `EXIT_ERRORED` at the rejected site, or dropping `returncode`
+    entirely, left every assertion green while CI read a real divergence
+    as an environment fault.
+    """
+    router = query_elastic_fake.responder
+
+    def dropping(search_doc, first, number):
+        result = router(search_doc, first=first, number=number)
+        if "sort" in search_doc:
+            return result
+        hits = [
+            hit
+            for hit in result["hits"]["hits"]
+            if hit["_source"]["path"] != f"{TWO}/CLIPC.fake"
+        ]
+        return {"hits": {"total": {"value": len(hits)}, "hits": hits}}
+
+    query_elastic_fake.route(dropping)
+    corpus_file, waiver_file = _files(tmp_path, f"{STORAGE_ID} | {ROOT} | n\n")
+
+    with pytest.raises(CommandError) as excinfo:
+        call_command(
+            "verify_discovery_equivalence",
+            "--corpus",
+            corpus_file,
+            "--waivers",
+            waiver_file,
+            "--providers",
+            card_provider.machine_name,
+            stdout=io.StringIO(),
+        )
+
+    assert getattr(excinfo.value, "returncode", None) == (
+        verify_discovery_equivalence.EXIT_REJECTED
+    )
+
+
+def test_a_corpus_defect_carries_the_usage_code(
+    migrated_db, tree, card_provider, tmp_path
+):
+    """A corpus typo and a discovery divergence must not look alike."""
+    corpus_file, waiver_file = _files(tmp_path, "# nothing here\n")
+
+    with pytest.raises(CommandError) as excinfo:
+        call_command(
+            "verify_discovery_equivalence",
+            "--corpus",
+            corpus_file,
+            "--waivers",
+            waiver_file,
+            "--providers",
+            card_provider.machine_name,
+            stdout=io.StringIO(),
+        )
+
+    assert getattr(excinfo.value, "returncode", None) == (
+        verify_discovery_equivalence.EXIT_USAGE
+    )
+
+
+@pytest.mark.parametrize("page_size", ["0", "-2", "many"])
+def test_every_defective_page_size_fails_at_parse_time(
+    migrated_db, tree, card_provider, tmp_path, storage_fake, page_size
+):
+    """This command's THIRD copy of the bound was tested at one end only.
+
+    Only `99999999` was covered, so dropping the `< 1` branch from this
+    copy left the twins' tests green while `--discovery-page-size 0`
+    reached `build_context`, spent a live `getStorage` per storage id,
+    and died in `RunOptions.__post_init__` as an uncaught `ValueError`.
+    """
+    corpus_file, waiver_file = _files(tmp_path, f"{STORAGE_ID} | {ROOT} | n\n")
+    before = storage_fake.get_storage_calls
+
+    with pytest.raises(CommandError, match="discovery-page-size"):
+        call_command(
+            "verify_discovery_equivalence",
+            "--corpus",
+            corpus_file,
+            "--waivers",
+            waiver_file,
+            "--discovery-page-size",
+            page_size,
+            "--providers",
+            card_provider.machine_name,
+            stdout=io.StringIO(),
+        )
+
+    assert storage_fake.get_storage_calls == before
+
+
+def test_a_verdict_file_that_cannot_be_written_fails_the_run(
+    migrated_db, tree, card_provider, tmp_path
+):
+    """RULED 2026-09-04: a requested artifact that was not produced fails.
+
+    The evidence still reaches stdout first, so the run's findings are
+    not lost — but CI, which reads the exit code and nothing else, must
+    not record a green gate with no verdict file behind it.
+    """
+    corpus_file, waiver_file = _files(tmp_path, f"{STORAGE_ID} | {ROOT} | n\n")
+    unwritable = tmp_path / "no-such-directory" / "verdict.json"
+    stdout = io.StringIO()
+
+    with pytest.raises(CommandError) as excinfo:
+        call_command(
+            "verify_discovery_equivalence",
+            "--corpus",
+            corpus_file,
+            "--waivers",
+            waiver_file,
+            "--out",
+            str(unwritable),
+            "--providers",
+            card_provider.machine_name,
+            stdout=stdout,
+        )
+
+    assert getattr(excinfo.value, "returncode", None) == (
+        verify_discovery_equivalence.EXIT_USAGE
+    )
+    assert "cannot write the verdict" in str(excinfo.value)
+    # The findings survived the failure.
+    assert "verdict: accepted" in stdout.getvalue()
+
+
+def test_the_verdict_file_is_replaced_atomically(
+    migrated_db, tree, card_provider, tmp_path
+):
+    """A truncating write leaves a short document that parses as complete."""
+    corpus_file, waiver_file = _files(tmp_path, f"{STORAGE_ID} | {ROOT} | n\n")
+    out = tmp_path / "verdict.json"
+    out.write_text("PREVIOUS", encoding="utf-8")
+
+    call_command(
+        "verify_discovery_equivalence",
+        "--corpus",
+        corpus_file,
+        "--waivers",
+        waiver_file,
+        "--out",
+        str(out),
+        "--providers",
+        card_provider.machine_name,
+        stdout=io.StringIO(),
+    )
+
+    assert json.loads(out.read_text(encoding="utf-8"))["verdict"] == "accepted"
+    # No temp file left behind next to it.
+    assert [p.name for p in tmp_path.glob("*.tmp")] == []
+
+
+def test_an_empty_out_path_is_refused_rather_than_skipped(
+    migrated_db, tree, card_provider, tmp_path
+):
+    corpus_file, waiver_file = _files(tmp_path, f"{STORAGE_ID} | {ROOT} | n\n")
+
+    with pytest.raises(CommandError, match="--out cannot be empty"):
+        call_command(
+            "verify_discovery_equivalence",
+            "--corpus",
+            corpus_file,
+            "--waivers",
+            waiver_file,
+            "--out",
+            "",
+            "--providers",
+            card_provider.machine_name,
+            stdout=io.StringIO(),
+        )
+
+
+def test_a_repeated_provider_name_does_not_change_the_documents_identity(
+    migrated_db, tree, card_provider, tmp_path
+):
+    """`build_provider_registry` de-duplicates; `scope` and the digest did not.
+
+    Two runs that proved the same thing over the same effective registry
+    wrote non-comparable documents.
+    """
+    corpus_file, waiver_file = _files(tmp_path, f"{STORAGE_ID} | {ROOT} | n\n")
+    once = tmp_path / "once.json"
+    twice = tmp_path / "twice.json"
+
+    for out, providers in (
+        (once, [card_provider.machine_name]),
+        (
+            twice,
+            [
+                card_provider.machine_name,
+                card_provider.machine_name,
+            ],
+        ),
+    ):
+        call_command(
+            "verify_discovery_equivalence",
+            "--corpus",
+            corpus_file,
+            "--waivers",
+            waiver_file,
+            "--out",
+            str(out),
+            "--providers",
+            *providers,
+            stdout=io.StringIO(),
+        )
+
+    assert once.read_text(encoding="utf-8") == twice.read_text(encoding="utf-8")
+
+
+def test_an_index_that_prefetched_nothing_is_an_instrument_fault(
+    migrated_db, tree, card_provider, tmp_path
+):
+    """An index outage would otherwise REJECT the gate.
+
+    Zero hits over a tree that demonstrably exists on disk turns every
+    legacy tuple into an `absent_from_index` divergence — the gate
+    failing for a reason that says nothing about discovery.
+    """
+    query_elastic_fake.route(
+        lambda search_doc, first, number: {"hits": {"total": {"value": 0}, "hits": []}}
+    )
+    corpus_file, waiver_file = _files(tmp_path, f"{STORAGE_ID} | {ROOT} | n\n")
+
+    with pytest.raises(CommandError) as excinfo:
+        call_command(
+            "verify_discovery_equivalence",
+            "--corpus",
+            corpus_file,
+            "--waivers",
+            waiver_file,
+            "--providers",
+            card_provider.machine_name,
+            stdout=io.StringIO(),
+        )
+
+    assert getattr(excinfo.value, "returncode", None) == (
+        verify_discovery_equivalence.EXIT_ERRORED
+    )
+    assert "could not RUN" in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# Round 2: what the round-1 suite let through (2026-09-04)
+#
+# Each of these was written against a mutation that survived the full
+# suite. A test that stays green when its subject is broken is not a pin.
+# ---------------------------------------------------------------------------
+
+
+def _dropping_router(missing):
+    """A legacy responder that loses one document; the index keeps it.
+
+    Copy-pasted four times before this; the sorted (`"sort" in
+    search_doc`) branch is the INDEX query and must pass through
+    untouched, which is what makes the lost document an `index_only`
+    divergence rather than a mutual absence.
+    """
+    router = query_elastic_fake.responder
+
+    def dropping(search_doc, first, number):
+        result = router(search_doc, first=first, number=number)
+        if "sort" in search_doc:
+            return result
+        hits = [
+            hit for hit in result["hits"]["hits"] if hit["_source"]["path"] != missing
+        ]
+        return {"hits": {"total": {"value": len(hits)}, "hits": hits}}
+
+    return dropping
+
+
+def test_the_command_actually_applies_the_waiver_file_it_loaded(
+    migrated_db, tree, card_provider, tmp_path
+):
+    """Dropping `waivers=waivers` from the command left 1283 green.
+
+    Every `call_command` test passed an EMPTY waiver file, and the one
+    test with a non-empty file died inside `load_waivers` before reaching
+    the relation. So the file was read, validated, and written into the
+    document — and suppressed nothing. A human ratifies a waiver for a
+    known Feature-G difference, the gate keeps exiting 1, and the verdict
+    additionally reports that waiver as having matched nothing.
+    """
+    query_elastic_fake.route(_dropping_router(f"{TWO}/CLIPC.fake"))
+    corpus_file, waiver_file = _files(
+        tmp_path,
+        f"{STORAGE_ID} | {ROOT} | n\n",
+        waiver_text=(
+            f"FR-1 | index_only | {TWO} | {TWO}/CLIPC.fake | * | the known delta\n"
+        ),
+    )
+    out = tmp_path / "verdict.json"
+    stdout = io.StringIO()
+
+    # No CommandError: the waiver turns a rejection into an acceptance.
+    call_command(
+        "verify_discovery_equivalence",
+        "--corpus",
+        corpus_file,
+        "--waivers",
+        waiver_file,
+        "--out",
+        str(out),
+        "--providers",
+        card_provider.machine_name,
+        stdout=stdout,
+    )
+
+    document = json.loads(out.read_text(encoding="utf-8"))
+    assert document["verdict"] == "accepted"
+    assert document["totals"]["suppressed"] == 1
+    assert document["unmatched_waivers"] == []
+    ((suppressed,),) = [
+        entry["suppressed"] for entry in document["entries"] if entry["suppressed"]
+    ]
+    assert suppressed["divergence"]["tuple"]["verified_file_path"] == (
+        f"{TWO}/CLIPC.fake"
+    )
+    assert suppressed["waiver"]["fr"] == "FR-1"
+    # And the console names what was silenced and by which line.
+    assert "suppressed by waiver:" in stdout.getvalue()
+
+
+def test_a_failed_replace_leaves_the_previous_verdict_intact_and_no_temp_file(
+    migrated_db, tree, card_provider, tmp_path, monkeypatch
+):
+    """The round-1 atomicity test could not detect its own absence.
+
+    Replacing `_write_atomically` with a plain truncating `open(path,
+    "w")` left 1283 green: that test only overwrote a file and parsed the
+    result, so the defect its docstring names — "a short document that
+    parses as complete" — was unreachable. Failing the REPLACE is what
+    separates the two implementations: a truncating write has already
+    destroyed the previous file by then.
+    """
+    corpus_file, waiver_file = _files(tmp_path, f"{STORAGE_ID} | {ROOT} | n\n")
+    out = tmp_path / "verdict.json"
+    out.write_text("PREVIOUS EVIDENCE", encoding="utf-8")
+
+    def boom(src, dst):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(verify_discovery_equivalence.os, "replace", boom, raising=True)
+
+    with pytest.raises(CommandError) as excinfo:
+        call_command(
+            "verify_discovery_equivalence",
+            "--corpus",
+            corpus_file,
+            "--waivers",
+            waiver_file,
+            "--out",
+            str(out),
+            "--providers",
+            card_provider.machine_name,
+            stdout=io.StringIO(),
+        )
+
+    assert getattr(excinfo.value, "returncode", None) == (
+        verify_discovery_equivalence.EXIT_USAGE
+    )
+    # A truncating write would have destroyed this before failing.
+    assert out.read_text(encoding="utf-8") == "PREVIOUS EVIDENCE"
+    # And the cleanup branch ran, so no half-written temp file is left
+    # sitting beside the verdict looking like one.
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+STABLE_SHOOT = f"{ROOT}/AH_20260106_stable"
+
+
+@pytest.fixture
+def drifting_and_stable_tree(tmp_path, es_fake, storage_fake):
+    """ONE scan root holding a drifting folder and a stable one.
+
+    `drifting_tree` puts all 250 files in a single folder, so its entry
+    has no folder left to conclude with and the whole entry goes
+    unstable. Per-folder withholding is only observable where a root
+    holds both: the 250-file shoot spans three legacy pages and drifts;
+    the two-file shoot is one page and returns the same set whatever
+    order the documents arrive in.
+    """
+    paths = [f"{ONE}/CLIP{i:03d}.fake" for i in range(250)]
+    paths += [f"{STABLE_SHOOT}/CLIPX.fake", f"{STABLE_SHOOT}/CLIPY.fake"]
+    for relative in paths:
+        target = tmp_path / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"clip data")
+    _install_router(es_fake, paths, drift=True)
+    storage_fake.set_root(STORAGE_ID, str(tmp_path))
+    return paths
+
+
+def test_a_folder_withheld_inside_a_concluding_entry_is_said_out_loud(
+    migrated_db, drifting_and_stable_tree, card_provider, tmp_path
+):
+    """Partial acceptance was stated for one of its three triggers.
+
+    Dropping `or totals["withheld_folders"]` from the condition left the
+    suite green, so the steady state the module predicts — legacy pages
+    at 100 hits, prod folders far above that — produced a clean-looking
+    green gate silently covering less of the corpus than it claimed.
+    """
+    corpus_file, waiver_file = _files(tmp_path, f"{STORAGE_ID} | {ROOT} | n\n")
+    out = tmp_path / "verdict.json"
+    stdout = io.StringIO()
+
+    call_command(
+        "verify_discovery_equivalence",
+        "--corpus",
+        corpus_file,
+        "--waivers",
+        waiver_file,
+        "--out",
+        str(out),
+        "--providers",
+        card_provider.machine_name,
+        stdout=stdout,
+    )
+
+    document = json.loads(out.read_text(encoding="utf-8"))
+    assert document["verdict"] == "accepted"
+    # The drifting shoot is withheld; the stable one concluded.
+    assert document["totals"]["withheld_folders"] >= 1
+    assert document["entries"][0]["status"] == "agreed"
+    output = stdout.getvalue()
+    assert "folder(s) withheld inside entries that otherwise concluded" in output
+
+
+def test_an_errored_entry_beside_an_accepted_one_is_stated_at_the_command(
+    migrated_db, tree, card_provider, tmp_path
+):
+    """The other untested trigger of the partial-acceptance line."""
+    corpus_file, waiver_file = _files(
+        tmp_path,
+        f"{STORAGE_ID} | {ROOT} | fine\n{STORAGE_ID} | 2099/gone | archived\n",
+    )
+    stdout = io.StringIO()
+
+    call_command(
+        "verify_discovery_equivalence",
+        "--corpus",
+        corpus_file,
+        "--waivers",
+        waiver_file,
+        "--providers",
+        card_provider.machine_name,
+        stdout=stdout,
+    )
+
+    output = stdout.getvalue()
+    assert "accepted over 1 of 2 entr(ies)" in output
+    assert "1 errored" in output
+
+
+def test_the_page_size_flag_reaches_the_index_prefetch(
+    migrated_db, tree, card_provider, tmp_path, monkeypatch
+):
+    """`scope` reported the requested size without the run using it.
+
+    The assertion read the number back out of the same `options` dict
+    that produced it, so deleting `discovery_page_size=` from the
+    `build_context` call left the index paging at the default while the
+    verdict kept claiming the requested value — and paging is the exact
+    mechanism `unstable_reference` exists for.
+    """
+    seen = []
+    real = equivalence.prefetch_index
+
+    def recording(query_elastic, storage_id, path, *, page_size):
+        seen.append(page_size)
+        return real(query_elastic, storage_id, path, page_size=page_size)
+
+    monkeypatch.setattr(equivalence, "prefetch_index", recording)
+    corpus_file, waiver_file = _files(tmp_path, f"{STORAGE_ID} | {ROOT} | n\n")
+
+    call_command(
+        "verify_discovery_equivalence",
+        "--corpus",
+        corpus_file,
+        "--waivers",
+        waiver_file,
+        "--discovery-page-size",
+        "50",
+        "--providers",
+        card_provider.machine_name,
+        stdout=io.StringIO(),
+    )
+
+    assert seen == [50]
+
+
+def test_progress_is_emitted_from_inside_the_walk(
+    migrated_db, tree, card_provider, tmp_path, monkeypatch
+):
+    """`PROGRESS_EVERY` had never fired: no fixture reaches 100 folders.
+
+    So the in-walk hook could be deleted outright — and the shipped
+    single-entry corpus would run three walks over 8,133 prod folders in
+    total silence, which is the slow-versus-hung ambiguity it was added
+    to remove. Lowering the cadence is the honest way to exercise it
+    without a 100-folder fixture.
+    """
+    monkeypatch.setattr(equivalence, "PROGRESS_EVERY", 2)
+    corpus_file, waiver_file = _files(tmp_path, f"{STORAGE_ID} | {ROOT} | n\n")
+    stdout = io.StringIO()
+
+    call_command(
+        "verify_discovery_equivalence",
+        "--corpus",
+        corpus_file,
+        "--waivers",
+        waiver_file,
+        "--providers",
+        card_provider.machine_name,
+        stdout=stdout,
+    )
+
+    assert "folders walked" in stdout.getvalue()
+
+
+def test_the_unratified_warning_lands_before_the_walk_not_only_after_it(
+    migrated_db, tree, card_provider, tmp_path
+):
+    """Deleting the pre-run warning left the suite green.
+
+    `render_verdict` emits the same phrase at the END, so `"NOT RATIFIED"
+    in output` was satisfied either way — and the operator only learned
+    the run was a rehearsal after waiting for it.
+    """
+    corpus_file, waiver_file = _files(
+        tmp_path, f"{STORAGE_ID} | {ROOT} | n\n", ratified=False
+    )
+    stdout = io.StringIO()
+
+    with pytest.raises(CommandError):
+        call_command(
+            "verify_discovery_equivalence",
+            "--corpus",
+            corpus_file,
+            "--waivers",
+            waiver_file,
+            "--providers",
+            card_provider.machine_name,
+            stdout=stdout,
+        )
+
+    output = stdout.getvalue()
+    assert output.index("NOT RATIFIED") < output.index("[legacy]: starting")
+
+
+def test_an_unreadable_corpus_path_is_an_operator_error_not_a_rejection(
+    migrated_db, tree, card_provider, tmp_path
+):
+    """`load_corpus_file`'s OSError wrapper had no test.
+
+    A leaked OSError exits 1, which is `EXIT_REJECTED` — CI would read a
+    typo'd path as a discovery divergence.
+    """
+    _, waiver_file = _files(tmp_path, f"{STORAGE_ID} | {ROOT} | n\n")
+
+    with pytest.raises(CommandError) as excinfo:
+        call_command(
+            "verify_discovery_equivalence",
+            "--corpus",
+            str(tmp_path / "no-such-corpus.txt"),
+            "--waivers",
+            waiver_file,
+            "--providers",
+            card_provider.machine_name,
+            stdout=io.StringIO(),
+        )
+
+    assert getattr(excinfo.value, "returncode", None) == (
+        verify_discovery_equivalence.EXIT_USAGE
+    )
+    assert "cannot read the corpus" in str(excinfo.value)
+
+
+def test_an_unknown_provider_name_is_an_operator_error(
+    migrated_db, tree, card_provider, tmp_path
+):
+    """`_build_registry_and_map` returns (None, None) for a bad name.
+
+    This lands on `context_factory`'s no-registry refusal, NOT on the
+    `build_context` guard — established by mutation: removing that guard
+    leaves this test green. The guard has its own test below.
+    """
+    corpus_file, waiver_file = _files(tmp_path, f"{STORAGE_ID} | {ROOT} | n\n")
+
+    with pytest.raises(CommandError) as excinfo:
+        call_command(
+            "verify_discovery_equivalence",
+            "--corpus",
+            corpus_file,
+            "--waivers",
+            waiver_file,
+            "--providers",
+            "no_such_provider",
+            stdout=io.StringIO(),
+        )
+
+    assert getattr(excinfo.value, "returncode", None) == (
+        verify_discovery_equivalence.EXIT_USAGE
+    )
+
+
+def test_a_context_that_cannot_be_built_at_all_is_an_operator_error(
+    migrated_db, tree, card_provider, tmp_path, monkeypatch
+):
+    """The round-1 `build_context` guard, pinned at last.
+
+    Removing it left 1311 green: the unknown-provider test above reaches
+    `context_factory` instead, and nothing in the fixture makes
+    `build_context` itself raise. Without the guard the exception leaves
+    a traceback and Django's default exit 1 — which is `EXIT_REJECTED`,
+    i.e. CI reading an unreachable storage as a discovery divergence.
+    """
+
+    def exploding(*args, **kwargs):
+        raise RuntimeError("getStorage timed out")
+
+    monkeypatch.setattr(
+        verify_discovery_equivalence.adapters, "build_context", exploding
+    )
+    corpus_file, waiver_file = _files(tmp_path, f"{STORAGE_ID} | {ROOT} | n\n")
+
+    with pytest.raises(CommandError) as excinfo:
+        call_command(
+            "verify_discovery_equivalence",
+            "--corpus",
+            corpus_file,
+            "--waivers",
+            waiver_file,
+            "--providers",
+            card_provider.machine_name,
+            stdout=io.StringIO(),
+        )
+
+    assert getattr(excinfo.value, "returncode", None) == (
+        verify_discovery_equivalence.EXIT_USAGE
+    )
+    assert "cannot build the run context" in str(excinfo.value)
+    assert "getStorage timed out" in str(excinfo.value)
+
+
+def test_a_waiver_defect_carries_the_usage_code_too(
+    migrated_db, tree, card_provider, tmp_path
+):
+    """Parse-time refusals asserted the message and never the code.
+
+    argparse's own exit status is 2, which equals `EXIT_WITHHELD`, so an
+    operator error reaching CI as "the gate was withheld" is one
+    unasserted branch away.
+    """
+    corpus_file, waiver_file = _files(
+        tmp_path,
+        f"{STORAGE_ID} | {ROOT} | n\n",
+        waiver_text="nope | index_only | a | b | c | d\n",
+    )
+
+    with pytest.raises(CommandError) as excinfo:
+        call_command(
+            "verify_discovery_equivalence",
+            "--corpus",
+            corpus_file,
+            "--waivers",
+            waiver_file,
+            "--providers",
+            card_provider.machine_name,
+            stdout=io.StringIO(),
+        )
+
+    assert getattr(excinfo.value, "returncode", None) == (
+        verify_discovery_equivalence.EXIT_USAGE
+    )
+
+
+def test_the_accepted_exit_code_is_actually_zero():
+    """Only distinctness was asserted; the numeric contract was not.
+
+    The Tasks section states `exit 0/1/2 = accepted/rejected/withheld`,
+    and every other test compares against the symbol.
+    """
+    assert verify_discovery_equivalence.EXIT_ACCEPTED == 0
+    assert verify_discovery_equivalence.EXIT_REJECTED == 1
+    assert verify_discovery_equivalence.EXIT_WITHHELD == 2
+
+
+def test_an_older_django_degrades_the_exit_code_loudly(monkeypatch):
+    """The `TypeError` fallback exists for the Portal the server runs.
+
+    It is the branch no test executes, on the deployment that is not the
+    dev environment. If it ever fires, the four-code contract is off and
+    that has to be visible rather than silent.
+    """
+
+    class OldCommandError(Exception):
+        def __init__(self, message):
+            super().__init__(message)
+
+    monkeypatch.setattr(
+        verify_discovery_equivalence, "CommandError", OldCommandError, raising=True
+    )
+    error = verify_discovery_equivalence._command_error(
+        "the corpus holds no entries",
+        verify_discovery_equivalence.EXIT_USAGE,
+    )
+
+    assert isinstance(error, OldCommandError)
+    assert "[exit 4]" in str(error)
+
+
+def test_the_gate_writes_nothing_through_the_command_either(
+    migrated_db, tree, card_provider, tmp_path
+):
+    """The zero-writes recorder only ever wrapped `run_equivalence`.
+
+    The Verification section's manual check runs the COMMAND, which also
+    builds the context, resolves the provider registry, writes `--out`
+    and renders — all outside the recorder's previous scope.
+    """
+    corpus_file, waiver_file = _files(tmp_path, f"{STORAGE_ID} | {ROOT} | n\n")
+    out = tmp_path / "verdict.json"
+
+    with captured_sql() as statements:
+        call_command(
+            "verify_discovery_equivalence",
+            "--corpus",
+            corpus_file,
+            "--waivers",
+            waiver_file,
+            "--out",
+            str(out),
+            "--providers",
+            card_provider.machine_name,
+            stdout=io.StringIO(),
+        )
+
+    # A command that made no query at all would pass this vacuously.
+    assert statements
+    offenders = [sql for sql in statements if not READ_ONLY_SQL.match(sql.strip())]
+    assert not offenders, offenders
+    assert (Clip.objects.count(), ClipMetadata.objects.count()) == (0, 0)
+
+
+def test_an_index_that_lost_a_file_is_charged_to_the_index(
+    migrated_db, tree, card_provider, tmp_path
+):
+    """The direction FR-4 exists for, proven on the real tree at last.
+
+    Every real-tree injection filtered the LEGACY responder, so every
+    end-to-end divergence was `index_only`/`absent_from_legacy`. The
+    dangerous direction is the other one: index discovery LOSING media,
+    which is what makes flipping the default unsafe.
+    """
+    router = query_elastic_fake.responder
+    missing = f"{TWO}/CLIPC.fake"
+
+    def losing(search_doc, first, number):
+        result = router(search_doc, first=first, number=number)
+        if "sort" not in search_doc:
+            return result
+        hits = [
+            hit for hit in result["hits"]["hits"] if hit["_source"]["path"] != missing
+        ]
+        return {"hits": {"total": {"value": len(hits)}, "hits": hits}}
+
+    query_elastic_fake.route(losing)
+
+    verdict = equivalence.run_equivalence(_corpus(), _runner(card_provider))
+
+    assert verdict.status == equivalence.STATUS_REJECTED
+    (divergence,) = verdict.entries[0].divergences
+    assert divergence.side == equivalence.SIDE_LEGACY_ONLY
+    assert divergence.classification == equivalence.CLASS_ABSENT_FROM_INDEX
+    assert divergence.verified_file_path == missing
+
+
+def test_an_unrecognised_verdict_status_never_reaches_ci_as_a_pass(
+    migrated_db, tree, card_provider, tmp_path, monkeypatch
+):
+    """The fifth-status guard exists so a later status cannot exit 0.
+
+    Four statuses today. The ladder used to fall through to a silent
+    return — a status added later would have read as `accepted` to the
+    only consumer that matters.
+    """
+    real = equivalence.run_equivalence
+
+    def with_new_status(*args, **kwargs):
+        verdict = real(*args, **kwargs)
+        return equivalence.dataclass_replace(verdict, status="inconclusive")
+
+    monkeypatch.setattr(equivalence, "run_equivalence", with_new_status)
+    corpus_file, waiver_file = _files(tmp_path, f"{STORAGE_ID} | {ROOT} | n\n")
+
+    with pytest.raises(CommandError) as excinfo:
+        call_command(
+            "verify_discovery_equivalence",
+            "--corpus",
+            corpus_file,
+            "--waivers",
+            waiver_file,
+            "--providers",
+            card_provider.machine_name,
+            stdout=io.StringIO(),
+        )
+
+    assert getattr(excinfo.value, "returncode", None) == (
+        verify_discovery_equivalence.EXIT_USAGE
+    )
+    assert "unknown verdict status" in str(excinfo.value)
+
+
+def test_a_descent_divergence_is_produced_by_the_real_walk(
+    migrated_db, tree, card_provider
+):
+    """`consumed_subdirs` drift, end to end at last.
+
+    Folder-set divergence is the NFR-1 duplicate-ingest direction and the
+    waiver file calls it non-waivable — "a fix, not a signature" — yet it
+    was only ever produced by hand-built `PathRun`s. Losing the file
+    inside the provider's sub-path from the INDEX makes that path stop
+    consuming `CONTENTS` and descend into it as an ordinary folder, while
+    legacy still claims it. The two paths then walk different folder
+    sets, which is exactly the shape a duplicate ingest would take.
+    """
+    router = query_elastic_fake.responder
+    missing = f"{CARD}/{SUBPATH}/CLIPD.fake"
+
+    def losing(search_doc, first, number):
+        result = router(search_doc, first=first, number=number)
+        if "sort" not in search_doc:
+            return result
+        hits = [
+            hit for hit in result["hits"]["hits"] if hit["_source"]["path"] != missing
+        ]
+        return {"hits": {"total": {"value": len(hits)}, "hits": hits}}
+
+    query_elastic_fake.route(losing)
+
+    verdict = equivalence.run_equivalence(_corpus(), _runner(card_provider))
+
+    entry = verdict.entries[0]
+    assert verdict.status == equivalence.STATUS_REJECTED
+    assert entry.folder_divergences, "the real walk produced no descent divergence"
+    walked_once = {(d.side, d.folder_path) for d in entry.folder_divergences}
+    assert (equivalence.SIDE_INDEX_ONLY, f"{CARD}/{SUBPATH}") in walked_once

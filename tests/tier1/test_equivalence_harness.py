@@ -112,6 +112,16 @@ def _entry(path=FOLDER, storage=STORAGE, note=""):
 
 
 def _path_run(mode, tuples, *, errors=(), failed=(), folders=None, elapsed=0.0):
+    """A `PathRun` double.
+
+    `folders` defaults to the folders the TUPLES name, which is what a
+    real walk would report. The `or frozenset({FOLDER})` fallback only
+    applies to an empty tuple set, and it is unrelated to the corpus
+    entry under test — a run over `2099/gone` will claim to have walked
+    `FOLDER`. That is harmless today because every empty-tuple case is
+    booked `errored` before the folder set is read, but pass `folders`
+    explicitly rather than relying on it.
+    """
     tuples = frozenset(tuples)
     if folders is None:
         folders = frozenset(values[4] for values in tuples) or frozenset({FOLDER})
@@ -211,8 +221,16 @@ def test_a_failed_folder_anywhere_in_the_walk_is_not_agreement():
     assert "2026/AA_one/card" in verdict.entries[0].error
 
 
-def test_a_corpus_with_one_broken_entry_is_never_accepted():
-    """Even when every other entry agrees, the run is not clean."""
+def test_one_broken_entry_withdraws_itself_without_sinking_the_corpus():
+    """RULED 2026-09-04: `errored` escalates the way instability does.
+
+    It used to sink the whole corpus, checked BEFORE "did anything
+    conclude" — so nineteen agreements plus one archived-away path exited
+    3, while nineteen agreements plus one unstable entry exited 0. Both
+    are "part of the corpus proved nothing". The asymmetry also made a
+    legitimately media-free subtree a permanently red gate with no way
+    out short of editing the corpus.
+    """
     corpus = equivalence.load_corpus(
         "VX-41 | 2026/AA_one | fine\nVX-41 | 2099/gone | archived\n"
     )
@@ -226,9 +244,34 @@ def test_a_corpus_with_one_broken_entry_is_never_accepted():
         clock=_counting_clock(),
     )
 
-    assert verdict.status == equivalence.STATUS_ERRORED
+    assert verdict.status == equivalence.STATUS_ACCEPTED
     assert [e.status for e in verdict.entries] == [
         equivalence.ENTRY_AGREED,
+        equivalence.ENTRY_ERRORED,
+    ]
+    # The partial acceptance is STATED, never inferred.
+    assert verdict.totals()[equivalence.ENTRY_ERRORED] == 1
+
+
+def test_a_corpus_where_nothing_concluded_is_errored_not_accepted():
+    """The other half of the ruling: symmetric is not permissive.
+
+    An entry withdrawing itself must not become a way for a corpus that
+    proved NOTHING to exit 0.
+    """
+    corpus = equivalence.load_corpus(
+        "VX-41 | 2098/gone | archived\nVX-41 | 2099/gone | archived\n"
+    )
+
+    verdict = equivalence.run_equivalence(
+        corpus,
+        _scripted_runner({"2098/gone": _agreeing([]), "2099/gone": _agreeing([])}),
+        clock=_counting_clock(),
+    )
+
+    assert verdict.status == equivalence.STATUS_ERRORED
+    assert [e.status for e in verdict.entries] == [
+        equivalence.ENTRY_ERRORED,
         equivalence.ENTRY_ERRORED,
     ]
 
@@ -349,9 +392,13 @@ def test_the_corpus_digest_covers_the_scope_and_not_the_notes():
         ("VX-41 |  | n\n", "the path column is empty"),
         ("VX-41 | /mnt/PAD_Storage/2026 | n\n", "is absolute"),
         ("VX-41 | 2026/../../etc | n\n", "escapes the storage root"),
-        # F3: gating a whole storage by accident is not a corpus.
         ("VX-41 | / | n\n", "is absolute"),
         ("VX-41 | // | n\n", "is absolute"),
+        # F3: gating a whole storage by accident is not a corpus. These
+        # two reach the storage-root branch; the absolute cases above are
+        # refused one guard earlier and never did.
+        ("VX-41 | . | n\n", "normalises to the storage root"),
+        ("VX-41 | ./. | n\n", "normalises to the storage root"),
         (
             "VX-41 | 2026/AA_one | n\nVX-41 | 2026/AA_one | again\n",
             "already in the corpus at line 1",
@@ -424,8 +471,27 @@ def test_the_shipped_corpus_and_waiver_files_parse():
     # F1: shipped UNRATIFIED, and it says so in machine-readable form.
     assert corpus.ratified is False
     assert corpus.ratification_note
-    # The list starts EMPTY and is append-only.
-    assert waivers == ()
+    # RULED 2026-09-04: pin the INVARIANT, not the emptiness. `waivers ==
+    # ()` turned the first legitimately ratified waiver — the very
+    # workflow the frozen block describes — into a red suite whose
+    # natural fix is deleting the assertion.
+    for waiver in waivers:
+        assert waiver.fr.startswith("FR-")
+        assert waiver.note, f"waiver at line {waiver.lineno} states no reason"
+        assert not (
+            waiver.side == equivalence.SIDE_ANY
+            and waiver.folder == waiver.file == waiver.provider == "*"
+        )
+    # RULED 2026-09-04: the corpus is the manual precedent's SHOOT, not
+    # the whole year. Re-widening it to `VX-41 | 2026` left the suite
+    # green, so the ruling and the deferred-work record that reconciles
+    # it were held only by the file's current contents.
+    (entry,) = corpus.entries
+    assert entry.path != "2026", (
+        "the corpus was re-widened to the whole year; that is a "
+        "maintenance-window run and a separate ratification decision"
+    )
+    assert entry.path.startswith("2026/AA_")
 
 
 # ---------------------------------------------------------------------------
@@ -781,7 +847,16 @@ def test_several_candidate_counterparts_are_reported_as_ambiguous():
         [_tuple("a", umid="two"), _tuple("a", umid="three")],
     )
 
-    assert divergences[0].classification == equivalence.CLASS_AMBIGUOUS_COUNTERPART
+    # Asserting `divergences[0]` relied on "one" < "three" < "two"
+    # putting the ambiguous one first; renaming a umid moved the
+    # assertion onto a different divergence. Assert the SET, and the
+    # asymmetry with it: one left tuple has two candidates and is
+    # ambiguous, while each right tuple has exactly one and is umid drift.
+    assert {(d.side, d.classification) for d in divergences} == {
+        (equivalence.SIDE_LEGACY_ONLY, equivalence.CLASS_AMBIGUOUS_COUNTERPART),
+        (equivalence.SIDE_INDEX_ONLY, equivalence.CLASS_UMID_DRIFT),
+    }
+    assert len(divergences) == 3
 
 
 def test_the_divergence_sort_key_is_total():
@@ -1002,10 +1077,15 @@ def test_a_failing_entry_is_errored_with_a_status_of_its_own():
 
     verdict = equivalence.run_equivalence(corpus, run_path, clock=_counting_clock())
 
-    assert verdict.status == equivalence.STATUS_ERRORED
-    assert verdict.status != equivalence.STATUS_UNSTABLE_REFERENCE
+    # The ENTRY keeps a status of its own — that is what CI acts on when
+    # nothing concluded (see
+    # `test_a_corpus_where_nothing_concluded_is_errored_not_accepted`).
+    # Here a clean entry did conclude, so the run is accepted with the
+    # errored count stated (RULED 2026-09-04).
+    assert verdict.status == equivalence.STATUS_ACCEPTED
     bad, clean = verdict.entries
     assert bad.status == equivalence.ENTRY_ERRORED
+    assert bad.status != equivalence.ENTRY_UNSTABLE_REFERENCE
     assert "Permission denied" in bad.error
     assert clean.status == equivalence.ENTRY_AGREED
 
@@ -1147,9 +1227,18 @@ def test_a_waiver_is_marked_used_even_when_the_entry_was_withheld():
         clock=_counting_clock(),
     )
 
-    assert verdict.entries[0].status == equivalence.ENTRY_UNSTABLE_REFERENCE
+    entry = verdict.entries[0]
+    assert entry.status == equivalence.ENTRY_UNSTABLE_REFERENCE
+    # The waiver's condition WAS observed, so it is not stale...
     assert verdict.unmatched_waivers == ()
-    assert verdict.entries[0].withheld_divergences == ()
+    # ...but it suppresses nothing (RULED 2026-09-04). The run never
+    # established this difference; a waiver that deleted it would have
+    # the verdict claim a suppression for something it refused to prove,
+    # while `as_dict(waivable=False)` refuses even to propose one.
+    assert [d.verified_file_path for d in entry.withheld_divergences] == ["c"]
+    assert entry.suppressed == ()
+    assert verdict.totals()["suppressed"] == 0
+    assert verdict.totals()["withheld"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1229,10 +1318,21 @@ def test_the_document_and_the_rendering_are_both_capped():
 
     entry = verdict.as_dict()["entries"][0]
     assert entry["counts"]["divergences"] == 400
-    assert len(entry["divergences"]) == equivalence.DOCUMENT_REPORT_LIMIT
+    # DOCUMENT_REPORT_LIMIT divergences plus the marker that says so. The
+    # bare slice this replaced truncated the CONTRACT in silence, while
+    # `errors` and `failed_folders` beside it stated their omission —
+    # a reader could only find out by cross-checking `counts`.
+    shown = entry["divergences"]
+    assert len(shown) == equivalence.DOCUMENT_REPORT_LIMIT + 1
+    assert shown[-1]["omitted"] == 400 - equivalence.DOCUMENT_REPORT_LIMIT
+    assert "not shown" in shown[-1]["note"]
     rendering = equivalence.render_verdict(verdict)
     assert any("more divergence(s) not shown" in line for line in rendering)
-    assert len(rendering) < 200
+    # Was `< 200`, a hand-picked ceiling loose enough to miss a 5x
+    # regression: raising CONSOLE_REPORT_LIMIT from 10 to 50 still fitted
+    # under it. Two lines per shown divergence, plus the header block.
+    shown_lines = [line for line in rendering if "/absent_from" in line]
+    assert len(shown_lines) == equivalence.CONSOLE_REPORT_LIMIT
 
 
 def test_the_tuple_sets_do_not_survive_the_comparison():
@@ -1377,3 +1477,568 @@ def test_a_source_less_deploy_degrades_to_a_named_unavailable_digest():
     assert versions["legacy"]["unavailable"] == ["mod.b: OSError"]
     assert versions["legacy"]["digest"].startswith("sha256:")
     assert versions["gone"]["digest"] == f"{equivalence.SOURCE_UNAVAILABLE}:no-source"
+
+
+# ---------------------------------------------------------------------------
+# The reference must agree with itself about FOLDERS, not only tuples
+# (code review 2026-09-04)
+# ---------------------------------------------------------------------------
+
+
+def test_a_reference_that_walked_different_folders_is_not_charged_to_the_index():
+    """The hole the folder self-check closes.
+
+    Legacy's unsorted `from`/`size` paging perturbs `hits`; `hits` decides
+    `consumed_subdirs`; `consumed_subdirs` decides the descent. So the
+    reference can disagree with ITSELF about which folders it walked
+    while its tuples happen to survive intact. That difference was then
+    compared against the index path and charged to it as a
+    `folder_divergence` — which is unwaivable and rejects the gate. An
+    instrument fault, billed to the instrument under test.
+    """
+    corpus = equivalence.load_corpus("VX-41 | 2026/AA_one | n\n")
+    tuples = [_tuple("a")]
+    first = _path_run(DISCOVERY_LEGACY, tuples, folders={FOLDER, FOLDER + "/card9"})
+    second = _path_run(DISCOVERY_LEGACY, tuples, folders={FOLDER})
+    index = _path_run(DISCOVERY_INDEX, tuples, folders={FOLDER})
+
+    verdict = equivalence.run_equivalence(
+        corpus,
+        _scripted_runner({"2026/AA_one": [first, second, index]}),
+        clock=_counting_clock(),
+    )
+
+    entry = verdict.entries[0]
+    assert verdict.status == equivalence.STATUS_ACCEPTED
+    # The drift is reported as what it is, against the reference.
+    assert [d.folder_path for d in entry.reference_folder_self_divergences] == [
+        FOLDER + "/card9"
+    ]
+    # And the resulting index comparison for that folder is WITHHELD, in
+    # a field of its own, never in `folder_divergences`.
+    assert entry.folder_divergences == ()
+    assert [d.folder_path for d in entry.withheld_folder_divergences] == [
+        FOLDER + "/card9"
+    ]
+    assert entry.withheld_folders == (FOLDER + "/card9",)
+
+
+def test_the_stable_folders_of_an_unstable_entry_still_conclude():
+    """RULED 2026-09-04: withhold per FOLDER, as the frozen block says.
+
+    "It invalidates the run's verdict for the affected FOLDERS rather
+    than the whole corpus." Returning the whole entry as unstable threw
+    away every conclusion about the rest of the subtree — and with a
+    single-entry corpus that is the whole gate.
+    """
+    stable = "2026/AA_one/stable"
+    flaky = "2026/AA_one/flaky"
+    good = _tuple("a", folder=stable)
+    drifting = _tuple("b", folder=flaky)
+    corpus = equivalence.load_corpus("VX-41 | 2026/AA_one | n\n")
+    first = _path_run(DISCOVERY_LEGACY, [good, drifting])
+    second = _path_run(DISCOVERY_LEGACY, [good], folders={stable, flaky})
+    index = _path_run(DISCOVERY_INDEX, [good, drifting])
+
+    verdict = equivalence.run_equivalence(
+        corpus,
+        _scripted_runner({"2026/AA_one": [first, second, index]}),
+        clock=_counting_clock(),
+    )
+
+    entry = verdict.entries[0]
+    assert entry.withheld_folders == (flaky,)
+    # The flaky folder proved nothing; the stable one did, so the entry
+    # concludes rather than collapsing.
+    assert entry.status == equivalence.ENTRY_AGREED
+    assert verdict.status == equivalence.STATUS_ACCEPTED
+    assert verdict.totals()["withheld_folders"] == 1
+
+
+def test_an_entry_whose_every_folder_is_unstable_still_proves_nothing():
+    """Per-folder withholding must not become a way to pass on nothing."""
+    corpus = equivalence.load_corpus("VX-41 | 2026/AA_one | n\n")
+    first = _path_run(DISCOVERY_LEGACY, [_tuple("a"), _tuple("b")])
+    second = _path_run(DISCOVERY_LEGACY, [_tuple("a")])
+    index = _path_run(DISCOVERY_INDEX, [_tuple("a")])
+
+    verdict = equivalence.run_equivalence(
+        corpus,
+        _scripted_runner({"2026/AA_one": [first, second, index]}),
+        clock=_counting_clock(),
+    )
+
+    assert verdict.entries[0].status == equivalence.ENTRY_UNSTABLE_REFERENCE
+    assert verdict.status == equivalence.STATUS_UNSTABLE_REFERENCE
+
+
+def test_an_error_set_difference_withholds_the_whole_entry():
+    """An error string carries no folder, so nothing can be attributed."""
+    corpus = equivalence.load_corpus("VX-41 | 2026/AA_one | n\n")
+    tuples = [_tuple("a")]
+    first = _path_run(DISCOVERY_LEGACY, tuples, errors=("Not descending into x",))
+    second = _path_run(DISCOVERY_LEGACY, tuples)
+    index = _path_run(DISCOVERY_INDEX, tuples)
+
+    verdict = equivalence.run_equivalence(
+        corpus,
+        _scripted_runner({"2026/AA_one": [first, second, index]}),
+        clock=_counting_clock(),
+    )
+
+    entry = verdict.entries[0]
+    assert entry.status == equivalence.ENTRY_UNSTABLE_REFERENCE
+    assert entry.reference_error_divergences == ("Not descending into x",)
+
+
+def test_a_withheld_folder_divergence_is_not_counted_as_a_gate_failure():
+    """The totals fed the command's REJECTED message.
+
+    `Verdict.totals()` summed `folder_divergences` over ALL entries, so a
+    number describing what the run REFUSED to conclude was quoted as what
+    it found.
+    """
+    corpus = equivalence.load_corpus("VX-41 | 2026/AA_one | n\n")
+    tuples = [_tuple("a")]
+    first = _path_run(DISCOVERY_LEGACY, tuples, folders={FOLDER, FOLDER + "/x"})
+    second = _path_run(DISCOVERY_LEGACY, tuples, folders={FOLDER})
+    index = _path_run(DISCOVERY_INDEX, tuples, folders={FOLDER})
+
+    verdict = equivalence.run_equivalence(
+        corpus,
+        _scripted_runner({"2026/AA_one": [first, second, index]}),
+        clock=_counting_clock(),
+    )
+
+    totals = verdict.totals()
+    assert totals["folder_divergences"] == 0
+    assert totals["withheld_folder_divergences"] == 1
+    rendering = "\n".join(equivalence.render_verdict(verdict))
+    assert "0 folder-set charged" in rendering
+    assert "WITHHELD" in rendering
+
+
+# ---------------------------------------------------------------------------
+# The smaller refusals (code review 2026-09-04)
+# ---------------------------------------------------------------------------
+
+
+def test_a_double_star_does_not_also_match_the_folder_it_hangs_off():
+    """The waiver file says `2026/AA_*/**` covers everything BELOW."""
+    assert equivalence.glob_match("2026/AA_x/**", "2026/AA_x/card1")
+    assert equivalence.glob_match("2026/AA_x/**", "2026/AA_x/card1/deeper")
+    assert not equivalence.glob_match("2026/AA_x/**", "2026/AA_x")
+
+
+def test_a_dot_segment_cannot_smuggle_the_same_subtree_in_twice():
+    with pytest.raises(equivalence.CorpusError, match="already in the corpus"):
+        equivalence.load_corpus("VX-41 | 2026/AA_one | a\nVX-41 | 2026/./AA_one | b\n")
+
+
+def test_a_directive_may_not_be_set_twice():
+    """Last-wins would let a `ratified: no` be overridden further down."""
+    with pytest.raises(equivalence.CorpusError, match="already set at line"):
+        equivalence.load_corpus(
+            "#! ratified: no\n#! ratified: yes\nVX-41 | 2026/AA_one | n\n"
+        )
+
+
+def test_a_waiver_that_suppresses_everything_is_refused():
+    with pytest.raises(equivalence.WaiverError, match="waives EVERY divergence"):
+        equivalence.load_waivers("FR-4 | any | * | * | * | blanket\n")
+
+
+def test_a_numeric_ad2_field_is_refused_rather_than_stringified():
+    """`str(0)` and the string `"0"` compare EQUAL."""
+    clip = FakeClip("a", umid=0, provider_name="red")
+
+    with pytest.raises(equivalence.EquivalenceError, match="AD-2 field is textual"):
+        equivalence.ad2_tuple(clip, FOLDER)
+
+
+def test_a_folder_whose_tuples_cannot_be_read_stays_out_of_the_folder_set():
+    """All-or-nothing covered the tuples and not the folder set.
+
+    A folder that aborted mid-read still appeared in `folder_paths` and
+    could therefore take part in the descent comparison.
+    """
+    good = FakeClip("a", umid="u", provider_name="red")
+    bad = FakeClip("b", umid=None, provider_name="red")
+
+    def process_folder(*args, **kwargs):
+        return FolderOutcome(result=WorkerResult(folder_path=FOLDER, clips=(good, bad)))
+
+    collector = equivalence.TupleCollector(process_folder)
+    with pytest.raises(equivalence.EquivalenceError):
+        collector(FOLDER)
+
+    assert collector.tuples == set()
+    assert collector.folder_paths == set()
+
+
+def test_the_capped_helpers_state_what_they_dropped():
+    """`_capped`/`_render_capped`'s truncation branches had no test."""
+    values = [f"folder{i:04d}" for i in range(equivalence.DOCUMENT_REPORT_LIMIT + 25)]
+
+    capped = equivalence._capped(values)
+    assert len(capped) == equivalence.DOCUMENT_REPORT_LIMIT + 1
+    assert capped[-1] == "... 25 more not shown"
+
+    lines = []
+    equivalence._render_capped(lines, values, "  folder: ")
+    assert len(lines) == equivalence.CONSOLE_REPORT_LIMIT + 1
+    assert lines[-1].endswith(
+        f"... {len(values) - equivalence.CONSOLE_REPORT_LIMIT} more not shown"
+    )
+
+
+def test_an_instrument_fault_carries_no_ratifiable_waiver_line():
+    """A reference self-divergence was never established as a difference.
+
+    Printing a ready-to-copy waiver beside one invites a human to
+    permanently suppress a difference the run did not prove.
+    """
+    corpus = equivalence.load_corpus("VX-41 | 2026/AA_one | n\n")
+    first = _path_run(DISCOVERY_LEGACY, [_tuple("a"), _tuple("b")])
+    second = _path_run(DISCOVERY_LEGACY, [_tuple("a")])
+    index = _path_run(DISCOVERY_INDEX, [_tuple("a")])
+
+    verdict = equivalence.run_equivalence(
+        corpus,
+        _scripted_runner({"2026/AA_one": [first, second, index]}),
+        clock=_counting_clock(),
+    )
+
+    entry = verdict.as_dict()["entries"][0]
+    assert entry["reference_self_divergences"]
+    for divergence in entry["reference_self_divergences"]:
+        assert divergence["proposed_waiver"] is None
+
+
+# ---------------------------------------------------------------------------
+# Round 2: what the round-1 suite let through (2026-09-04)
+#
+# Every test below was written against a MUTATION that survived the full
+# suite. The bar for a test here is not that it passes — it is that it
+# goes red when the thing it names is broken.
+# ---------------------------------------------------------------------------
+
+
+def test_one_diverging_entry_rejects_a_corpus_whose_other_entry_agreed():
+    """`verdict_status`'s precedence had no multi-entry test at all.
+
+    Every rejection case used a single-entry corpus, so reordering the
+    ladder to test `ENTRY_AGREED -> accepted` BEFORE
+    `ENTRY_DIVERGED -> rejected` left the whole suite green. A real
+    divergence would then exit 0 the moment the corpus grew a second
+    entry — and the shipped corpus header explicitly anticipates that
+    growth ("a second shoot with different card shapes").
+    """
+    corpus = equivalence.load_corpus(
+        "VX-41 | 2026/AA_one | agrees\nVX-41 | 2026/AA_two | diverges\n"
+    )
+    agreeing = _tuple("a", folder="2026/AA_one")
+    both = _tuple("b", folder="2026/AA_two")
+    extra = _tuple("c", folder="2026/AA_two")
+
+    verdict = equivalence.run_equivalence(
+        corpus,
+        _scripted_runner(
+            {
+                "2026/AA_one": _agreeing([agreeing]),
+                "2026/AA_two": [[both], [both], [both, extra]],
+            }
+        ),
+        clock=_counting_clock(),
+    )
+
+    assert [e.status for e in verdict.entries] == [
+        equivalence.ENTRY_AGREED,
+        equivalence.ENTRY_DIVERGED,
+    ]
+    assert verdict.status == equivalence.STATUS_REJECTED
+
+
+def test_a_divergence_in_a_stable_folder_still_rejects_an_unstable_entry():
+    """Ruling #1's rejecting half, which the suite only tested permissively.
+
+    Collapsing the per-folder split — one flaky folder withholding EVERY
+    divergence in the entry — left 1283 green. That is the ruling
+    inverted into a false PASS: instability is the steady state (legacy
+    pages at 100 hits, prod folders run far above that), so a single
+    drifting folder would have silenced every real divergence beside it.
+    """
+    stable = "2026/AA_one/stable"
+    flaky = "2026/AA_one/flaky"
+    kept = _tuple("a", folder=stable)
+    drifting = _tuple("b", folder=flaky)
+    real = _tuple("c", folder=stable)
+    corpus = equivalence.load_corpus("VX-41 | 2026/AA_one | n\n")
+
+    verdict = equivalence.run_equivalence(
+        corpus,
+        _scripted_runner(
+            {
+                "2026/AA_one": [
+                    _path_run(DISCOVERY_LEGACY, [kept, drifting]),
+                    _path_run(DISCOVERY_LEGACY, [kept], folders={stable, flaky}),
+                    _path_run(DISCOVERY_INDEX, [kept, drifting, real]),
+                ]
+            }
+        ),
+        clock=_counting_clock(),
+    )
+
+    entry = verdict.entries[0]
+    assert entry.withheld_folders == (flaky,)
+    # The drifting folder's difference is withheld...
+    assert [d.verified_file_path for d in entry.withheld_divergences] == []
+    # ...and the stable folder's is CHARGED, so the gate fails.
+    assert [d.verified_file_path for d in entry.divergences] == ["c"]
+    assert entry.status == equivalence.ENTRY_DIVERGED
+    assert verdict.status == equivalence.STATUS_REJECTED
+
+
+def test_a_taint_reaches_the_folders_below_the_one_that_drifted():
+    """`_is_under` reduced to exact membership left 1283 green.
+
+    Prod is exactly the shape that punishes this: provider sub-paths and
+    RED card directories sit BELOW the shoot folder whose paging drifts,
+    so a difference owned by a card dir of a drifting shoot would be
+    charged as a real divergence and reject the gate.
+    """
+    shoot = "2026/AA_one/shoot"
+    card = f"{shoot}/CARD_001/CONTENTS"
+    kept = _tuple("a", folder="2026/AA_one/stable")
+    drifting = _tuple("b", folder=shoot)
+    below = _tuple("c", folder=card)
+    corpus = equivalence.load_corpus("VX-41 | 2026/AA_one | n\n")
+
+    verdict = equivalence.run_equivalence(
+        corpus,
+        _scripted_runner(
+            {
+                "2026/AA_one": [
+                    _path_run(DISCOVERY_LEGACY, [kept, drifting]),
+                    _path_run(
+                        DISCOVERY_LEGACY,
+                        [kept],
+                        folders={"2026/AA_one/stable", shoot},
+                    ),
+                    _path_run(DISCOVERY_INDEX, [kept, drifting, below]),
+                ]
+            }
+        ),
+        clock=_counting_clock(),
+    )
+
+    entry = verdict.entries[0]
+    assert entry.withheld_folders == (shoot,)
+    # `card` is not itself tainted — it is BELOW a tainted folder.
+    assert card not in entry.withheld_folders
+    assert [d.verified_file_path for d in entry.withheld_divergences] == ["c"]
+    assert entry.divergences == ()
+    assert verdict.status != equivalence.STATUS_REJECTED
+
+
+def test_an_any_sided_waiver_suppresses_both_directions():
+    """`SIDE_ANY` appeared only in the test that REFUSES a blanket row.
+
+    Dropping the `self.side != SIDE_ANY` short-circuit left the suite
+    green while silently disabling every `any` waiver — which is a side
+    the loader accepts and the shipped waiver file tells operators to
+    write.
+    """
+    waiver = equivalence.load_waivers(
+        f"FR-9 | any | {FOLDER} | c | red | the card fix\n"
+    )[0]
+    index_only = equivalence.Divergence(
+        side=equivalence.SIDE_INDEX_ONLY,
+        classification=equivalence.CLASS_ABSENT_FROM_LEGACY,
+        values=_tuple("c"),
+    )
+    legacy_only = equivalence.Divergence(
+        side=equivalence.SIDE_LEGACY_ONLY,
+        classification=equivalence.CLASS_ABSENT_FROM_INDEX,
+        values=_tuple("c"),
+    )
+
+    assert waiver.matches(index_only)
+    assert waiver.matches(legacy_only)
+    # And it still discriminates on the fields that are not the side.
+    other_file = equivalence.Divergence(
+        side=equivalence.SIDE_INDEX_ONLY,
+        classification=equivalence.CLASS_ABSENT_FROM_LEGACY,
+        values=_tuple("d"),
+    )
+    assert not waiver.matches(other_file)
+
+
+def test_a_withheld_divergence_carries_no_ratifiable_waiver_line_either():
+    """The round-1 test for this rule was blind to its own subject.
+
+    It iterated `reference_self_divergences`, whose sides are not in
+    `GATE_SIDES` — so `proposed_waiver` is `None` one clause earlier and
+    the assertion held with the `waivable` parameter deleted outright. A
+    WITHHELD divergence is `index_only`/`legacy_only`, i.e. exactly the
+    case `waivable=False` exists for.
+    """
+    corpus = equivalence.load_corpus("VX-41 | 2026/AA_one | n\n")
+    verdict = equivalence.run_equivalence(
+        corpus,
+        _scripted_runner(
+            {
+                "2026/AA_one": [
+                    [_tuple("a"), _tuple("b")],
+                    [_tuple("a")],
+                    [_tuple("a"), _tuple("c")],
+                ]
+            }
+        ),
+        clock=_counting_clock(),
+    )
+
+    entry = verdict.as_dict()["entries"][0]
+    assert entry["withheld_divergences"]
+    for divergence in entry["withheld_divergences"]:
+        assert divergence["side"] in equivalence.GATE_SIDES
+        assert divergence["proposed_waiver"] is None
+
+
+def test_a_run_that_dies_late_keeps_the_evidence_from_the_runs_that_finished():
+    """Reverting to a single tuple assignment left 1283 green.
+
+    The errored entry a human has to diagnose then ships with nothing in
+    it: no counts, no errors, no failed folders for the two legacy walks
+    that completed before the third raised.
+    """
+    corpus = equivalence.load_corpus("VX-41 | 2026/AA_one | n\n")
+    calls = {"n": 0}
+
+    def run_path(entry, mode):
+        calls["n"] += 1
+        if calls["n"] == 3:
+            raise ConnectionResetError("peer closed the connection")
+        return _path_run(mode, [_tuple("a")], errors=("Cannot get full path for x",))
+
+    verdict = equivalence.run_equivalence(corpus, run_path, clock=_counting_clock())
+
+    entry = verdict.entries[0]
+    assert entry.status == equivalence.ENTRY_ERRORED
+    assert "ConnectionResetError" in entry.error
+    # The two walks that DID finish are still in the document.
+    assert entry.reference is not None and entry.reference_second is not None
+    assert entry.index is None
+    assert entry.counts()["reference_tuples"] == 1
+    assert entry.counts()["errors"] == 1
+    payload = entry.as_dict()
+    assert payload["errors"] == ["Cannot get full path for x"]
+    assert len(payload["runs"]) == 2
+
+
+def test_a_broken_entry_beside_an_unstable_one_reads_as_errored_not_withheld():
+    """Ruling #4's precedence, which no test reached.
+
+    Swapping the last two branches of `verdict_status` left the suite
+    green while CI would read exit 2 (withheld: the instrument was
+    flaky) where the ruling says exit 3 (errored: something is broken).
+    The whole reason there are four codes is that those two must not look
+    alike.
+    """
+    corpus = equivalence.load_corpus(
+        "VX-41 | 2026/AA_flaky | unstable\nVX-41 | 2099/gone | archived\n"
+    )
+
+    verdict = equivalence.run_equivalence(
+        corpus,
+        _scripted_runner(
+            {
+                "2026/AA_flaky": [
+                    [_tuple("a"), _tuple("b")],
+                    [_tuple("a")],
+                    [_tuple("a")],
+                ],
+                "2099/gone": _agreeing([]),
+            }
+        ),
+        clock=_counting_clock(),
+    )
+
+    assert [e.status for e in verdict.entries] == [
+        equivalence.ENTRY_UNSTABLE_REFERENCE,
+        equivalence.ENTRY_ERRORED,
+    ]
+    assert equivalence.ENTRY_AGREED not in [e.status for e in verdict.entries]
+    assert verdict.status == equivalence.STATUS_ERRORED
+
+
+@pytest.mark.parametrize("attribute", ["umid", "provider_name", "storage_id"])
+def test_an_empty_ad2_field_is_refused_like_a_null_one(attribute):
+    """`""` is the second value that makes two broken extractions agree.
+
+    The null parametrize covered `None`; the empty-string branch of
+    `_required_field` was never reached, and an empty umid on both sides
+    compares equal exactly the way `"None"` used to.
+    """
+    clip = FakeClip("a", umid="u", provider_name="red")
+    setattr(clip, attribute, "")
+
+    with pytest.raises(equivalence.EquivalenceError, match="is empty"):
+        equivalence.ad2_tuple(clip, FOLDER)
+
+
+@pytest.mark.parametrize("path", [None, ""])
+def test_a_scanned_file_with_no_path_is_refused(path):
+    """`verified_file_path` comes off `file.getPath()`, which can be empty.
+
+    A pathless VSFile would otherwise become a sentinel that compares
+    equal to another pathless one — the `str(None)` defect one field
+    across.
+    """
+    clip = FakeClip("a", umid="u", provider_name="red")
+    clip.file = FakeFile(path)
+
+    with pytest.raises(equivalence.EquivalenceError, match="verified_file_path"):
+        equivalence.ad2_tuple(clip, FOLDER)
+
+
+def test_the_reference_runs_first_and_twice_and_the_index_runs_last():
+    """ "Order is load-bearing" was asserted nowhere.
+
+    `_scripted_runner` consumes its three scripted values positionally
+    and rewrites `mode`, so it agrees with ANY order `compare_entry`
+    picks. Inverting to index-first, or dropping the second reference
+    run, would silently re-target every instability test in this file.
+    """
+    corpus = equivalence.load_corpus("VX-41 | 2026/AA_one | n\n")
+    seen = []
+
+    def run_path(entry, mode):
+        seen.append(mode)
+        return _path_run(mode, [_tuple("a")])
+
+    equivalence.run_equivalence(corpus, run_path, clock=_counting_clock())
+
+    assert seen == [DISCOVERY_LEGACY, DISCOVERY_LEGACY, DISCOVERY_INDEX]
+
+
+def test_building_both_contexts_does_not_mutate_the_base_context():
+    """ "No context is ever mutated (AD-3/AD-4)" had no test.
+
+    The sharing test checks that the registry and storages are the SAME
+    objects; nothing re-read the base's own `discovery` afterwards, which
+    is the assertion that catches an in-place rebind.
+    """
+    base = _base_context()
+    before = base.options.discovery
+    context_for = equivalence.context_factory(base)
+
+    legacy = context_for(_entry(), DISCOVERY_LEGACY)
+    index = context_for(_entry(), DISCOVERY_INDEX)
+
+    assert (legacy.options.discovery, index.options.discovery) == (
+        DISCOVERY_LEGACY,
+        DISCOVERY_INDEX,
+    )
+    assert base.options.discovery == before
+    assert base.discovery_index is None
