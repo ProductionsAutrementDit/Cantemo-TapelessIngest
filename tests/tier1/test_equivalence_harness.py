@@ -468,9 +468,19 @@ def test_the_shipped_corpus_and_waiver_files_parse():
     waivers = equivalence.load_waivers_file(equivalence.default_waivers_path())
 
     assert corpus.entries
-    # F1: shipped UNRATIFIED, and it says so in machine-readable form.
-    assert corpus.ratified is False
+    # RATIFIED 2026-09-08 by Camille, on a measured inventory of all 18
+    # years of VX-41 with every path verified to be a real directory. The
+    # flag is what lets the gate exit 0, so it is pinned -- but as the
+    # invariant "ratification is recorded and justified", not as a fixed
+    # answer: a corpus can legitimately go back to unratified while it is
+    # being widened.
+    assert isinstance(corpus.ratified, bool)
     assert corpus.ratification_note
+    if corpus.ratified:
+        assert len(corpus.ratification_note) > 80, (
+            "a ratified corpus states what the ratification rests on; this "
+            "note is too short to carry evidence"
+        )
     # RULED 2026-09-04: pin the INVARIANT, not the emptiness. `waivers ==
     # ()` turned the first legitimately ratified waiver — the very
     # workflow the frozen block describes — into a red suite whose
@@ -482,16 +492,19 @@ def test_the_shipped_corpus_and_waiver_files_parse():
             waiver.side == equivalence.SIDE_ANY
             and waiver.folder == waiver.file == waiver.provider == "*"
         )
-    # RULED 2026-09-04: the corpus is the manual precedent's SHOOT, not
-    # the whole year. Re-widening it to `VX-41 | 2026` left the suite
-    # green, so the ruling and the deferred-work record that reconciles
-    # it were held only by the file's current contents.
-    (entry,) = corpus.entries
-    assert entry.path != "2026", (
-        "the corpus was re-widened to the whole year; that is a "
-        "maintenance-window run and a separate ratification decision"
-    )
-    assert entry.path.startswith("2026/AA_")
+    # RULED 2026-09-04: every entry is a SHOOT, never a bare year.
+    # Re-widening to `VX-41 | 2026` left the suite green, so the ruling
+    # and the deferred-work record that reconciles it were held only by
+    # the file's current contents. A year is 65,000 files walked three
+    # times -- a maintenance window, and a separate ratification.
+    for entry in corpus.entries:
+        segments = entry.path.split("/")
+        assert len(segments) >= 2, (
+            f"{entry.path!r} is a bare year: that is a maintenance-window "
+            f"run and a separate ratification decision"
+        )
+        assert segments[0].isdigit() and len(segments[0]) == 4, entry.path
+        assert entry.note, f"{entry.path} states no reason for being here"
 
 
 # ---------------------------------------------------------------------------
