@@ -2055,3 +2055,108 @@ def test_building_both_contexts_does_not_mutate_the_base_context():
     )
     assert base.options.discovery == before
     assert base.discovery_index is None
+
+
+# ---------------------------------------------------------------------------
+# The multi-file clip tuple collapse (measured on prod, 2026-09-08)
+# ---------------------------------------------------------------------------
+
+
+class _ScannedFile:
+    """The three methods `new_clip_defaults` and the AD-2 tuple read."""
+
+    def __init__(self, path, storage=STORAGE):
+        self._path = path
+        self._storage = storage
+
+    def getPath(self):
+        return self._path
+
+    def getId(self):
+        return f"{self._storage}-{self._path}"
+
+    def getStorage(self):
+        return self._storage
+
+
+def test_a_multi_file_clip_yields_the_same_tuples_whatever_order_it_was_read_in():
+    """The first FR-4 gate run's dominant defect, and it was the instrument's.
+
+    `attach_file_metadatas` overwrites `clip.file` once per file, so a
+    clip spanning several files keeps whichever file was attached LAST.
+    Legacy sorts each `from`/`size` page while the index path sorts the
+    scan root globally — the AD-7 divergence story 4.1 sanctioned — so
+    the two paths attach a different last file and the AD-2 tuple names a
+    different one on each side.
+
+    Measured on production 2026-09-08 over the ratified corpus: 196 of
+    203 charged divergences were this, symmetric `legacy_only` /
+    `index_only` pairs sharing a umid and sharing no file.
+    `deferred-work.md` had reasoned the loss was identical on both paths
+    and therefore harmless; it is not, because the SET is order
+    independent and "which file was attached last" is not.
+    """
+    from portal.plugins.TapelessIngest.models.clip import Clip
+
+    folder = "2012/EC_shoot/CONTENTS/AUDIO"
+    first = _ScannedFile(f"{folder}/0001WE01.MXF")
+    second = _ScannedFile(f"{folder}/0001WE03.MXF")
+    metadatas = {"umid": "60A2B340101010501010D4", "provider": "panasonicP2"}
+
+    def read_in(order):
+        clip = Clip(**Clip.new_clip_defaults(order[0], metadatas))
+        for scanned in order:
+            clip.attach_file_metadatas(scanned, metadatas)
+        return set(equivalence.ad2_tuples(clip, folder))
+
+    legacy_order = read_in([first, second])
+    index_order = read_in([second, first])
+
+    assert legacy_order == index_order, (
+        "the same clip read in two orders produced different AD-2 tuples: "
+        "that is the instrument diverging, not discovery"
+    )
+    # And the relation gains what the collapse was costing it: one tuple
+    # per FILE, which is what AD-2's set is defined over.
+    assert {values[1] for values in legacy_order} == {
+        first.getPath(),
+        second.getPath(),
+    }
+    # Returned sorted, so the order the files were read in cannot leak
+    # into what a caller sees.
+    clip = Clip(**Clip.new_clip_defaults(second, metadatas))
+    for scanned in (second, first):
+        clip.attach_file_metadatas(scanned, metadatas)
+    emitted = equivalence.ad2_tuples(clip, folder)
+    assert list(emitted) == sorted(emitted)
+
+
+def test_the_collector_reads_every_file_of_a_multi_file_clip():
+    """The seam where the per-file fix actually reaches the gate.
+
+    `_scan_pass` appends ONE clip object once per file it spans, so the
+    collector sees the same object repeatedly. Reading `ad2_tuple` there
+    -- one tuple per clip rather than per file -- puts the collapse back
+    while every other test stays green; established by mutation.
+    """
+    from portal.plugins.TapelessIngest.models.clip import Clip
+
+    folder = "2012/EC_shoot/CONTENTS/AUDIO"
+    files = [_ScannedFile(f"{folder}/0001WE0{i}.MXF") for i in (1, 3)]
+    metadatas = {"umid": "60A2B340101010501010D4", "provider": "panasonicP2"}
+    clip = Clip(**Clip.new_clip_defaults(files[0], metadatas))
+    for scanned in files:
+        clip.attach_file_metadatas(scanned, metadatas)
+
+    def process_folder(*args, **kwargs):
+        # One clip, two files: the walk hands it over once per file.
+        return FolderOutcome(
+            result=WorkerResult(folder_path=folder, clips=(clip, clip))
+        )
+
+    collector = equivalence.TupleCollector(process_folder)
+    collector(folder)
+
+    assert {values[1] for values in collector.tuples} == {
+        f.getPath() for f in files
+    }, "the collector collapsed a multi-file clip back to one tuple"

@@ -602,8 +602,11 @@ def ad2_tuple(clip, owning_folder_path) -> Ad2Tuple:
     read honestly must abort the folder, never become a placeholder that
     happens to compare equal to another placeholder.
     """
+    return _tuple_for(clip, getattr(clip, "file", None), owning_folder_path)
+
+
+def _tuple_for(clip, file, owning_folder_path) -> Ad2Tuple:
     where = f"clip {getattr(clip, 'umid', None)!r} in {owning_folder_path}"
-    file = getattr(clip, "file", None)
     if file is None:
         raise EquivalenceError(
             f"{where}: no scanned file, so its AD-2 tuple cannot be read"
@@ -615,6 +618,26 @@ def ad2_tuple(clip, owning_folder_path) -> Ad2Tuple:
         _required_field(getattr(clip, "provider_name", None), "provider_name", where),
         _required_field(owning_folder_path, "owning_folder_path", where),
     )
+
+
+def ad2_tuples(clip, owning_folder_path) -> Tuple[Ad2Tuple, ...]:
+    """Every AD-2 tuple one assembled clip contributes — one per FILE.
+
+    AD-2's set is defined over files, not over clips: a clip spanning
+    several files contributes one tuple each. Reading only `clip.file`
+    collapsed it to whichever file `attach_file_metadatas` bound LAST,
+    which is order dependent and therefore differs between the two
+    discovery paths (AD-7). Sorted, so the tuple order a caller sees
+    never leaks the order the files were read in.
+
+    A clip with no accumulated files falls back to `clip.file`: that is
+    the shape every hand-built test double has, and the fallback keeps
+    the single-file case reading exactly as before.
+    """
+    scanned = getattr(clip, "_scanned_files", None)
+    if not scanned:
+        return (ad2_tuple(clip, owning_folder_path),)
+    return tuple(sorted(_tuple_for(clip, file, owning_folder_path) for file in scanned))
 
 
 class TupleCollector:
@@ -667,7 +690,17 @@ class TupleCollector:
         # FOLDER set is written after the same gate — a folder whose
         # tuples could not be read must not turn up in `folder_paths`
         # and take part in the descent comparison.
-        found = [ad2_tuple(clip, result.folder_path) for clip in result.clips]
+        # `result.clips` repeats ONE clip object once per file it spans,
+        # so the clips are deduplicated by identity before their tuples
+        # are read: `ad2_tuples` already returns every file's tuple, and
+        # a 500-file clip would otherwise be expanded 500 times over.
+        seen = []
+        for clip in result.clips:
+            if not any(known is clip for known in seen):
+                seen.append(clip)
+        found = [
+            values for clip in seen for values in ad2_tuples(clip, result.folder_path)
+        ]
         self.tuples.update(found)
         self.folder_paths.add(result.folder_path)
         if self._progress is not None and self.calls % PROGRESS_EVERY == 0:

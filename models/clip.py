@@ -927,6 +927,23 @@ class Clip(models.Model):
         self.metadatas = metadatas
         self.file = file
         self.reference_file = file.getId()
+        # FR-4: a clip spanning several files keeps only the LAST one on
+        # `self.file`, because this runs once per file on ONE clip
+        # object. Production is content with that; the equivalence gate
+        # is not, because legacy sorts each page while the index path
+        # sorts the scan root globally (AD-7), so the two attach a
+        # different last file and the AD-2 tuple names a different one on
+        # each side. Measured on prod 2026-09-08: 196 of 203 charged
+        # divergences were exactly this. Accumulating them here is
+        # instance state, like `_file`/`_root_path`/`_storage` above: no
+        # column, no query, no change to what production does with
+        # `self.file`.
+        scanned = getattr(self, "_scanned_files", None)
+        if scanned is None:
+            scanned = self._scanned_files = []
+        path = file.getPath()
+        if not any(known.getPath() == path for known in scanned):
+            scanned.append(file)
         return self
 
     @classmethod
