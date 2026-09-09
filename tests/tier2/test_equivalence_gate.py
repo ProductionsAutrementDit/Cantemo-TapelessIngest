@@ -1991,3 +1991,72 @@ def test_a_descent_divergence_is_produced_by_the_real_walk(
     assert entry.folder_divergences, "the real walk produced no descent divergence"
     walked_once = {(d.side, d.folder_path) for d in entry.folder_divergences}
     assert (equivalence.SIDE_INDEX_ONLY, f"{CARD}/{SUBPATH}") in walked_once
+
+
+class _RecordingStream:
+    """A stdout double that records writes AND flushes, in order.
+
+    Django wraps whatever `call_command(stdout=...)` is given in an
+    `OutputWrapper`, whose `flush()` delegates here -- so this observes
+    the real interleaving the operator's terminal or log file would see.
+    """
+
+    def __init__(self):
+        self.events = []
+
+    def write(self, text):
+        self.events.append(("write", text))
+
+    def flush(self):
+        self.events.append(("flush",))
+
+    def isatty(self):
+        return False
+
+    def getvalue(self):
+        return "".join(
+            t for kind, *rest in self.events for t in rest if kind == "write"
+        )
+
+
+def test_progress_is_flushed_as_it_is_produced_not_at_the_end(
+    migrated_db, tree, card_provider, tmp_path
+):
+    """E4's hook is useless unless it reaches the reader while it runs.
+
+    Python block-buffers a non-tty stdout, so a redirected run -- which
+    is every unattended one, including cron -- shows nothing until 8KB
+    has accumulated or the process exits. Measured on production
+    2026-09-08: 130 bytes of log after 11 minutes of a 22-minute run,
+    and all 130 were Django's own stderr. The progress hook exists
+    precisely for the long unattended run and was inert in exactly that
+    case.
+    """
+    corpus_file, waiver_file = _files(tmp_path, f"{STORAGE_ID} | {ROOT} | n\n")
+    stream = _RecordingStream()
+
+    call_command(
+        "verify_discovery_equivalence",
+        "--corpus",
+        corpus_file,
+        "--waivers",
+        waiver_file,
+        "--providers",
+        card_provider.machine_name,
+        stdout=stream,
+    )
+
+    kinds = [e[0] for e in stream.events]
+    first_progress = next(
+        i for i, e in enumerate(stream.events) if e[0] == "write" and "starting" in e[1]
+    )
+    assert "flush" in kinds[first_progress:], "no flush at all after a progress line"
+    next_flush = kinds.index("flush", first_progress)
+    later_writes = [
+        i for i, k in enumerate(kinds) if k == "write" and i > first_progress
+    ]
+    assert not later_writes or next_flush < later_writes[-1], (
+        "the stream was only flushed at the very end: a redirected run "
+        "stays silent for its whole duration, which is what the hook exists "
+        "to prevent"
+    )

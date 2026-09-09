@@ -342,7 +342,7 @@ class Command(BaseCommand):
             # E4 again: the per-ENTRY line lands only when an entry ends,
             # and the shipped corpus holds one entry. Progress has to
             # come from inside the walk.
-            emit=self.stdout.write,
+            emit=self._emit,
         )
 
         # C3: what this run was NARROWED to. A run over one provider
@@ -379,7 +379,7 @@ class Command(BaseCommand):
             scope=scope,
             # E4: three walks per entry over an 8,000-folder tree is
             # hours of silence otherwise.
-            emit=self.stdout.write,
+            emit=self._emit,
             now=started_at,
         )
         document = json.dumps(
@@ -467,6 +467,20 @@ class Command(BaseCommand):
                 f"entries that otherwise concluded"
             )
         log.info("discovery equivalence ACCEPTED (exit %d)", EXIT_ACCEPTED)
+
+    def _emit(self, line):
+        """Write a progress line AND flush it.
+
+        Python block-buffers a non-tty stdout, so a run whose output is
+        redirected -- which is every unattended one, cron included --
+        showed nothing until 8KB had accumulated or the process exited.
+        Measured on prod 2026-09-08: 130 bytes of log after 11 minutes of
+        a 22-minute run, all of it Django's own stderr. E4's whole point
+        is that a three-walk pass over a shoot tree must not be silent,
+        and it was silent in exactly the case it was written for.
+        """
+        self.stdout.write(line)
+        self.stdout.flush()
 
     def _process_folder(self):
         """Imported lazily so ``--help`` never pulls in the ORM."""
