@@ -235,6 +235,24 @@ def extras_without_a_file_id(extra_files: Any) -> List[Dict[str, Any]]:
 # still running.
 PLACEHOLDER_IMPORT_JOB_TYPE = "PLACEHOLDER_IMPORT"
 
+# The shape tag EVERY anchor import asks Vidispine to transcode to — the
+# ONE source of truth for both anchor paths (`_import_single_component`
+# passes it as `tags`, which Portal copies into the import query's `tag`;
+# `_import_multi_component` puts it in that query by hand). Ruled
+# 2026-09-14: every clip the plugin ingests, all providers, mono and
+# multi-component alike, gets this shape — not only RED.
+#
+# Requesting the tag is NOT enough on its own. Portal's PLACEHOLDER_IMPORT
+# job (step 540, `vidispine/place_holder_import_tasks.xml`) REPLACES the
+# job's tags with the ingest group's import-map targets whenever the
+# file's mimetype matches, so the default ingest group's profile must
+# also target this tag or the request is silently overridden — which is
+# why the old hardcoded `lowres` never mattered. And Portal only serves a
+# proxy from a shape whose tag is listed in `PREVIEW_VIDEO_SHAPES` in
+# `portal.conf`, which Portal upgrades reset. The operational checklist
+# lives in USER_GUIDE.md ("Configure transcode profiles").
+TRANSCODE_SHAPE_TAG = "lowres-forge"
+
 
 # WHICH file a running job is importing is read off the job OBJECT, by
 # PATH — never off the job's `data` list.
@@ -2033,6 +2051,7 @@ class Clip(models.Model):
         res = ingest_helper.importFileToPlaceholder(
             self.item_id,
             file_id=main_file_id,
+            tags=TRANSCODE_SHAPE_TAG,
             ingestprofile_groups=user_groups,
             notification_id=None,
             noTranscode=no_transcode,
@@ -2775,7 +2794,7 @@ class Clip(models.Model):
             self.error = message
             return False
 
-        query = {"fileId": main_file_id, "tag": "lowres"}
+        query = {"fileId": main_file_id, "tag": TRANSCODE_SHAPE_TAG}
         if no_transcode:
             query["no-transcode"] = no_transcode
 

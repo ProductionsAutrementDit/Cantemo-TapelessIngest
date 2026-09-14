@@ -1423,9 +1423,19 @@ class IngestHelperFake(_HelperFake):
         notification_id=None,
         noTranscode=None,
         ignore_sidecars=False,
+        tags=None,
     ):
+        # `tags` is recorded so a test can read back WHICH shape tag the
+        # single-component anchor asked for — Portal copies it into the
+        # import query's `tag`, the same slot the multi-component anchor
+        # fills by hand.
         VidispineFake.record(
-            "importFileToPlaceholder", item_id=item_id, file_id=file_id
+            "importFileToPlaceholder",
+            item_id=item_id,
+            file_id=file_id,
+            tags=tags,
+            noTranscode=noTranscode,
+            ignore_sidecars=ignore_sidecars,
         )
         if not file_id:
             raise ImportWithoutAFileId(

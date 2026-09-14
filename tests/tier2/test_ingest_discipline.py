@@ -41,7 +41,11 @@ from portal.vidispine.iexception import NotFoundError
 
 from portal.plugins.TapelessIngest.models import clip as clip_module
 from portal.plugins.TapelessIngest.models import folder as folder_module
-from portal.plugins.TapelessIngest.models.clip import Clip, ClipMetadata
+from portal.plugins.TapelessIngest.models.clip import (
+    TRANSCODE_SHAPE_TAG,
+    Clip,
+    ClipMetadata,
+)
 from portal.plugins.TapelessIngest.models.folder import Folder, persist_scan_results
 from portal.plugins.TapelessIngest.providers.providers import (
     MAIN_FILE_YIELDS_VIDEO,
@@ -832,8 +836,19 @@ def test_extra_components_carry_a_bare_file_id(migrated_db):
     assert "ingestprofile_groups" not in component["kwargs"]
 
 
+def test_the_transcode_shape_tag_is_the_forge_profile():
+    """`lowres-forge` is the Portal encoding profile production runs (ruled
+    2026-09-14, every provider); renaming the profile must redden a test
+    whose name says so, not a proxy on prod."""
+    assert TRANSCODE_SHAPE_TAG == "lowres-forge"
+
+
 def test_the_main_import_still_carries_the_tag_and_the_ingest_groups(migrated_db):
-    """The counterpart: stripping the components must not strip the main file."""
+    """The counterpart: stripping the components must not strip the main file.
+
+    The tag is the ONE constant: a call site that drifts off it must
+    redden a test, not a proxy on prod.
+    """
     api = _multi_component_import(
         _ItemHelperFake({"jobId": "VX-77"}),
         [{"file_id": "VX-41-A0", "path": "a0.wav", "type": "audio"}],
@@ -841,7 +856,7 @@ def test_the_main_import_still_carries_the_tag_and_the_ingest_groups(migrated_db
 
     main = next(i for i in api.imports if i["component"] == "container")
     assert main["query"]["fileId"] == "VX-41-MAIN"
-    assert main["query"]["tag"] == "lowres"
+    assert main["query"]["tag"] == TRANSCODE_SHAPE_TAG
     assert main["kwargs"]["ingestprofile_groups"] == ["Admin"]
 
 
@@ -1167,6 +1182,88 @@ def test_a_real_import_with_a_job_id_is_ingested(
     assert stored.job_id == "VX-JOB-77"
     assert stored.item_id
     assert stored.status == Clip.STATUS_PLACHOLDER_CREATED
+
+
+def test_the_single_component_import_asks_for_the_same_shape_tag(
+    migrated_db, es_fake, es_page, ingestable_provider, tmp_path, collection_seam
+):
+    """A one-file clip asks for the SAME shape tag as a multi-component one.
+
+    Before 2026-09-14 the single path passed no tag at all and Portal's
+    group ingest profile (`DEFAULT_VIDEO_TRANSCODES = lowres`) decided,
+    while the multi path hardcoded `lowres`. Both anchors now request
+    `TRANSCODE_SHAPE_TAG` explicitly, through the SAME constant, so the
+    two paths cannot drift apart again.
+
+    What is pinned: both call sites share the one constant. The `tags`
+    the single path sends is read off the STUB's recorded call and
+    compared to the tag the multi path puts in its container query, not
+    to a second literal. That Portal copies `tags` into the import
+    query's `tag` is VENDOR behaviour, evidenced by the decompiled
+    `IngestHelper.importFileToPlaceholder` and by Portal's own v2 API
+    passing `tags` as a plain string (`portal/api/v2/items/views.py:635`)
+    — not by this test.
+    """
+    rel = "2026/AH_20260101_shapetag"
+    es_fake.push(es_page(_ingestable_page(tmp_path, rel, ["CLIPTAG"]), total=1))
+    VidispineFake.set_import_response({"jobId": "VX-JOB-78"})
+
+    response = _folder(tmp_path, rel).ingest(providers=[INGESTABLE_NAME])
+
+    assert (response["ingested"], response["failed"]) == (1, 0)
+    single_imports = [
+        details
+        for name, details in VidispineFake.calls
+        if name == "importFileToPlaceholder"
+    ]
+    assert len(single_imports) == 1
+    assert single_imports[0]["tags"] == TRANSCODE_SHAPE_TAG
+    assert single_imports[0]["ignore_sidecars"] is True
+
+    multi = _multi_component_import(
+        _ItemHelperFake({"jobId": "VX-77"}),
+        [{"file_id": "VX-41-A0", "path": "a0.wav", "type": "audio"}],
+    )
+    container = next(i for i in multi.imports if i["component"] == "container")
+    assert single_imports[0]["tags"] == container["query"]["tag"]
+
+
+def test_a_no_transcode_import_still_asks_for_the_shape_tag_on_both_paths(
+    migrated_db,
+):
+    """A REPLACED clip imports with `no-transcode`, and keeps the tag.
+
+    `import_file` forces `no_transcode = True` on a replace; the tag and
+    the override are two different fields of the same request, so the
+    override must not cost the request its tag, on either anchor path.
+    """
+    from tests.portal_stub import IngestHelperFake, ItemAPIFake as _StubItemAPI
+
+    multi = _ItemHelperFake({"jobId": "VX-77"})
+    Clip(umid="NO-TRANSCODE", item_id="VX-100")._import_multi_component(
+        {"file_id": "VX-41-MAIN", "path": "main.mxf", "type": "video"},
+        [{"file_id": "VX-41-A0", "path": "a0.wav", "type": "audio"}],
+        "VX-100-SHAPE",
+        ["Admin"],
+        True,
+        None,
+        multi,
+        _JobHelperFake(),
+    )
+    container = next(i for i in multi.itemapi.imports if i["component"] == "container")
+    assert container["query"]["tag"] == TRANSCODE_SHAPE_TAG
+    assert container["query"]["no-transcode"] is True
+
+    VidispineFake.set_item("VX-900")
+    _StubItemAPI().createPlaceholderShape("VX-900")
+    VidispineFake.set_import_response({"jobId": "VX-JOB-79"})
+    Clip(umid="NO-TRANSCODE-1", item_id="VX-900")._import_single_component(
+        "VX-41-SOLO", ["Admin"], True, IngestHelperFake(), _JobHelperFake()
+    )
+    single = [d for n, d in VidispineFake.calls if n == "importFileToPlaceholder"]
+    assert len(single) == 1
+    assert single[0]["tags"] == TRANSCODE_SHAPE_TAG
+    assert single[0]["noTranscode"] is True
 
 
 def test_a_failed_import_leaves_a_row_that_says_so(

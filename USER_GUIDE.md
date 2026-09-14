@@ -495,6 +495,37 @@ POST /tapelessingest/api/folder/{folder_id}/ingest/
 4. Check storage methods (browse enabled)
 5. Review Portal error logs
 
+### Issue: Clip ingested but the proxy is `lowres` / the transcoder plugin was never invoked
+
+**Symptoms**: the clip is `ingested`, the item has a proxy, but its shape
+tag is `lowres` rather than `lowres-forge`, and no transcoder-plugin job
+exists for the item.
+
+**Cause**: the default ingest group's ingest profile overrode the tag.
+Portal's `PLACEHOLDER_IMPORT` job (step 540) replaces the job's tags with
+the group's import-map targets when the file's mimetype matches, so the
+plugin's explicit `lowres-forge` request never reached the transcoder.
+
+**Solution**: set the ingest group's import map / transcode presets to
+target `lowres-forge` for video (see "Configure transcode profiles" under
+Performance Tuning). Already-ingested items are not retranscoded, and
+`--replace` will not do it either (a replaced clip imports with
+`no-transcode`): request a transcode to `lowres-forge` from the Portal
+item page, or delete the item and re-ingest the clip.
+
+### Issue: Proxy shape exists but the item page plays nothing
+
+**Symptoms**: the item carries a `lowres-forge` shape with a real file,
+yet the Portal item page shows no player or a black one.
+
+**Cause**: `PREVIEW_VIDEO_SHAPES` in `/etc/cantemo/portal/portal.conf`
+does not list `lowres-forge` — most likely because a Portal upgrade reset
+the file.
+
+**Solution**: add `lowres-forge` to `PREVIEW_VIDEO_SHAPES` (keeping
+`lowres` for the existing catalogue) and restart Portal; see "Configure
+transcode profiles" under Performance Tuning.
+
 ### Issue: A clip is `failed` and its media is already on the item
 
 **Symptoms**: the run reports the clip `failed` with a reason mentioning
@@ -659,7 +690,10 @@ user_clip_name    -> description
 - Consider dedicated ES instance for large deployments
 
 **Vidispine**:
-- Configure transcode profiles appropriately
+- Configure transcode profiles appropriately:
+  - The plugin requests the `lowres-forge` shape tag explicitly on every anchor import, all providers, single- and multi-component clips alike.
+  - The default ingest group's ingest profile (Portal Admin → Groups → the ingest group → import map / transcode presets) MUST target `lowres-forge` for video. Portal's `PLACEHOLDER_IMPORT` job (step 540) replaces the job's tags with the group's targets whenever the file's mimetype matches the import map, so a group profile still targeting `lowres` silently overrides the plugin's request and the transcoder plugin is never invoked. This setting lives in Vidispine group metadata and survives Portal upgrades.
+  - `PREVIEW_VIDEO_SHAPES` in `/etc/cantemo/portal/portal.conf` must list `lowres-forge` IN ADDITION to `lowres`: clips ingested before this change carry `lowres`-only shapes and replaced clips keep their legacy proxy (`no-transcode`), so dropping `lowres` breaks playback of the existing catalogue. That file is reset by Portal upgrades — re-check it after each one.
 - Balance transcode priority
 - Monitor job queue depth
 
