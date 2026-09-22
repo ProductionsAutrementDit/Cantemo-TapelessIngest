@@ -201,6 +201,13 @@ GET /tapelessingest/api/clip/{umid}/
 - **Registered (2)**: File registered in Vidispine
 - **Placeholder created (3)**: Item exists but no media
 - **Imported (4)**: Fully imported with transcodes
+- **Shape posted (5)**: The plugin stated the item's `original` shape
+  itself and asked for the proxy, because Vidispine could deduce no
+  shape from the media (see "Sources Vidispine cannot decode"). This
+  route starts **no import job**, so such a clip has an item id and an
+  empty `job_id` — which is why it has a state of its own: without it
+  the resume rung would read the row as an unfinished import and post a
+  second `original` shape on every scan.
 
 **Query by Status**:
 ```
@@ -418,10 +425,49 @@ Two states are not resumed:
 **Sources Vidispine cannot decode.** Some media yields no video essence
 to Vidispine's shape deduction — every `.R3D` whose start timecode
 carries the drop-frame flag, for instance. Those produce a *binary*
-component, which satisfies the container slot and no video slot, so the
-declared component count leaves the video slot out for them. The
-provider decides this (`red` reads it from REDline's `Abs TC`); every
-other provider keeps counting its main file as a video contributor.
+component, which satisfies the container slot and no video slot.
+
+For a provider that can describe its own essence — today that is `red`
+and only `red` — the plugin no longer imports such a clip at all. It
+**posts the whole `original` shape itself** and then asks for the proxy
+explicitly:
+
+1. the shape document is composed from what REDline already printed at
+   scan time (duration, resolution, frame rate), plus the format
+   constants read off a shape Vidispine built itself for a decodable
+   twin — nothing is guessed, and a REDline column that is missing or
+   unreadable fails the clip by name instead. If the card carries a
+   separate `.wav`, its channels, sample rate and length are read from
+   the `.wav`'s own header and declared as an audio component, so the
+   sound is never silently left off the item; a `.wav` the standard
+   `wave` reader refuses (RF64, floating-point) fails the clip by name
+   too, rather than posting a shape without its sound;
+2. it is `POST`ed to `/API/item/{id}/shape/create?tag=original&updateItemMetadata=true`.
+   The `updateItemMetadata` half is what makes the ITEM state its
+   duration, its resolution and its codec; without it the shape is
+   correct and the item stays invisible to any duration or type search;
+3. a `lowres-forge` transcode is requested on the item. No import job
+   exists on this route, and it is the main file's import job that
+   normally starts the transcode, so nothing else would ever ask;
+4. the clip is recorded **Shape posted (5)**.
+
+The item ends up with video components naming `_001`...`_N` — the set
+the transcoder plugin reconstructs the take from — a stated duration,
+and a proxy. Single-segment clips take the same route: before this they
+were not even typed as video (`mediaType = 'data'`).
+
+Re-running is safe: `shape/create` **adds** a shape rather than
+replacing one, so the plugin refuses to post when the item already
+carries a real (non-placeholder) `original` shape. The empty placeholder
+shape Vidispine leaves beside it is harmless — it is invisible to
+`GET /API/item/{id}/shape` and to the transcoder plugin — and must not
+be deleted by hand: `DELETE ...?keepFiles=true` marks the files for
+removal.
+
+Providers that cannot compose a shape document keep the old behaviour
+exactly: the declared component count leaves the video slot out for the
+main file, and the clip is imported as before. Every provider but `red`
+keeps counting its main file as a video contributor in the first place.
 
 ### Dry Run Mode
 

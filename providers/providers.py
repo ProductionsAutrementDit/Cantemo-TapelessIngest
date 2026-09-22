@@ -86,6 +86,30 @@ def yields_video_component(main_file):
     return bool(declared)
 
 
+def main_file_declares_no_video(main_file):
+    """Whether the provider DECLARED, positively, that there is no video.
+
+    The third reading of the same key, and the only one the SHAPE-POSTING
+    route may turn on. ``yields_video_component`` folds an absent key and
+    an explicit ``None`` into ``True``, and ``main_file_verdict_is_unknown``
+    answers for ``None`` alone; this one answers for a provider that
+    looked, could tell, and said NO. An absent key is not this — that is a
+    provider that never had the question — and neither is ``None``, which
+    is the un-evidenced refusal ruled on 2026-09-02.
+
+    A falsy value that is not ``None`` (``0``, ``""``) is taken at its
+    word, exactly as ``yields_video_component`` coerces it: a provider
+    answering ``0`` has taken a position, and the two readers must not
+    disagree about which position it is.
+    """
+    if not isinstance(main_file, Mapping):
+        return False
+    if MAIN_FILE_YIELDS_VIDEO not in main_file:
+        return False
+    declared = main_file[MAIN_FILE_YIELDS_VIDEO]
+    return declared is not None and not bool(declared)
+
+
 def main_file_verdict_is_unknown(main_file):
     """Whether the provider DECLARED that it could not tell.
 
@@ -410,6 +434,35 @@ class Provider:
 
         Overriding THIS hook is how a provider narrows the answer; see
         ``providers/red.py``, which derives it from REDline's ``Abs TC``.
+        """
+        return None
+
+    def buildShapeDocument(self, main_file, extra_files, metadatas):
+        """A COMPLETE Vidispine ``ShapeDocument`` for this clip, or ``None``.
+
+        Only ever consulted when this provider has declared, positively,
+        that the anchor yields no video component
+        (``main_file_declares_no_video``). Vidispine then deduces nothing
+        from the anchor, so there is no shape for an import to complete
+        and the plugin has to state the shape itself — see
+        ``Clip._post_shape_document``.
+
+        ``None`` — the default — means "I cannot compose one", and the
+        clip keeps the budget-and-import route it has always taken.
+        That is what keeps this story at ``red``: a provider that answers
+        ``False`` without knowing how to describe its own essence must
+        not be handed a route that would have to GUESS a codec, a
+        resolution and a frame rate on its behalf.
+
+        Implementations must be PURE: a dict in, a dict out, no
+        Vidispine, no filesystem, no database. They may raise
+        ``TapelessIngestException`` to refuse a clip they cannot describe
+        honestly; the caller reports that reason and imports nothing.
+
+        Args:
+            main_file: the anchor dict ``getClipMainMediaFile`` returned
+            extra_files: the list ``getClipAdditionalMediaFiles`` returned
+            metadatas: the clip's metadata mapping
         """
         return None
 

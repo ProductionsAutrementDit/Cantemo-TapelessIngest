@@ -30,6 +30,7 @@ import logging
 import os
 import re
 import time
+import wave
 
 import pytest
 from django.db import DatabaseError, connection
@@ -41,12 +42,15 @@ from portal.vidispine.iexception import NotFoundError
 
 from portal.plugins.TapelessIngest.models import clip as clip_module
 from portal.plugins.TapelessIngest.models import folder as folder_module
+from portal.plugins.TapelessIngest.helpers import TapelessIngestHelper
 from portal.plugins.TapelessIngest.models.clip import (
     TRANSCODE_SHAPE_TAG,
     Clip,
     ClipMetadata,
+    ItemHelperExtended,
 )
 from portal.plugins.TapelessIngest.models.folder import Folder, persist_scan_results
+from portal.plugins.TapelessIngest.providers import red as red_module
 from portal.plugins.TapelessIngest.providers.providers import (
     MAIN_FILE_YIELDS_VIDEO,
     Provider as BaseProvider,
@@ -2668,6 +2672,636 @@ def test_a_deducible_anchor_promotes_its_shape_end_to_end(
     assert _declared_counts() == [{"container": 1, "video": 3, "audio": None}]
     item_id = Clip.objects.get(pk=f"{rel}/CLIPVID").item_id
     assert VidispineFake.placeholder_shape(item_id) is None
+
+
+# --- (4b) the dot-separated RED anchor: the shape is POSTED, not imported
+
+
+RED_SHAPE_NAME = "fakeredshape"
+RED_STEM = "K001_K067_0804BF"
+
+# The eight technical columns exactly as REDline prints them — strings,
+# verbatim. `red.getAllClipMetadatas` persists them unconverted; turning
+# them into a duration and a resolution is the document's business.
+REDLINE_METADATAS = {
+    "frame_width": "3840",
+    "frame_height": "2160",
+    "fps": "60.000",
+    "record_fps": "60.000",
+    "total_frames": "1012",
+    "file_segments": "2",
+    "redcode": "5:1",
+    "camera_audio_channels": "2",
+}
+
+
+class RedShapeProvider(IngestableProvider):
+    """`red`-shaped down to the file names, and the REAL shape builder.
+
+    `buildShapeDocument` is `providers.red.Provider`'s own staticmethod,
+    not a stand-in: the document these tests watch being posted is the
+    one production posts, so a change to either side shows up here.
+
+    `verdict` is what `red.anchor_yields_video_component` answers off
+    `Abs TC` — `False` for a dot-separated timecode, `True` for a
+    colon-separated one, `None` for one it cannot read.
+    """
+
+    def __init__(self, extras=1, verdict=False, metadatas=None, wav_root=None):
+        IngestableProvider.__init__(self)
+        self.name = "Fake RED Shape Provider"
+        self.machine_name = RED_SHAPE_NAME
+        self.extras = extras
+        self.verdict = verdict
+        self.wav_root = wav_root
+        self.redline_metadatas = dict(
+            REDLINE_METADATAS if metadatas is None else metadatas
+        )
+
+    def getExtensions(self):
+        return [".R3D"]
+
+    def getMetadatasFromFile(self, media_file, metadatas, context):
+        metadatas["provider"] = self.machine_name
+        metadatas["umid"] = os.path.splitext(media_file.getPath())[0]
+        metadatas["clipname"] = os.path.basename(metadatas["umid"])
+        metadatas.update(self.redline_metadatas)
+        return metadatas
+
+    def getClipMainMediaFile(self, clip):
+        return {
+            "type": "video",
+            "track": 1,
+            "order": 0,
+            "file_id": clip.file_id,
+            "path": os.path.join(clip.path, f"{clip.metadatas['clipname']}.R3D"),
+            MAIN_FILE_YIELDS_VIDEO: self.verdict,
+        }
+
+    def getClipAdditionalMediaFiles(self, clip):
+        stem = clip.metadatas["clipname"].rsplit("_", 1)[0]
+        files = [
+            {
+                "type": "video",
+                "track": 1,
+                "order": index - 1,
+                "file_id": f"{clip.file_id}-S{index:03d}",
+                "path": os.path.join(clip.path, f"{stem}_{index:03d}.R3D"),
+            }
+            for index in range(2, self.extras + 2)
+        ]
+        if self.wav_root:
+            name = f"{clip.metadatas['clipname']}.wav"
+            files.append(
+                {
+                    "type": "audio",
+                    "track": 1,
+                    "order": 1,
+                    "file_id": f"{clip.file_id}-WAV",
+                    "path": os.path.join(clip.path, name),
+                    "absolute_path": os.path.join(self.wav_root, name),
+                }
+            )
+        return files
+
+    buildShapeDocument = staticmethod(red_module.Provider.buildShapeDocument)
+
+
+@pytest.fixture
+def red_shape_provider():
+    def _register(extras=1, verdict=False, metadatas=None, wav_root=None):
+        provider = RedShapeProvider(
+            extras=extras, verdict=verdict, metadatas=metadatas, wav_root=wav_root
+        )
+        Clip._PROVIDER_CACHE[RED_SHAPE_NAME] = provider
+        return provider
+
+    yield _register
+    Clip._PROVIDER_CACHE.pop(RED_SHAPE_NAME, None)
+
+
+def _red_page(tmp_path, rel, names):
+    """Only the ANCHOR is on disk; the segments are the provider's word.
+
+    That is production's shape too: the scan groups on `_001` and the
+    provider re-collects the siblings from the storage index.
+    """
+    return _write_clips(tmp_path, rel, names, suffix=".R3D")
+
+
+def _posted_shapes():
+    return [
+        details
+        for name, details in VidispineFake.calls
+        if name == "createShapeFromDocument"
+    ]
+
+
+def _transcode_requests():
+    return [
+        details
+        for name, details in VidispineFake.calls
+        if name == "requestItemTranscode"
+    ]
+
+
+def _import_calls():
+    return [
+        name
+        for name, _details in VidispineFake.calls
+        if name
+        in (
+            "doImportToPlaceholder",
+            "importFileToPlaceholder",
+            "updatePlaceholderComponentCount",
+            "createPlaceholderShape",
+        )
+    ]
+
+
+@pytest.mark.parametrize("extras,segments", [(0, 1), (1, 2), (3, 4)], ids=str)
+def test_a_dot_separated_anchor_posts_one_whole_shape(
+    migrated_db,
+    es_fake,
+    es_page,
+    red_shape_provider,
+    tmp_path,
+    collection_seam,
+    extras,
+    segments,
+):
+    """The route, end to end: ONE shape, naming `_001`...`_N`, no import.
+
+    ``extras=0`` is the ``VX-216301`` population — single segment, shape
+    promoted, ``binaryComponent`` and nothing else, ``mediaType =
+    'data'``. It is a third of the broken clips and it is broken
+    differently only because the SINGLE-component import path never read
+    the verdict. Routing on the verdict once, before the paths split, is
+    what covers both.
+
+    Mutations killed: selecting the route inside
+    ``_import_multi_component`` only (``extras=0`` then imports as
+    before); patching the placeholder instead of posting the whole shape
+    (the components start at ``_002``).
+    """
+    red_shape_provider(extras=extras)
+    rel = f"2026/AH_20260101_post{segments}"
+    es_fake.push(es_page(_red_page(tmp_path, rel, [f"{RED_STEM}_001"]), total=1))
+
+    response = _folder(tmp_path, rel).ingest(providers=[RED_SHAPE_NAME])
+
+    assert (response["ingested"], response["failed"]) == (1, 0)
+    assert response["errors"] == []
+
+    posted = _posted_shapes()
+    assert len(posted) == 1
+    document = posted[0]["document"]
+    # The tag and `updateItemMetadata` travel in the QUERY. Without the
+    # second one the shape is perfect and the ITEM stays mute —
+    # `mediaType='none'`, `durationSeconds` empty (VX-216898).
+    assert (posted[0]["tag"], posted[0]["update_item_metadata"]) == (
+        "original",
+        "true",
+    )
+    assert posted[0]["method"] == "POST"
+
+    anchor_id = Clip.objects.get(pk=f"{rel}/{RED_STEM}_001").file_id
+    expected = [anchor_id] + [f"{anchor_id}-S{i:03d}" for i in range(2, segments + 1)]
+    assert [c["file"][0]["id"] for c in document["videoComponent"]] == expected
+    # The container names the ANCHOR, never a segment.
+    assert document["containerComponent"]["file"] == [{"id": anchor_id}]
+    # Whole-take duration on every one of them.
+    assert {
+        tuple(sorted(c["duration"]["timeBase"].items()))
+        for c in document["videoComponent"]
+    } == {(("denominator", 60000), ("numerator", 1000))}
+    assert {c["duration"]["samples"] for c in document["videoComponent"]} == {1012}
+
+    # Nothing was imported and no budget was declared: this route
+    # replaces both.
+    assert _import_calls() == []
+
+
+def test_a_dot_separated_clip_with_a_wav_declares_its_sound(
+    migrated_db, es_fake, es_page, red_shape_provider, tmp_path, collection_seam
+):
+    """322 RED clips on prod carry a separate `.wav` (10 shoots, 2022-2026).
+
+    Dropping it silently was never an option, and refusing those clips
+    was the wrong reading of the audio "Ask First": what that rules out
+    is GUESSING the audio inside the `.R3D`, whose sample rate no
+    captured column gives. A separate `.wav` declares its own
+    parameters, so they are read off its header.
+
+    Mutations killed: filtering non-video extras away (the item is
+    ingested without its sound and every counter says success);
+    appending the `.wav` to the video components (the `_001`...`_N` set
+    the reconstruction reads gains a file that is not a segment).
+    """
+    rel = "2026/AH_20260101_withwav"
+    sources = _red_page(tmp_path, rel, [f"{RED_STEM}_001"])
+    handle = wave.open(str(tmp_path / rel / f"{RED_STEM}_001.wav"), "wb")
+    handle.setnchannels(2)
+    handle.setsampwidth(3)
+    handle.setframerate(48000)
+    handle.writeframes(b"\x00" * 6 * 1000)
+    handle.close()
+    red_shape_provider(extras=2, wav_root=str(tmp_path / rel))
+    es_fake.push(es_page(sources, total=1))
+
+    response = _folder(tmp_path, rel).ingest(providers=[RED_SHAPE_NAME])
+
+    assert (response["ingested"], response["failed"]) == (1, 0)
+    assert response["errors"] == []
+    document = _posted_shapes()[0]["document"]
+    anchor_id = Clip.objects.get(pk=f"{rel}/{RED_STEM}_001").file_id
+    # The picture is untouched: three segments, no `.wav` among them.
+    assert [c["file"][0]["id"] for c in document["videoComponent"]] == [
+        anchor_id,
+        f"{anchor_id}-S002",
+        f"{anchor_id}-S003",
+    ]
+    # ...and the sound is declared, from the header on disk.
+    assert document["audioComponent"] == [
+        {
+            "file": [{"id": f"{anchor_id}-WAV"}],
+            "codec": "pcm_s24le",
+            "channelCount": 2,
+            "channelLayout": 0,
+            "frameSize": 1,
+            "blockAlign": 6,
+            "bitrate": 2304000,
+            "timeBase": {"numerator": 1, "denominator": 48000},
+            "duration": {
+                "samples": 1000,
+                "timeBase": {"numerator": 1, "denominator": 48000},
+            },
+            "itemTrack": "A1",
+            "essenceStreamId": 0,
+            "sampleFormat": "AV_SAMPLE_FMT_S32",
+        }
+    ]
+
+
+def test_an_unreadable_wav_fails_the_clip_instead_of_posting_it(
+    migrated_db, es_fake, es_page, red_shape_provider, tmp_path, collection_seam
+):
+    """A shape posted without its sound is a silent partial ingest."""
+    rel = "2026/AH_20260101_badwav"
+    sources = _red_page(tmp_path, rel, [f"{RED_STEM}_001"])
+    (tmp_path / rel / f"{RED_STEM}_001.wav").write_bytes(b"RF64" + b"\x00" * 40)
+    red_shape_provider(extras=1, wav_root=str(tmp_path / rel))
+    es_fake.push(es_page(sources, total=1))
+
+    response = _folder(tmp_path, rel).ingest(providers=[RED_SHAPE_NAME])
+
+    assert (response["ingested"], response["failed"]) == (0, 1)
+    assert _posted_shapes() == []
+    assert _transcode_requests() == []
+    assert f"{RED_STEM}_001.wav" in response["errors"][0]
+
+
+def test_a_clip_with_a_wav_on_the_import_route_opens_nothing(
+    migrated_db, es_fake, es_page, red_shape_provider, tmp_path, collection_seam
+):
+    """The header is read by the DOCUMENT, never by the collection.
+
+    A colon-separated clip with a `.wav` takes the component-budget
+    import exactly as it always has, and a `.wav` that `wave` cannot
+    read must not be able to break it. Reading the header inside
+    `getClipAdditionalMediaFiles` would have made a corrupt sidecar a
+    regression for clips that were ingesting perfectly.
+    """
+    rel = "2026/AH_20260101_wavimport"
+    sources = _red_page(tmp_path, rel, [f"{RED_STEM}_001"])
+    (tmp_path / rel / f"{RED_STEM}_001.wav").write_bytes(b"RF64" + b"\x00" * 40)
+    red_shape_provider(extras=1, verdict=True, wav_root=str(tmp_path / rel))
+    es_fake.push(es_page(sources, total=1))
+    _queue_import_jobs("VX-JOB-W1", "VX-JOB-W2", "VX-JOB-W3")
+
+    response = _folder(tmp_path, rel).ingest(providers=[RED_SHAPE_NAME])
+
+    assert (response["ingested"], response["failed"]) == (1, 0)
+    assert _posted_shapes() == []
+    assert _declared_counts() == [{"container": 1, "video": 2, "audio": 1}]
+
+
+def test_the_wavs_absolute_path_is_built_from_the_clips_own_root(migrated_db, tmp_path):
+    """The join `getClipAdditionalMediaFiles` carries, and its `None`.
+
+    An unresolvable storage root leaves `Clip.root_path` RAISING rather
+    than answering, and a path this provider cannot build must not be
+    what breaks collecting a clip's media — the document refuses by name
+    instead.
+    """
+    clip = Clip(umid="WAVPATH", path="2026/AA_x", storage_id=STORAGE_ID)
+    clip._root_path = str(tmp_path)
+
+    assert red_module.Provider._clip_absolute_path(clip, "take.wav") == os.path.join(
+        str(tmp_path), "2026/AA_x", "take.wav"
+    )
+
+    rootless = Clip(umid="NOROOT", path="2026/AA_x", storage_id="VX-NOSUCH")
+    assert red_module.Provider._clip_absolute_path(rootless, "take.wav") is None
+
+
+def test_the_proxy_is_asked_for_explicitly(
+    migrated_db, es_fake, es_page, red_shape_provider, tmp_path, collection_seam
+):
+    """No import job exists on this route, so nothing else would ask.
+
+    It is the ANCHOR's import job that evaluates a placeholder and
+    starts the transcode on the ordinary route; a shape posted whole
+    starts no job at all.
+
+    Mutation killed: dropping the transcode request — the item then has
+    a perfect shape, a stated duration and no proxy, which is
+    indistinguishable from success in every counter.
+    """
+    red_shape_provider(extras=1)
+    rel = "2026/AH_20260101_proxy"
+    es_fake.push(es_page(_red_page(tmp_path, rel, [f"{RED_STEM}_001"]), total=1))
+
+    response = _folder(tmp_path, rel).ingest(providers=[RED_SHAPE_NAME])
+
+    assert response["ingested"] == 1
+    item_id = Clip.objects.get(pk=f"{rel}/{RED_STEM}_001").item_id
+    assert _transcode_requests() == [
+        {"item_id": item_id, "tag": TRANSCODE_SHAPE_TAG, "method": "POST"}
+    ]
+
+
+def test_the_row_records_the_posted_shape_and_no_job(
+    migrated_db, es_fake, es_page, red_shape_provider, tmp_path, collection_seam
+):
+    """The whole reason ``STATUS_SHAPE_POSTED`` exists.
+
+    An item id, no job id and ``PLACHOLDER_CREATED`` is bit for bit the
+    incomplete-import cell the resume rung brings back — and
+    ``shape/create`` ADDS a shape rather than refusing one, so a
+    re-entry would stack a second ``original`` shape every scan.
+
+    Mutation killed: leaving the status at ``PLACHOLDER_CREATED``, which
+    makes ``_incomplete_import`` true and re-posts for ever.
+    """
+    red_shape_provider(extras=1)
+    rel = "2026/AH_20260101_status"
+    es_fake.push(es_page(_red_page(tmp_path, rel, [f"{RED_STEM}_001"]), total=1))
+
+    _folder(tmp_path, rel).ingest(providers=[RED_SHAPE_NAME])
+
+    clip = Clip.objects.get(pk=f"{rel}/{RED_STEM}_001")
+    assert clip.status == Clip.STATUS_SHAPE_POSTED
+    assert clip.get_readable_status() == "Shape posted"
+    assert not clip.job_id
+    assert clip.item_id
+    # The rung that motivated the new state, read through the real
+    # helper the folder uses.
+    assert folder_module._incomplete_import(clip) is False
+
+
+def test_a_second_scan_posts_nothing_and_asks_for_nothing(
+    migrated_db, es_fake, es_page, red_shape_provider, tmp_path, collection_seam
+):
+    """`shape/create` never refuses and never replaces — it ADDS.
+
+    Measured on VX-216897. Without a guard every run leaves one more
+    ``original`` shape on the item.
+
+    Mutation killed: removing the idempotency query — the second run
+    then posts a second shape and requests a second transcode.
+    """
+    red_shape_provider(extras=1)
+    rel = "2026/AH_20260101_again"
+    sources = _red_page(tmp_path, rel, [f"{RED_STEM}_001"])
+
+    es_fake.push(es_page(sources, total=1))
+    first = _folder(tmp_path, rel).ingest(providers=[RED_SHAPE_NAME])
+    es_fake.push(es_page(sources, total=1))
+    second = _rescanned_folder(tmp_path, rel).ingest(providers=[RED_SHAPE_NAME])
+
+    assert (first["ingested"], second["ingested"]) == (1, 0)
+    assert len(_posted_shapes()) == 1
+    assert len(_transcode_requests()) == 1
+
+
+def test_a_repaired_item_re_entered_by_hand_still_posts_nothing(
+    migrated_db, es_fake, es_page, red_shape_provider, tmp_path, collection_seam
+):
+    """The guard, not the scan ladder, is what refuses the second post.
+
+    The ladder skips an already-ingested clip before ``import_file`` is
+    ever called, so a suite that only ran two scans would pass with no
+    guard at all. This drives ``import_file`` DIRECTLY against an item
+    that already carries a real ``original`` shape — the "re-run over a
+    repaired item" row of the matrix.
+    """
+    provider = red_shape_provider(extras=1)
+    clip = Clip(
+        umid="REPAIRED",
+        path="2026/AH_20260101_repaired",
+        storage_id=STORAGE_ID,
+        item_id="VX-REPAIRED",
+        provider_name=RED_SHAPE_NAME,
+        status=Clip.STATUS_SHAPE_POSTED,
+    )
+    clip.metadatas = dict(REDLINE_METADATAS, clipname=f"{RED_STEM}_001")
+    clip.file_id = "VX-41-REPAIRED"
+    main_file = provider.getClipMainMediaFile(clip)
+    extra_files = provider.getClipAdditionalMediaFiles(clip)
+    VidispineFake.set_original_shape(
+        "VX-REPAIRED",
+        "VX-REPAIRED-SHAPE",
+        files=[{"id": "VX-41-REPAIRED", "storage": STORAGE_ID}],
+    )
+
+    verdict = clip._post_shape_document(
+        main_file,
+        extra_files,
+        None,
+        None,
+        ItemHelperExtended(),
+        TapelessIngestHelper(),
+    )
+
+    assert verdict == clip_module.SHAPE_ROUTE_SKIPPED
+    assert _posted_shapes() == []
+    assert _transcode_requests() == []
+
+
+def test_a_colon_separated_clip_takes_the_import_path_untouched(
+    migrated_db, es_fake, es_page, red_shape_provider, tmp_path, collection_seam
+):
+    """The deducible verdict is not this story's business.
+
+    Mutation killed: routing on ``not yields_video_component(...)``,
+    which would drag every deducible clip onto the new route.
+    """
+    red_shape_provider(extras=1, verdict=True)
+    rel = "2026/AH_20260101_colon"
+    es_fake.push(es_page(_red_page(tmp_path, rel, [f"{RED_STEM}_001"]), total=1))
+    _queue_import_jobs("VX-JOB-C1", "VX-JOB-C2")
+
+    response = _folder(tmp_path, rel).ingest(providers=[RED_SHAPE_NAME])
+
+    assert (response["ingested"], response["failed"]) == (1, 0)
+    assert _posted_shapes() == []
+    assert _transcode_requests() == []
+    assert _declared_counts() == [{"container": 1, "video": 2, "audio": None}]
+
+
+def test_an_unreadable_timecode_is_still_refused_not_posted(
+    migrated_db, es_fake, es_page, red_shape_provider, tmp_path, collection_seam
+):
+    """The un-evidenced verdict keeps its 2026-09-02 ruling.
+
+    ``None`` is "the provider could not tell". Posting a shape on it
+    would be stating a duration, a resolution and a codec on no
+    evidence — a louder version of the guess that ruling forbade.
+
+    Mutation killed: reading the verdict through
+    ``yields_video_component``, which folds ``None`` into ``True``, or
+    through a plain falsiness test, which folds it into ``False``.
+    """
+    red_shape_provider(extras=1, verdict=None)
+    rel = "2026/AH_20260101_unknown"
+    es_fake.push(es_page(_red_page(tmp_path, rel, [f"{RED_STEM}_001"]), total=1))
+
+    response = _folder(tmp_path, rel).ingest(providers=[RED_SHAPE_NAME])
+
+    assert (response["ingested"], response["failed"]) == (0, 1)
+    assert _posted_shapes() == []
+    assert _transcode_requests() == []
+    assert "could not tell" in response["errors"][0]
+
+
+def test_a_clip_whose_shape_cannot_be_composed_is_failed_not_posted(
+    migrated_db, es_fake, es_page, red_shape_provider, tmp_path, collection_seam
+):
+    """A missing REDline column names itself and stops the route.
+
+    Posting a shape with a blank duration would reproduce exactly the
+    mute item this route exists to replace.
+    """
+    red_shape_provider(extras=1, metadatas=dict(REDLINE_METADATAS, total_frames=""))
+    rel = "2026/AH_20260101_nodur"
+    es_fake.push(es_page(_red_page(tmp_path, rel, [f"{RED_STEM}_001"]), total=1))
+
+    response = _folder(tmp_path, rel).ingest(providers=[RED_SHAPE_NAME])
+
+    assert (response["ingested"], response["failed"]) == (0, 1)
+    assert _posted_shapes() == []
+    assert "total_frames" in response["errors"][0]
+    clip = Clip.objects.get(pk=f"{rel}/{RED_STEM}_001")
+    assert clip.status == Clip.STATUS_PLACHOLDER_CREATED
+
+
+def test_a_post_that_died_after_vidispine_wrote_is_not_posted_twice(
+    migrated_db, es_fake, es_page, red_shape_provider, tmp_path, collection_seam
+):
+    """The half that can orphan: the shape is up, the caller never knew.
+
+    The clip is failed — honestly, because this run cannot say the shape
+    is there — and the NEXT run must find it and post nothing, or the
+    item collects one more `original` shape per scan for ever.
+    """
+    red_shape_provider(extras=1)
+    rel = "2026/AH_20260101_crash"
+    sources = _red_page(tmp_path, rel, [f"{RED_STEM}_001"])
+    VidispineFake.fail_next("createShapeFromDocument")
+
+    es_fake.push(es_page(sources, total=1))
+    first = _folder(tmp_path, rel).ingest(providers=[RED_SHAPE_NAME])
+
+    assert (first["ingested"], first["failed"]) == (0, 1)
+    assert _transcode_requests() == []
+
+    es_fake.push(es_page(sources, total=1))
+    second = _rescanned_folder(tmp_path, rel).ingest(providers=[RED_SHAPE_NAME])
+
+    assert second["ingested"] == 0
+    assert len(_posted_shapes()) == 1
+
+
+def test_a_transcode_that_fails_keeps_the_shape_and_says_so(
+    migrated_db, es_fake, es_page, red_shape_provider, tmp_path, collection_seam
+):
+    """The shape is the durable half; the proxy can be asked for again.
+
+    So the status is written BEFORE the transcode request — the clip is
+    not re-posted — and the failure still reaches the operator's report,
+    because an item permanently without a proxy that nothing complains
+    about is the silent failure this whole line of work is about.
+    """
+    red_shape_provider(extras=1)
+    rel = "2026/AH_20260101_notranscode"
+    es_fake.push(es_page(_red_page(tmp_path, rel, [f"{RED_STEM}_001"]), total=1))
+    VidispineFake.fail_next("requestItemTranscode")
+
+    response = _folder(tmp_path, rel).ingest(providers=[RED_SHAPE_NAME])
+
+    assert (response["ingested"], response["failed"]) == (0, 1)
+    assert len(_posted_shapes()) == 1
+    assert TRANSCODE_SHAPE_TAG in response["errors"][0]
+    clip = Clip.objects.get(pk=f"{rel}/{RED_STEM}_001")
+    assert clip.status == Clip.STATUS_SHAPE_POSTED
+
+
+def test_a_provider_with_no_shape_hook_at_all_keeps_its_old_route(migrated_db):
+    """A provider need not inherit `providers.Provider`.
+
+    The registry only requires the hooks the ingest actually calls, so a
+    hook added after a provider was written must read as "composes
+    nothing" — never as an AttributeError out of the middle of an
+    import, which would reach the folder's raising arm and be reported
+    as a crash rather than as the ordinary route it is.
+    """
+
+    class HookLessProvider:
+        machine_name = "fakehookless"
+
+    Clip._PROVIDER_CACHE["fakehookless"] = HookLessProvider()
+    try:
+        clip = Clip(
+            umid="HOOKLESS", item_id="VX-HOOKLESS", provider_name="fakehookless"
+        )
+        verdict = clip._post_shape_document(
+            {"file_id": "VX-41-H", "path": "a_001.R3D", "type": "video"},
+            [],
+            None,
+            None,
+            ItemHelperExtended(),
+            TapelessIngestHelper(),
+        )
+    finally:
+        Clip._PROVIDER_CACHE.pop("fakehookless", None)
+
+    assert verdict is None
+    assert _posted_shapes() == []
+
+
+def test_a_provider_that_composes_no_document_keeps_its_old_route(
+    migrated_db, es_fake, es_page, spanned_provider, tmp_path, collection_seam
+):
+    """This story is specified against `red`, and that is enforced here.
+
+    `SpannedIngestableProvider` answers the verdict `False` and inherits
+    the base hook, which composes nothing. It must keep the component
+    budget it has always declared — widening the route to every provider
+    that can answer `False` would mean guessing a codec, a resolution
+    and a frame rate on their behalf.
+    """
+    spanned_provider(extras=2, deducible=False)
+    rel = "2026/AH_20260101_nodocument"
+    es_fake.push(es_page(_ingestable_page(tmp_path, rel, ["CLIPNODOC"]), total=1))
+    VidispineFake.set_non_deducible("VX-41-CLIPNODOC")
+    _queue_import_jobs("VX-JOB-N1", "VX-JOB-N2", "VX-JOB-N3")
+
+    response = _folder(tmp_path, rel).ingest(providers=[SPANNED_NAME])
+
+    assert (response["ingested"], response["failed"]) == (1, 0)
+    assert _posted_shapes() == []
+    assert _declared_counts() == [{"container": 1, "video": 2, "audio": None}]
 
 
 def test_the_anchor_is_deferred_until_the_extras_have_landed(

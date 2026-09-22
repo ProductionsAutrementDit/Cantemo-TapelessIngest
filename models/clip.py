@@ -52,6 +52,7 @@ from portal.plugins.TapelessIngest.models.settings import (
 from portal.plugins.TapelessIngest.metadatas import XMLParser
 from portal.plugins.TapelessIngest.providers import PROVIDER_NAMES
 from portal.plugins.TapelessIngest.providers.providers import (
+    main_file_declares_no_video,
     main_file_verdict_is_unknown,
     yields_video_component,
 )
@@ -252,6 +253,16 @@ PLACEHOLDER_IMPORT_JOB_TYPE = "PLACEHOLDER_IMPORT"
 # `portal.conf`, which Portal upgrades reset. The operational checklist
 # lives in USER_GUIDE.md ("Configure transcode profiles").
 TRANSCODE_SHAPE_TAG = "lowres-forge"
+
+# What `Clip._post_shape_document` answers. Tokens, not booleans: "there
+# was nothing to post" and "posting it failed" are both not-posted, and
+# collapsing them into one falsy answer is how a skip gets reported as a
+# failure. `None` is a fourth answer and means something else again —
+# this provider offers no document, so the caller takes the import route
+# it always took.
+SHAPE_ROUTE_POSTED = "posted"
+SHAPE_ROUTE_SKIPPED = "skipped"
+SHAPE_ROUTE_FAILED = "failed"
 
 
 # WHICH file a running job is importing is read off the job OBJECT, by
@@ -667,18 +678,42 @@ class Clip(models.Model):
     REGISTERED = "Registered"
     PLACHOLDER_CREATED = "Placeholder created"
     IMPORTED = "Imported"
+    SHAPE_POSTED = "Shape posted"
     STATUS_NOT_IMPORTED = 0
     STATUS_WRAPPED = 1
     STATUS_REGISTERED = 2
     STATUS_PLACHOLDER_CREATED = 3
     STATUS_IMPORTED = 4
+    # THE JOB-LESS INGEST. `_post_shape_document` states the whole shape
+    # itself and starts NO import job, so the row it leaves carries an
+    # item_id, a real `original` shape and an EMPTY `job_id` — which is
+    # bit-for-bit the FR-35 incomplete-import cell (`scan/ingestion.py::
+    # is_incomplete_import`) the resume rung exists to bring back. Left
+    # at PLACHOLDER_CREATED, every scan would re-enter the route and
+    # `shape/create` would stack another `original` shape, for ever.
+    #
+    # Ruled by Camille 2026-09-22, over two alternatives: probing
+    # Vidispine per clip (a round trip per clip per scan, which FR-8
+    # exists to have removed) and parking the transcode job's id in
+    # `job_id` (which would make that column mean two different things —
+    # "the import that attached the media" and "the proxy that was asked
+    # for"). The cost is this migration and one more state every ladder
+    # that reads `status` has to honour; `_incomplete_import`
+    # (`models/folder.py`) is the one that motivated it, and the others
+    # are re-read where they stand.
+    STATUS_SHAPE_POSTED = 5
     STATUS = {
         STATUS_NOT_IMPORTED: NOT_IMPORTED,
         STATUS_WRAPPED: WRAPPED,
         STATUS_REGISTERED: REGISTERED,
         STATUS_PLACHOLDER_CREATED: PLACHOLDER_CREATED,
         STATUS_IMPORTED: IMPORTED,
+        STATUS_SHAPE_POSTED: SHAPE_POSTED,
     }
+    # Declared to Django as well as to `get_readable_status`: a state the
+    # model does not declare is a state the admin, the serializer and the
+    # next reader of the schema never learn about.
+    STATUS_CHOICES = tuple(sorted(STATUS.items()))
 
     # Class-level provider cache for performance
     _PROVIDER_CACHE: Dict[str, Any] = {}
@@ -694,7 +729,9 @@ class Clip(models.Model):
     output_file = models.TextField(null=True)
     file_id = models.CharField(max_length=255, null=True)
     reference_file = models.CharField(max_length=255, null=False)
-    status = models.IntegerField(blank=True, default=STATUS_NOT_IMPORTED)
+    status = models.IntegerField(
+        blank=True, default=STATUS_NOT_IMPORTED, choices=STATUS_CHOICES
+    )
     progress = models.CharField(max_length=255, null=True)
     spanned = models.BooleanField(blank=True, default=False)
     spanned_order = models.IntegerField(blank=True, default=0)
@@ -1377,6 +1414,13 @@ class Clip(models.Model):
             else:
                 return "PROCESSING"
         else:
+            # RE-READ for STATUS_SHAPE_POSTED (2026-09-22) and left
+            # alone. Nothing in this plugin ever writes STATUS_IMPORTED,
+            # so this arm already answers NOTIMPORTED for a clip whose
+            # ordinary import succeeded and left PLACHOLDER_CREATED.
+            # Mapping the new state to IMPORTED here would make a posted
+            # shape read as MORE finished than a normal ingest, which it
+            # is not — the transcode is still in flight either way.
             if self.status is self.STATUS_IMPORTED:
                 return "IMPORTED"
             else:
@@ -1988,6 +2032,202 @@ class Clip(models.Model):
             return
         self._job = job
 
+    def _post_shape_document(
+        self,
+        main_file: Dict[str, Any],
+        extra_files: List[Dict[str, Any]],
+        no_transcode: Optional[bool],
+        user: Optional[User],
+        item_helper: Any,
+        ingest_helper: Any,
+    ) -> Optional[str]:
+        """State the whole `original` shape, because Vidispine will not.
+
+        Taken only when the PROVIDER has declared, positively, that the
+        anchor yields no video component. On that verdict Vidispine
+        deduces nothing from the file: the item comes out with a
+        `binaryComponent`, no duration, no resolution, no codec, no
+        proxy — and, for a single-segment clip, `mediaType = 'data'`, so
+        no duration or type search ever finds it. Measured on prod
+        2026-09-22 (`VX-216267`, `VX-216301`); around 40% of RED ingests
+        land there. Declaring a budget of `video = len(extras)` and
+        importing, which is what this replaces, stops the shape hanging
+        as a placeholder for ever and produces an item nobody can use.
+
+        THE WHOLE SHAPE, never a patch of the placeholder Vidispine
+        left: pad_forge's reconstruction wants the video components to
+        name `_001`...`_N` with no hole, and completing a placeholder
+        leaves the anchor in a `binaryComponent` and the components at
+        `{_002...}`. The provider composes the document
+        (`buildShapeDocument`), this method only posts it — so nothing
+        here knows what a codec, a frame rate or a `.R3D` is.
+
+        FOUR things this route owes, each of them paid for on prod:
+
+        * the RAW endpoint, not `ItemAPI.createItemShape`, which drops
+          `updateItemMetadata` and leaves the item mute (`VX-216898`);
+        * the transcode ASKED FOR explicitly — no import job exists on
+          this route, and it is the anchor's import job that normally
+          evaluates the placeholder and starts the transcode;
+        * IDEMPOTENCE — `shape/create` never refuses and never replaces,
+          it ADDS (`VX-216897`), so a run that finds a real `original`
+          shape must post nothing. The query is the non-placeholder half
+          of the three-state filter `_get_or_create_placeholder_shape`
+          uses: a non-placeholder `original` shape means "already
+          repaired";
+        * `STATUS_SHAPE_POSTED` written the moment the shape is up. A
+          death between the POST and `persist_ingest_state` leaves
+          PLACEHOLDER_CREATED beside a real shape, which the resume rung
+          brings back — and the idempotency guard above is what makes
+          that re-run harmless rather than a second stacked shape.
+
+        The placeholder shape `createPlaceholder` made for the item is
+        deliberately left where it is. It is measured harmless: absent
+        from `GET /API/item/{id}/shape` and never returned by
+        `getSourceShape()`, and `DELETE ...?keepFiles=true` is unmeasured
+        and marks files for removal.
+
+        Returns:
+            ``SHAPE_ROUTE_POSTED``, ``SHAPE_ROUTE_SKIPPED`` or
+            ``SHAPE_ROUTE_FAILED`` — or ``None`` when this provider
+            offers no document, in which case the caller must take the
+            budget-and-import route unchanged.
+        """
+        anchor_path = main_file.get("path") if isinstance(main_file, Mapping) else None
+        # `getattr`, not a bare call: a provider does not have to inherit
+        # `providers.Provider` — the registry only requires the hooks the
+        # ingest actually uses — so a hook added after a provider was
+        # written must read as "composes nothing", never as an
+        # AttributeError out of the middle of an import.
+        compose = getattr(self.provider, "buildShapeDocument", None)
+        if compose is None:
+            log.info(
+                f"Importing {self.item_id}: the anchor {anchor_path} yields no "
+                f"video component, and provider {self.provider_name} has no "
+                f"shape-document hook, so the component-budget import is used "
+                f"exactly as before"
+            )
+            return None
+        try:
+            document = compose(main_file, extra_files, self.metadatas)
+        except TapelessIngestException as error:
+            # A document that cannot be composed HONESTLY is not a
+            # document. Every refusal the builder makes names a value
+            # REDline did not give or a segment set that would be
+            # refused downstream, and inventing either is what produced
+            # the mute items this route exists to stop making.
+            message = (
+                f"Importing {self.item_id}: the provider says the anchor "
+                f"{anchor_path} yields no video component, so Vidispine will "
+                f"deduce no shape from it — and the shape that would replace "
+                f"that deduction cannot be composed: {error}. Nothing is "
+                f"posted and nothing is imported"
+            )
+            log.error(message)
+            self.error = message
+            return SHAPE_ROUTE_FAILED
+
+        if document is None:
+            # The provider answered the verdict but cannot describe its
+            # own essence. Handing it this route would mean GUESSING a
+            # codec, a resolution and a frame rate on its behalf — which
+            # is why widening past `red` is a decision, not a default.
+            log.info(
+                f"Importing {self.item_id}: the anchor {anchor_path} yields no "
+                f"video component, but provider {self.provider_name} composes "
+                f"no shape document, so the component-budget import is used "
+                f"exactly as before"
+            )
+            return None
+
+        existing = item_helper.getItemShapesFromNames(self.item_id, ["original"])
+        if existing:
+            log.info(
+                f"Importing {self.item_id}: a non-placeholder original shape "
+                f"({', '.join(shape.getId() or '?' for shape in existing)}) is "
+                f"already on this item, so its shape was posted by an earlier "
+                f"run — `shape/create` adds rather than replaces, so nothing "
+                f"is posted and no transcode is requested"
+            )
+            return SHAPE_ROUTE_SKIPPED
+
+        video_components = document.get("videoComponent") or []
+        log.info(
+            f"Importing {self.item_id}: the provider says the anchor "
+            f"{anchor_path} yields NO video component, so Vidispine will "
+            f"deduce nothing from it — posting a complete original shape with "
+            f"{len(video_components)} video component(s) instead of declaring "
+            f"a component budget and importing"
+        )
+        try:
+            ingest_helper.itemapi.createShapeFromDocument(
+                self.item_id,
+                document,
+                tag="original",
+                update_item_metadata=True,
+                runasuser=user,
+            )
+        except Exception as error:  # noqa: BLE001 - any refusal is a failure
+            message = (
+                f"Importing {self.item_id}: posting the original shape for "
+                f"{anchor_path} was refused ({error}) — the item keeps its "
+                f"placeholder and nothing is attached, so the next run can "
+                f"post it again"
+            )
+            log.error(message, exc_info=True)
+            self.error = message
+            return SHAPE_ROUTE_FAILED
+
+        # BEFORE the transcode request, and never after it: the shape is
+        # the durable half. A transcode that fails can be asked for
+        # again by hand; a shape posted twice cannot be taken back.
+        self.status = self.STATUS_SHAPE_POSTED
+        log.info(
+            f"Importing {self.item_id}: original shape posted for "
+            f"{anchor_path}; this route starts no import job, so the clip is "
+            f"recorded as {self.STATUS[self.STATUS_SHAPE_POSTED]!r} and the "
+            f"resume ladder leaves it alone"
+        )
+
+        if no_transcode:
+            # The same contract the import route honours: a provider
+            # asking for `no-transcode`, or a legacy replacement that
+            # keeps its existing proxy, must not be handed a new one.
+            log.info(
+                f"Importing {self.item_id}: no-transcode is set, so no "
+                f"{TRANSCODE_SHAPE_TAG} transcode is requested for the shape "
+                f"just posted"
+            )
+            return SHAPE_ROUTE_POSTED
+
+        try:
+            ingest_helper.itemapi.requestItemTranscode(
+                self.item_id, TRANSCODE_SHAPE_TAG, runasuser=user
+            )
+        except Exception as error:  # noqa: BLE001 - a proxy nobody asked for
+            # REPORTED, not swallowed, and not rolled back either. The
+            # shape is up and the item can state its duration; what is
+            # missing is the proxy, and the operator has a one-click
+            # remedy (USER_GUIDE: "request a transcode to lowres-forge
+            # from the Portal UI"). Saying nothing here is how an item
+            # ends up permanently without a proxy and nobody learns.
+            message = (
+                f"Importing {self.item_id}: the original shape for "
+                f"{anchor_path} was posted, but requesting the "
+                f"{TRANSCODE_SHAPE_TAG} transcode failed ({error}) — the item "
+                f"has its media and its duration but no proxy, and nothing "
+                f"will ask again: request the transcode from the Portal UI"
+            )
+            log.error(message, exc_info=True)
+            self.error = message
+            return SHAPE_ROUTE_FAILED
+
+        log.info(
+            f"Importing {self.item_id}: requested a {TRANSCODE_SHAPE_TAG} "
+            f"transcode — no import job exists on this route to start one"
+        )
+        return SHAPE_ROUTE_POSTED
+
     def _import_single_component(
         self,
         main_file_id: str,
@@ -2088,8 +2328,10 @@ class Clip(models.Model):
         which declares ``video=len(extraFileIds['video']) + 1`` flat. A
         source Vidispine cannot decode yields a ``binaryComponent``: it
         satisfies the container slot (proved by the 10 single-segment
-        drop-frame clips, which promote normally) and fills NO video
-        slot, so the extra slot is never filled and the shape stays a
+        drop-frame clips, whose shape does leave the placeholder state
+        and is tagged ``original`` — read the next paragraph before
+        taking that for health) and fills NO video slot, so the extra
+        slot is never filled and the shape stays a
         placeholder for ever — no ``original`` tag, no transcode, no
         error anywhere. Signature on all 31 stuck clips of the 2026
         STARLUX shoot: ``files == videoComponents + 1``,
@@ -2101,6 +2343,53 @@ class Clip(models.Model):
         the first explicit Vidispine error text we have for the
         non-deducible case. It is on the JOB, which is why no ingest ever
         surfaced it.)
+
+        PROMOTED IS NOT HEALTHY, and this comment used to say "promote
+        normally", which read as if those 10 clips were fine. They are
+        not. Measured on prod 2026-09-22, three items read end to end:
+
+        * ``VX-216301`` — single-segment, dot-separated. Shape
+          ``VX-455006`` is tagged ``original``, and carries a
+          ``binaryComponent`` and NOTHING else: zero video components,
+          zero audio, ``containerComponent`` ABSENT. The item has no
+          second shape, so no proxy of any tag. ``durationSeconds``,
+          ``originalWidth``, ``originalVideoCodec`` are all EMPTY and
+          Vidispine types the item ``mediaType = 'data'`` — it is not a
+          video to a search any more.
+        * ``VX-216267`` — multi-segment, dot-separated, the case THIS
+          branch repairs. Promoted ``original``, and still mute:
+          ``durationSeconds`` empty, no proxy shape. Its one video
+          component names ``_002.R3D``; ``_001`` appears only in the
+          ``binaryComponent``.
+        * ``VX-216302`` — colon-separated, deducible, the control.
+          ``containerComponent`` present, two video components naming
+          ``_001`` AND ``_002``, an audio component, a ``lowres`` proxy
+          shape, ``durationSeconds = 16.866666666666667``.
+
+        So what this branch buys is a shape that COMPLETES instead of
+        hanging as a placeholder for ever. That is worth having and it is
+        why the branch exists. It is not an item an editor can use: no
+        duration, no proxy. Do not read a promotion as a fix.
+
+        SINCE 2026-09-22 THAT IS NO LONGER WHERE A `red` CLIP ENDS UP.
+        A provider that declares the verdict `False` AND can compose its
+        own `ShapeDocument` (`Provider.buildShapeDocument`) is routed to
+        `_post_shape_document` by `import_file` before this method is
+        ever reached: the whole shape is stated at once, the item gets
+        its duration, resolution and codec, and a proxy is asked for
+        explicitly. This branch still runs — and still has to be right —
+        for a provider that answers `False` and composes nothing, which
+        is every provider but `red`.
+
+        Two traps in the measurement, for whoever reads a shape next.
+        ``containerComponent`` is ABSENT on both binary shapes even
+        though the container slot is plainly satisfied — never test for a
+        container component to infer the budget's state. And the video
+        components of a repaired clip name ``_002…_N`` only, which is why
+        pad_forge's reconstruction (``manifest.py::_red_anchor``, which
+        wants ``_001…_N`` with no hole) refuses exactly the clips this
+        branch repairs. The ``_001`` path is available on the
+        ``binaryComponent``.
 
         The other direction is just as wrong: declaring ``len(extras)``
         unconditionally makes a DEDUCIBLE anchor's own video component
@@ -3276,6 +3565,41 @@ class Clip(models.Model):
 
         _, default_ingest_group = _gh.getUserIngestGroups()
         user_groups = [urllib.parse.quote(str(default_ingest_group))]
+
+        # THE ANCHOR VIDISPINE DEDUCES NOTHING FROM — decided ONCE, for
+        # both import paths.
+        #
+        # It has to be both. The single-component path never read the
+        # verdict at all, which is why a one-segment dot-separated clip
+        # (`VX-216301`) is broken differently from a multi-segment one
+        # (`VX-216267`): its shape promotes, carries a `binaryComponent`
+        # and NOTHING else, and Vidispine types the item `mediaType =
+        # 'data'`. That is a third of the population; routing only the
+        # multi-component path would leave it exactly where it is.
+        #
+        # Read through `main_file_declares_no_video`, which answers for a
+        # POSITIVE declaration only: an absent key is a provider that
+        # never had the question and an explicit `None` is the
+        # un-evidenced verdict `_import_multi_component` refuses (ruled
+        # 2026-09-02). Neither comes here. `yields_video_component` folds
+        # both into `True` and is deliberately not the reader.
+        #
+        # BEFORE `_get_or_create_placeholder_shape`: this route needs no
+        # placeholder shape and must not mint a second one.
+        if main_file_declares_no_video(main_file):
+            verdict = self._post_shape_document(
+                main_file, extra_files, no_transcode, user, _ith, _igh
+            )
+            if verdict is not None:
+                result["ingested"] = verdict == SHAPE_ROUTE_POSTED
+                result["skipped"] = verdict == SHAPE_ROUTE_SKIPPED
+                result["failed"] = verdict == SHAPE_ROUTE_FAILED
+                if result["failed"]:
+                    log.error(
+                        f"Importing {self.item_id}: counting this clip failed "
+                        f"— {self.error or 'the original shape was not posted'}"
+                    )
+                return result
 
         placeholder = self._get_or_create_placeholder_shape(
             user, _ith, main_file=main_file, extra_files=extra_files

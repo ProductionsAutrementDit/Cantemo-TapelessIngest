@@ -9,7 +9,9 @@ import sys
 import os
 import csv
 import re
+import wave
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from io import StringIO
 from portal.plugins.TapelessIngest.helpers import TapelessIngestException
 from portal.plugins.TapelessIngest.metadatas import XMLParser
@@ -75,7 +77,58 @@ REDLINE_FALLBACK_PATHS = (
 DEDUCIBLE_TIMECODE = re.compile(r"\d{2}:\d{2}:\d{2}:\d{2}")
 UNDEDUCIBLE_TIMECODE = re.compile(r"\d{2}\.\d{2}\.\d{2}\.\d{2}")
 
+# The TECHNICAL columns, as `metadatas` key -> REDline column name.
+#
+# CAPTURE ONLY. Every value is copied out of the CSV exactly as REDline
+# printed it — a string, never an int, never a float, never a quotient.
+# `Total Frames / FPS` reproduces bit-for-bit the `durationSeconds`
+# Vidispine writes when its shape deduction succeeds (`1012 / 60` =
+# `16.866666666666667` on VX-216302, measured 2026-09-22), and
+# `Frame Width x Frame Height` its `originalWidth x originalHeight` —
+# but DERIVING either of them is a later story's business, and doing it
+# here would put a computed number in a table whose other rows are
+# transcriptions. What this story owes is the measurement, unaltered.
+#
+# All eight are printed by the `--printMeta 3` call `getAllClipMetadatas`
+# already makes: no second REDline invocation, no probe, no decode. They
+# were measured present and identically populated on BOTH a dot-separated
+# clip (`K001_K067_0804BF_001.R3D`, the shape Vidispine extracts no
+# essence from) and a colon-separated one (`K001_K068_0804LK_001.R3D`) —
+# the media is not the problem, only Vidispine's decoder is.
+#
+# Two values mean less than they look like:
+#
+# - `Total Frames` on the anchor covers the WHOLE TAKE, not the anchor's
+#   own segment (`File Segments=2` -> `Total Frames=1012` while
+#   `Clip Out=1011`). Whatever later reads it must never sum the
+#   segments.
+# - `Camera Audio Channels` can be `2` while `WAV Filename` is EMPTY:
+#   the audio is inside the `.R3D`, and on a deducible clip Vidispine
+#   emits an `audioComponent` naming the `.R3D` itself.
+#
+# And none of them is a verdict. `Abs TC` stays the only field
+# `anchor_yields_video_component` reads; a second opinion derived from
+# `REDCODE` or `FPS` would be an unmeasured guess competing with a
+# measurement.
+REDLINE_TECHNICAL_COLUMNS = (
+    ("frame_width", "Frame Width"),
+    ("frame_height", "Frame Height"),
+    ("fps", "FPS"),
+    ("record_fps", "Record FPS"),
+    ("total_frames", "Total Frames"),
+    ("file_segments", "File Segments"),
+    ("redcode", "REDCODE"),
+    ("camera_audio_channels", "Camera Audio Channels"),
+)
+
 # The columns getAllClipMetadatas reads out of --printMeta 3.
+#
+# ONE tier, deliberately: a column this provider reads and cannot find
+# means the CSV is not the shape this provider claims to understand, and
+# that must fail loudly rather than persist a blank. A second,
+# non-fatal tier is the documented fallback IF one of the eight turns
+# out absent on a REDline older than prod's (2025-11-25) — not the
+# default.
 REDLINE_REQUIRED_COLUMNS = (
     "Clip Name",
     "UUID",
@@ -84,7 +137,7 @@ REDLINE_REQUIRED_COLUMNS = (
     "Timestamp",
     "Camera Model",
     "Camera PIN",
-)
+) + tuple(column for _key, column in REDLINE_TECHNICAL_COLUMNS)
 
 # Where a RED card's media sits, RELATIVE to the folder being scanned —
 # and the whole of what "card structure" now means.
@@ -129,6 +182,82 @@ R3D_EXTENSION = ".R3D"
 # not exist; the ceiling is here so that hitting it is REPORTED rather
 # than silently truncating a clip's media.
 SEGMENT_FILE_LIMIT = 1000
+
+# ---------------------------------------------------------------------------
+# The shape document for an anchor Vidispine deduces nothing from
+# ---------------------------------------------------------------------------
+#
+# When `anchor_yields_video_component` answers False, Vidispine extracts
+# no essence from the `.R3D` at all: the item comes out with a
+# `binaryComponent`, no duration, no resolution, no codec — and, for a
+# single-segment clip, `mediaType = 'data'`, so no duration or type
+# search ever finds it (measured on prod 2026-09-22, VX-216267 and
+# VX-216301). The plugin therefore states the shape itself.
+#
+# EVERY CONSTANT BELOW WAS READ OFF A SHAPE VIDISPINE BUILT ITSELF —
+# `VX-455007`, the `original` shape of `VX-216302`, the deducible twin of
+# the broken clip, same card, 24 seconds apart (prod, 2026-09-22). They
+# are format facts about an `.R3D`, not guesses, and they are the only
+# values in the document that do not come from REDline. Everything that
+# varies per clip — duration, resolution, frame rate — is read from the
+# columns `REDLINE_TECHNICAL_COLUMNS` captured, and a column that is
+# missing or unreadable REFUSES the clip rather than inventing a number.
+#
+# What the reference shape carries and this document deliberately does
+# NOT:
+#
+# * `startTimecode`, `firstSMPTETimecode`, `timeCodeTimeBase`,
+#   `roundedTimeBase`, `dropFrame`. On a COLON-separated anchor these are
+#   measured; on a DOT-separated one — the only population this document
+#   is ever built for — they are not, and `dropFrame` in particular has
+#   never been measured on such a clip. An unmeasured field written as a
+#   fact is worse than an absent one, so they are omitted (spec: "Out of
+#   Scope").
+# * an `audioComponent` for the audio INSIDE the `.R3D`. The reference
+#   has one (`pcm_s32le`, 2 channels, 48000), but no captured column
+#   gives its sample rate, and the prod probe of 2026-09-22 proved it
+#   unnecessary: a document declaring none still produced a proxy WITH
+#   AAC audio, because pad_forge builds `AudioTrack(anchor, 0)` from the
+#   file itself. `Camera Audio Channels` can read `2` while
+#   `WAV Filename` is empty — that is this case, and it stays silent.
+#
+# A SEPARATE `.wav` beside the card is NOT that case and IS declared —
+# see `_audio_component`. 322 RED clips on prod carry one (10 shoots,
+# 2022-2026, measured 2026-09-22), so dropping it silently, or refusing
+# the clip, were both wrong. Its parameters are not REDline's business
+# and not guessed either: they belong to the `.wav`, and the `.wav`
+# declares them in its own header.
+R3D_CONTAINER_FORMAT = "R3D"
+R3D_VIDEO_CODEC = "r3d_raw"
+R3D_PIXEL_FORMAT = "rgb48le"
+R3D_BIT_DEPTH = 16
+R3D_FIELD_ORDER = "progressive"
+R3D_MIME_TYPE = "video/x-raw-red"
+
+# The separate `.wav`'s component, modelled on the shape Vidispine built
+# ITSELF for `A002_A021_0526HT` — a 9-segment RED clip with a `.wav`,
+# read off prod 2026-09-22. Everything else about that component is
+# derived from the header (`_audio_component`); these four are the
+# constants it carried.
+WAV_ITEM_TRACK = "A1"
+WAV_ESSENCE_STREAM_ID = 0
+WAV_FRAME_SIZE = 1
+WAV_CHANNEL_LAYOUT = 0
+
+# `sampleFormat` is the ONE audio field that does not fall out of the
+# header arithmetic, so it is a MEASUREMENT TABLE, not a formula: a
+# 3-byte (24-bit) `.wav` carried `AV_SAMPLE_FMT_S32` on the reference
+# shape — FFmpeg widens 24-bit samples to 32 — and nothing else has been
+# measured. A width absent from this table omits the field rather than
+# extrapolating the pattern, which is the same rule `dropFrame` follows.
+WAV_SAMPLE_FORMATS = {3: "AV_SAMPLE_FMT_S32"}
+
+# The denominator every frame rate is expressed over. The reference shape
+# states 60 fps as `averageFrameRate = {60000, 1000}` and the take's
+# duration as `timeBase = {1000, 60000}` — the same rational, inverted.
+# 1000 is what makes REDline's three decimals exact: `23.976` becomes
+# `23976/1000`, not a float rounded twice.
+FRAME_RATE_SCALE = 1000
 
 
 def configured_redline_path():
@@ -316,6 +445,9 @@ class Provider(BaseProvider):
             metadatas["device_manufacturer"] = "RED"
             metadatas["device_model"] = row["Camera Model"]
             metadatas["device_serial"] = row["Camera PIN"]
+            # Copied, never computed: see REDLINE_TECHNICAL_COLUMNS.
+            for key, column in REDLINE_TECHNICAL_COLUMNS:
+                metadatas[key] = row[column]
         return metadatas
 
     @staticmethod
@@ -535,9 +667,360 @@ class Provider(BaseProvider):
                     "order": 1,
                     "path": audio_file.getPath(),
                     "file_id": audio_file.getId(),
+                    # The absolute path, carried so that
+                    # `buildShapeDocument` can READ the `.wav`'s own
+                    # header when it has to declare an audio component.
+                    # A join, not a call: `clip.absolute_path` resolves
+                    # off the storage object this clip already holds
+                    # (memoized, and cached for 5 minutes), so the import
+                    # route that does NOT need it pays nothing, and a
+                    # `.wav` is never opened on a route that would not
+                    # look at it.
+                    "absolute_path": self._clip_absolute_path(clip, audio_file_name),
                 }
             )
         return files
 
+    @staticmethod
+    def _clip_absolute_path(clip, file_name):
+        """``<storage root>/<clip folder>/<file_name>``, or ``None``.
+
+        ``None`` for every reason a root can be missing — an unresolvable
+        browse method leaves ``Clip.root_path`` raising ``AttributeError``
+        rather than answering — because a path this provider cannot build
+        must not be what breaks collecting a clip's media. The caller
+        that actually needs it (the shape document) refuses by name when
+        it is absent; the import route never looks.
+        """
+        try:
+            folder = clip.absolute_path
+        except Exception:  # noqa: BLE001 - an unresolvable root is "no path"
+            log.debug(
+                "red: no absolute path for %s",
+                getattr(clip, "umid", None),
+                exc_info=True,
+            )
+            return None
+        if not folder:
+            return None
+        return os.path.join(folder, file_name)
+
     def getImportOptions(self):
         return {}
+
+    @staticmethod
+    def buildShapeDocument(main_file, extra_files, metadatas):
+        """The whole `original` shape for a dot-separated RED anchor.
+
+        Dicts in, a dict out: no Vidispine, no REDline, no database, no
+        clip row — so the document this posts can be read in a unit test
+        instead of off a production item.
+
+        ONE read of the filesystem, and only one: when the clip carries a
+        separate `.wav`, its header is opened to state the audio
+        component (`_audio_component`). Those parameters are not among
+        REDline's columns and belong to the `.wav` anyway, which declares
+        them itself; the alternatives were to guess a sample rate or to
+        drop the sound of 322 prod clips. The read happens HERE and not
+        in `getClipAdditionalMediaFiles`, so the ordinary import route —
+        which never looks at these numbers — opens nothing, and a
+        corrupt `.wav` cannot break a clip that was importing fine. The
+        picture side stays free of I/O entirely, and the derivation
+        itself is pure (`_audio_component_from_header`).
+
+        THE WHOLE SHAPE, never a patch. `manifest.py::_red_anchor` — what
+        pad_forge reconstructs the take from — requires the files named
+        by the VIDEO components to be a `_001`...`_N` set: same folder,
+        same stem, no hole. Completing the placeholder Vidispine left
+        would put the anchor in a `binaryComponent` and start the video
+        components at `_002`, which pad_forge refuses with
+        `segment(s) _001 missing`. That refusal is why this method
+        exists, so the numbering is CHECKED here and a gap is a refusal,
+        not a document.
+
+        Three things the reference shape settles, and this follows:
+
+        1. the container names the ANCHOR (`_001`), never a segment;
+        2. every video component carries the duration of the WHOLE take,
+           not its own segment's share — which is also why
+           `Total Frames` must never be summed over the segments;
+        3. `itemTrack` does not encode segment order (Vidispine gave
+           `_002` V1 and `_001` V2 on the reference), so no track number
+           is stated at all. Order comes from the file names.
+
+        Raises:
+            TapelessIngestException: when the clip cannot be described
+                honestly — a missing or unreadable REDline column, an
+                anchor with no Vidispine file id, a segment set with a
+                hole, a `.wav` that cannot be read, or an extra this
+                document has no component for.
+        """
+        anchor_path = (main_file or {}).get("path") or "(no path)"
+        anchor_id = (main_file or {}).get("file_id")
+        if not anchor_id:
+            raise TapelessIngestException(
+                f"the anchor {anchor_path} has no Vidispine file id, so no "
+                f"shape can name it"
+            )
+
+        segments, audio_files = Provider._ordered_segments(main_file, extra_files)
+        frames = Provider._positive_int(metadatas, "total_frames", anchor_path)
+        width = Provider._positive_int(metadatas, "frame_width", anchor_path)
+        height = Provider._positive_int(metadatas, "frame_height", anchor_path)
+        rate = Provider._frame_rate_scaled(metadatas, anchor_path)
+
+        # One duration object, shared by the container and by EVERY video
+        # component: `samples` is the whole take's frame count and the
+        # time base is one frame. `1012 / 60 = 16.866666666666667` is
+        # exactly the `durationSeconds` Vidispine writes for the twin it
+        # can deduce.
+        duration = {
+            "samples": frames,
+            "timeBase": {"numerator": FRAME_RATE_SCALE, "denominator": rate},
+        }
+        document = {
+            "containerComponent": {
+                "file": [{"id": anchor_id}],
+                "format": R3D_CONTAINER_FORMAT,
+                "duration": duration,
+            },
+            "videoComponent": [
+                {
+                    "file": [{"id": segment["file_id"]}],
+                    "duration": duration,
+                    "resolution": {"width": width, "height": height},
+                    "codec": R3D_VIDEO_CODEC,
+                    "pixelFormat": R3D_PIXEL_FORMAT,
+                    "bitDepth": R3D_BIT_DEPTH,
+                    "averageFrameRate": {
+                        "numerator": rate,
+                        "denominator": FRAME_RATE_SCALE,
+                    },
+                    "pixelAspectRatio": {"horizontal": 1, "vertical": 1},
+                    "fieldOrder": R3D_FIELD_ORDER,
+                }
+                for segment in segments
+            ],
+            "mimeType": [R3D_MIME_TYPE],
+        }
+        if audio_files:
+            document["audioComponent"] = [Provider._audio_component(audio_files[0])]
+        return document
+
+    @staticmethod
+    def _ordered_segments(main_file, extra_files):
+        """``(segments, audio_files)`` — the picture in `_001`...`_N` order.
+
+        The ORDER is the shape's, and pad_forge reads it off the file
+        names, so it is taken from the names here too rather than from
+        whatever order the storage query answered in.
+
+        The extras are SPLIT, not filtered: a card `.wav` is a component
+        of its own (`_audio_component`), and 322 RED clips on prod carry
+        one. Anything that is neither picture nor sound has no component
+        in this document, and posting the shape without it would attach
+        the picture and quietly drop the rest — so it is refused, exactly
+        as a media file with no Vidispine file id is refused on the
+        import route. A silent partial ingest is the one outcome this
+        whole line of work exists to end.
+
+        A HOLE in the picture numbering is refused too: it is what
+        pad_forge refuses downstream, and refusing here names the missing
+        segment where refusing there names only the shape.
+        """
+        audio_files = []
+        strays = []
+        video_files = []
+        for media_file in extra_files or ():
+            kind = media_file.get("type")
+            if kind == "video":
+                video_files.append(media_file)
+            elif kind == "audio":
+                audio_files.append(media_file)
+            else:
+                strays.append(media_file)
+        if strays:
+            raise TapelessIngestException(
+                f"{len(strays)} media file(s) of this clip are neither video "
+                f"nor audio ({', '.join(str(f.get('path')) for f in strays)}) "
+                f"and this shape declares no component for them — posting it "
+                f"would attach the picture and silently drop the rest, so "
+                f"nothing is posted"
+            )
+        if len(audio_files) > 1:
+            # `getClipAdditionalMediaFiles` collects at most ONE `.wav`
+            # (an exact-name query, first hit), so this is unreachable
+            # through a scan. It is refused rather than assumed because
+            # which track is `A1` and which is `A2` has never been
+            # measured, and picking one would be a guess.
+            raise TapelessIngestException(
+                f"this clip carries {len(audio_files)} audio files "
+                f"({', '.join(str(f.get('path')) for f in audio_files)}) and "
+                f"the track order of several has never been measured, so "
+                f"nothing is posted"
+            )
+
+        segments = [main_file] + [
+            media_file for media_file in video_files if media_file.get("path")
+        ]
+        indexed = []
+        for media_file in segments:
+            if not media_file.get("file_id"):
+                raise TapelessIngestException(
+                    f"the segment {media_file.get('path')} has no Vidispine "
+                    f"file id, so no shape can name it"
+                )
+            parsed = segment_stem(os.path.basename(media_file.get("path") or ""))
+            if parsed is None:
+                raise TapelessIngestException(
+                    f"the segment {media_file.get('path')} is not named "
+                    f"<stem>_<three digits>.R3D, so its place in the take "
+                    f"cannot be read from its name"
+                )
+            indexed.append((parsed[1], media_file))
+
+        indexed.sort(key=lambda entry: entry[0])
+        expected = [f"{index + 1:03d}" for index in range(len(indexed))]
+        found = [index for index, _media_file in indexed]
+        if found != expected:
+            raise TapelessIngestException(
+                f"this clip's segments are numbered {', '.join(found)} where a "
+                f"complete take is {', '.join(expected)} — a shape with a hole "
+                f"in its video components is refused by the reconstruction "
+                f"(segment _001 first, then no gap), so nothing is posted"
+            )
+        return [media_file for _index, media_file in indexed], audio_files
+
+    @staticmethod
+    def _audio_component(audio_file):
+        """The component for the card's separate `.wav`.
+
+        The `.wav` declares its own parameters, so they are READ, never
+        estimated: `wave` is in the standard library, the header is 44
+        bytes, and this is the same kind of disk access REDline already
+        makes on every `.R3D` at scan time.
+
+        A `.wav` that cannot be read FAILS the clip by name — a format
+        `wave` refuses (RF64, floating-point WAV), a path that is not
+        there, a header claiming no channels or no rate. The alternative
+        is a shape whose sound is silently missing, which is the outcome
+        this document exists to stop producing.
+        """
+        path = audio_file.get("absolute_path")
+        file_id = audio_file.get("file_id")
+        named = audio_file.get("path") or path or "(no path)"
+        if not file_id:
+            raise TapelessIngestException(
+                f"the audio file {named} has no Vidispine file id, so no "
+                f"shape can name it"
+            )
+        if not path:
+            raise TapelessIngestException(
+                f"the audio file {named} has no resolvable path on disk, so "
+                f"its format cannot be read and the shape would be posted "
+                f"without its sound"
+            )
+        try:
+            with wave.open(path, "rb") as handle:
+                channels = handle.getnchannels()
+                sample_width = handle.getsampwidth()
+                frame_rate = handle.getframerate()
+                frames = handle.getnframes()
+        except Exception as error:  # noqa: BLE001 - any unreadable wav
+            raise TapelessIngestException(
+                f"the audio file {named} could not be read ({error}) — a "
+                f"floating-point or RF64 WAV is not a shape this provider "
+                f"can describe, so nothing is posted"
+            )
+        return Provider._audio_component_from_header(
+            file_id, channels, sample_width, frame_rate, frames
+        )
+
+    @staticmethod
+    def _audio_component_from_header(
+        file_id, channels, sample_width, frame_rate, frames
+    ):
+        """The measured header, as Vidispine's `AudioComponentType`.
+
+        PURE, and split out from the read on purpose: every field below
+        is arithmetic over four numbers, so it can be pinned against the
+        reference shape without a file on disk.
+
+        Checked against `A002_A021_0526HT` (prod, 2026-09-22): 2
+        channels, 3-byte samples at 48000 give `blockAlign` 6, `bitrate`
+        2304000 and `pcm_s24le`, which is exactly what Vidispine wrote.
+
+        `sampleFormat` is looked up, never computed: see
+        `WAV_SAMPLE_FORMATS`. An unmeasured sample width omits the field
+        rather than extrapolating.
+        """
+        if channels <= 0 or sample_width <= 0 or frame_rate <= 0:
+            raise TapelessIngestException(
+                f"the audio file {file_id} declares {channels} channel(s) at "
+                f"{frame_rate} Hz in {sample_width}-byte samples, which is "
+                f"not a format that can be described, so nothing is posted"
+            )
+        time_base = {"numerator": 1, "denominator": frame_rate}
+        component = {
+            "file": [{"id": file_id}],
+            "codec": f"pcm_s{8 * sample_width}le",
+            "channelCount": channels,
+            "channelLayout": WAV_CHANNEL_LAYOUT,
+            "frameSize": WAV_FRAME_SIZE,
+            "blockAlign": channels * sample_width,
+            "bitrate": frame_rate * channels * sample_width * 8,
+            "timeBase": time_base,
+            "duration": {"samples": frames, "timeBase": dict(time_base)},
+            "itemTrack": WAV_ITEM_TRACK,
+            "essenceStreamId": WAV_ESSENCE_STREAM_ID,
+        }
+        sample_format = WAV_SAMPLE_FORMATS.get(sample_width)
+        if sample_format is not None:
+            component["sampleFormat"] = sample_format
+        return component
+
+    @staticmethod
+    def _positive_int(metadatas, key, anchor_path):
+        """One REDline column, as the positive integer the shape needs.
+
+        REDline's values are CAPTURED as strings (see
+        `REDLINE_TECHNICAL_COLUMNS`); converting them is this document's
+        business, not the capture's. A value that is absent, empty or not
+        a positive integer refuses the clip: a `0` width or a blank
+        duration would post a shape as mute as the one this replaces.
+        """
+        raw = (metadatas or {}).get(key)
+        try:
+            value = int(str(raw).strip())
+        except (TypeError, ValueError):
+            value = 0
+        if value <= 0:
+            raise TapelessIngestException(
+                f"REDline gave no usable {key} for {anchor_path} ({raw!r}), so "
+                f"the shape would state nothing where Vidispine states a "
+                f"number — nothing is posted"
+            )
+        return value
+
+    @staticmethod
+    def _frame_rate_scaled(metadatas, anchor_path):
+        """`FPS` as an integer over `FRAME_RATE_SCALE`.
+
+        `Record FPS` is captured beside it and deliberately NOT used: the
+        duration Vidispine writes on a deducible twin is
+        `Total Frames / FPS` (measured), and mixing the two rates in one
+        document would make the duration and the frame rate describe
+        different clips.
+        """
+        raw = (metadatas or {}).get("fps")
+        try:
+            scaled = (Decimal(str(raw).strip()) * FRAME_RATE_SCALE).to_integral_value()
+        except (InvalidOperation, ArithmeticError, TypeError, ValueError):
+            scaled = 0
+        if scaled <= 0:
+            raise TapelessIngestException(
+                f"REDline gave no usable fps for {anchor_path} ({raw!r}), so "
+                f"neither the duration nor the frame rate of this shape could "
+                f"be stated — nothing is posted"
+            )
+        return int(scaled)

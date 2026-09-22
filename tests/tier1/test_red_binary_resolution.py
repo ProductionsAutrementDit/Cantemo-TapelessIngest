@@ -35,10 +35,19 @@ from portal.plugins.TapelessIngest.providers import red as red_module
 
 # A trimmed REDline --printMeta 3 CSV: only the columns the provider reads,
 # in REDline's own order, with the trailing comma real output carries.
-REDLINE_HEADER = "Clip Name,Camera Model,Camera PIN,UUID,Date,Timestamp,Abs TC,"
+# The eight technical columns joined the seven identifying ones on
+# 2026-09-22; they are exercised for their own sake in
+# ``test_red_technical_metadata.py`` and are carried here only so this
+# file's fixture stays a CSV the provider accepts.
+REDLINE_HEADER = (
+    "Clip Name,Camera Model,Camera PIN,UUID,Date,Timestamp,Abs TC,"
+    "Frame Width,Frame Height,FPS,Record FPS,Total Frames,File Segments,"
+    "REDCODE,Camera Audio Channels,"
+)
 REDLINE_ROW = (
     "K001_K001_0804TX,KOMODO 6K,KMDBK006080,"
     "42B681D6-2AB5-46A2-8DEA-B1C05BD0CA54,20260804,103910,10:39:10:00,"
+    "3840,2160,60.000,60.000,1012,2,5:1,2,"
 )
 REDLINE_CSV = f"{REDLINE_HEADER}\n{REDLINE_ROW}\n"
 

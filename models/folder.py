@@ -165,6 +165,16 @@ def _incomplete_import(clip):
     Narrow on purpose — a clip whose ``item_id`` came from hash RECOVERY
     also has no job, and re-examining those every run is exactly the
     per-clip HTTP cost FR-8 removed.
+
+    NARROW ENOUGH TO EXCLUDE A POSTED SHAPE, and that is load bearing,
+    not incidental. ``Clip._post_shape_document`` states a whole
+    ``original`` shape and starts NO import job, so the row it leaves
+    matches this rung on two of its three terms: an ``item_id``, no
+    ``job_id`` — and a status of ``STATUS_SHAPE_POSTED``, which is why
+    that state was added. Widening the status term to "anything past
+    NOT_IMPORTED" would bring every repaired R3D clip back on every
+    scan, and ``shape/create`` ADDS a shape rather than refusing one, so
+    the item would collect one more ``original`` shape per run.
     """
     return is_incomplete_import(
         clip.item_id,

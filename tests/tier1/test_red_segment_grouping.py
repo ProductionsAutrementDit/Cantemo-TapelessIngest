@@ -42,6 +42,7 @@ from portal.plugins.TapelessIngest.models.clip import (
 )
 from portal.plugins.TapelessIngest.providers.providers import (
     MAIN_FILE_YIELDS_VIDEO,
+    main_file_declares_no_video,
     main_file_verdict_is_unknown,
     yields_video_component,
 )
@@ -821,6 +822,42 @@ def test_only_an_explicit_none_is_an_unknown_verdict(main_file, unknown):
     (refuses an absent key — every other provider).
     """
     assert main_file_verdict_is_unknown(main_file) is unknown
+
+
+@pytest.mark.parametrize(
+    "main_file,declares_no_video",
+    [
+        ({MAIN_FILE_YIELDS_VIDEO: False}, True),
+        # A position, not a shrug — and the two falsy readers must agree
+        # about which position it is.
+        ({MAIN_FILE_YIELDS_VIDEO: 0}, True),
+        ({MAIN_FILE_YIELDS_VIDEO: ""}, True),
+        ({MAIN_FILE_YIELDS_VIDEO: True}, False),
+        # The un-evidenced verdict. It is REFUSED by the multi-component
+        # import (ruled 2026-09-02); it must never select the
+        # shape-posting route, which would state a shape on no evidence.
+        ({MAIN_FILE_YIELDS_VIDEO: None}, False),
+        # A provider that never had the question keeps today's route.
+        ({}, False),
+        (None, False),
+    ],
+)
+def test_only_a_positive_no_selects_the_shape_posting_route(
+    main_file, declares_no_video
+):
+    """The THIRD reading of the key, and the narrowest.
+
+    ``yields_video_component`` folds an absent key and ``None`` into
+    ``True``, ``main_file_verdict_is_unknown`` answers for ``None``
+    alone, and this one answers only for a provider that looked, could
+    tell, and said no.
+
+    Mutation killed: `not yields_video_component(main_file)` (which is
+    the same answer here but reads `None` through a helper that hides
+    it); `main_file.get(KEY) is False` (which would drop `0` and `""`,
+    silently disagreeing with the count).
+    """
+    assert main_file_declares_no_video(main_file) is declares_no_video
 
 
 @pytest.mark.parametrize("declared", [None, 0, "", "no"])

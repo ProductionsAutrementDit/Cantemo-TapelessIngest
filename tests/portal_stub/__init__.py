@@ -509,6 +509,7 @@ class VidispineFake:
     settle_after_polls = 1
     stalled_jobs = set()
     _placeholder_counter = 0
+    _posted_shape_counter = 0
     # Story 3.2: pool workers reach the two compound class-state operations
     # below (`fault_point`'s scan-then-pop, `new_placeholder_id`'s
     # read-increment-format) from up to `workers` threads at once. The GIL
@@ -540,6 +541,7 @@ class VidispineFake:
             cls.settle_after_polls = 1
             cls.stalled_jobs.clear()
             cls._placeholder_counter = 0
+            cls._posted_shape_counter = 0
             cls._default_job_counter = 0
 
     @classmethod
@@ -620,6 +622,32 @@ class VidispineFake:
         cls.item_shapes.setdefault(item_id, []).append(
             {"id": shape_id, "files": list(files), "placeholder": bool(placeholder)}
         )
+
+    @classmethod
+    def post_shape(cls, item_id, document):
+        """What ``shape/create`` does: ADD a real (non-placeholder) shape.
+
+        Not a replace and not a refusal — the endpoint stacks, which is
+        exactly why the plugin owns an idempotency guard. The files the
+        document NAMES are attached, because that is what makes the
+        posted shape visible to the next run's non-placeholder query and
+        to ``_should_replace_original_files``.
+
+        The placeholder shape the item already carries is left untouched:
+        measured harmless on prod, and no guard against it may be written.
+        """
+        with cls._lock:
+            cls._posted_shape_counter += 1
+            shape_id = f"{item_id}-POSTED-{cls._posted_shape_counter}"
+        files = []
+        for component in [document.get("containerComponent") or {}] + list(
+            document.get("videoComponent") or []
+        ):
+            for entry in component.get("file") or []:
+                if entry.get("id") and entry["id"] not in [f["id"] for f in files]:
+                    files.append({"id": entry["id"], "storage": "VX-41"})
+        cls.set_original_shape(item_id, shape_id, files=files, placeholder=False)
+        return shape_id
 
     @classmethod
     def fill_placeholder_shapes(cls, item_id, files):
@@ -1261,18 +1289,87 @@ class RestTransportFake:
         cls.calls.clear()
 
     @classmethod
-    def prepare(cls, base64string, url, runasuser=None, return_format="json"):
-        return {"url": url, "runasuser": runasuser, "return_format": return_format}
+    def prepare(
+        cls,
+        base64string,
+        url,
+        method=None,
+        body=None,
+        runasuser=None,
+        header_contenttype=None,
+        header_personal=None,
+        return_format=None,
+    ):
+        """``RestAPIBase.utility.prepare_request``'s real keyword surface.
+
+        ``method``/``body``/``header_contenttype`` are what a POST needs,
+        and the plugin's ``shape/create`` and ``item/.../transcode``
+        calls pass them. Accepting them is what lets those two run for
+        real off-server; dropping them would let a GET masquerade as the
+        POST and the suite would never notice.
+        """
+        return {
+            "url": url,
+            "method": method,
+            "body": body,
+            "header_contenttype": header_contenttype,
+            "runasuser": runasuser,
+            "return_format": return_format,
+        }
 
     @classmethod
-    def perform(cls, url=None, runasuser=None, return_format="json", **kwargs):
+    def perform(
+        cls,
+        url=None,
+        method=None,
+        body=None,
+        header_contenttype=None,
+        runasuser=None,
+        return_format="json",
+        **kwargs,
+    ):
         cls.calls.append(url)
-        match = re.search(r"/item/([^/?]+)/shape", url or "")
+        path = urlsplit(url or "").path
+        query = parse_qs(urlsplit(url or "").query)
+
+        create = re.search(r"/item/([^/?]+)/shape/create$", path)
+        if create:
+            # `shape/create` ADDS a shape — it never refuses one and
+            # never replaces one (measured on VX-216897). Modelling it as
+            # an append is the whole point: a plugin that lost its
+            # idempotency guard must show up here as a SECOND `original`
+            # shape, not as a silent overwrite.
+            item_id = create.group(1)
+            document = json.loads(body) if body else {}
+            VidispineFake.record(
+                "createShapeFromDocument",
+                item_id=item_id,
+                tag=(query.get("tag") or [None])[0],
+                update_item_metadata=(query.get("updateItemMetadata") or [None])[0],
+                document=document,
+                method=method,
+                header_contenttype=header_contenttype,
+            )
+            shape_id = VidispineFake.post_shape(item_id, document)
+            VidispineFake.fault_point("createShapeFromDocument")
+            return json.dumps({"id": shape_id})
+
+        transcode = re.search(r"/item/([^/?]+)/transcode$", path)
+        if transcode:
+            VidispineFake.record(
+                "requestItemTranscode",
+                item_id=transcode.group(1),
+                tag=(query.get("tag") or [None])[0],
+                method=method,
+            )
+            VidispineFake.fault_point("requestItemTranscode")
+            return json.dumps({"jobId": "VX-TRANSCODE-JOB"})
+
+        match = re.search(r"/item/([^/?]+)/shape", path)
         if match:
             # The query string is READ, not ignored: `placeholder` is a
             # three-state filter on this endpoint and the plugin's retry
             # path turns on its exclusivity (see VidispineFake.shapes_for).
-            query = parse_qs(urlsplit(url or "").query)
             placeholder = query.get("placeholder", [None])[0]
             shapes = VidispineFake.shapes_for(match.group(1), placeholder)
             return json.dumps({"uri": [shape["id"] for shape in shapes]})

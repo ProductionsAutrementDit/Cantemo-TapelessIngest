@@ -245,12 +245,100 @@ def getClipMainMediaFile(self, clip):
   colon-separated one means a video component, and anything it does not
   recognise answers `None` with a warning — so a RED clip with an
   unreadable `Abs TC` and span files is refused rather than guessed at.
-- The key is read by `providers.providers.yields_video_component` (a
-  count: `None` and an absent key both read `True` there) and by
-  `providers.providers.main_file_verdict_is_unknown` (the refusal: an
-  explicit `None` is the only value it answers `True` for, and
-  `_import_multi_component` refuses to declare a budget on it);
-  `models/clip.py` never learns what a codec or a timecode is.
+- **`Abs TC` is the only field that decides, and the eight technical
+  columns beside it are not a second opinion.** Since 2026-09-22 the
+  same `--printMeta 3` row also yields `Frame Width`, `Frame Height`,
+  `FPS`, `Record FPS`, `Total Frames`, `File Segments`, `REDCODE` and
+  `Camera Audio Channels`, persisted verbatim as `ClipMetadata` rows
+  (`REDLINE_TECHNICAL_COLUMNS`). The CAPTURE computes nothing: every
+  value is copied exactly as REDline printed it — a string, never an
+  int, never a float, never a quotient — and a populated `Frame Width`
+  never upgrades a dot-separated anchor's verdict to `True`. The media
+  was never the problem, only Vidispine's decoder is, and both clips
+  measured on prod carried these columns identically populated. They
+  are absent from `getAvailableMetadatas()`, so they are not selectable
+  in a metadata mapping. Two of the values mean less than they look
+  like: `Total Frames` on the anchor covers the **whole take**, not the
+  anchor's segment (`File Segments=2` → `Total Frames=1012` while
+  `Clip Out=1011`), and `Camera Audio Channels` can be `2` while `WAV
+  Filename` is empty, the audio being inside the `.R3D`. A missing
+  column raises `TapelessIngestException` naming it, exactly as the
+  seven identifying columns do.
+- **They ARE used, at one place and only there: `buildShapeDocument`.**
+  When the verdict is `False`, Vidispine deduces no shape at all, so the
+  plugin states one — and these are the numbers it states. `Total Frames
+  / FPS` reproduces bit for bit the `durationSeconds` Vidispine writes
+  when its own deduction succeeds (`1012 / 60` =
+  `16.866666666666667`). Converting a captured string into a duration is
+  the document's business; doing it at capture time would have put a
+  computed number in a table whose other rows are transcriptions. See
+  the next section.
+- The key has **three** readers, and they answer different questions:
+  `providers.providers.yields_video_component` (a count: `None` and an
+  absent key both read `True`), `main_file_verdict_is_unknown` (the
+  refusal: an explicit `None` is the only value it answers `True` for,
+  and `_import_multi_component` refuses to declare a budget on it), and
+  `main_file_declares_no_video` (the shape-posting route below: only a
+  positive `False`/`0`/`""` selects it — an absent key is a provider
+  that never had the question and `None` is the refusal). `models/clip.py`
+  never learns what a codec or a timecode is.
+
+#### Composing the shape yourself
+
+```python
+def buildShapeDocument(self, main_file, extra_files, metadatas):
+    """A complete Vidispine ShapeDocument, or None."""
+    return None
+```
+
+Consulted **only** when this provider has declared, positively, that the
+main file yields no video component. Vidispine then deduces nothing from
+it: there is no shape for an import to complete, and the item comes out
+with a *binary* component, no duration, no resolution, no codec and no
+proxy — `mediaType = 'data'` for a single-file clip, so no duration or
+type search ever finds it. The plugin therefore posts a whole `original`
+shape (`POST /API/item/{id}/shape/create?tag=original&updateItemMetadata=true`)
+and asks for the proxy explicitly, instead of declaring a component
+budget and importing.
+
+- **`None` — the default — keeps today's behaviour.** A provider that
+  can answer the verdict but cannot describe its own essence must not be
+  handed a route that would have to guess a codec, a resolution and a
+  frame rate on its behalf. That is what holds this route at `red`.
+- **Be pure.** Dicts in, a dict out: no Vidispine, no filesystem, no
+  database, no subprocess. The document a production item receives is
+  then readable in a unit test.
+- **Post the WHOLE shape, never a patch.** The files named by the
+  *video* components must form a `_001`…`_N` set — same folder, same
+  stem, no hole — because that is what the transcoder plugin
+  reconstructs the take from. Completing the placeholder Vidispine left
+  puts the anchor in a binary component and starts the video components
+  at `_002`, which it refuses.
+- **Refuse rather than invent.** Raise `TapelessIngestException` for
+  anything you cannot describe honestly — a metadata value the extractor
+  did not capture, a media file with no Vidispine file id, a gap in the
+  segment numbering, an extra your document declares no component for.
+  The clip is reported failed with that reason and the item keeps a
+  clean placeholder, so a corrected clip is a fresh import.
+- **State only what was measured.** `red`'s document carries the format
+  constants read off a shape Vidispine built *itself* for a decodable
+  twin, and the per-clip numbers REDline printed. Fields that were never
+  measured for this population — `dropFrame` and the timecode fields on
+  a dot-separated anchor — are **omitted**, not guessed.
+- **Read a parameter rather than estimating it, when the file declares
+  it.** The audio *inside* the `.R3D` gets no component: no captured
+  column gives its sample rate, and the proxy comes out with audio
+  anyway (pad_forge builds it from the file itself). A **separate
+  `.wav`** is the opposite case — 322 RED clips on prod carry one — and
+  it declares its own channels, width, rate and length in its header, so
+  `red` opens it (`wave`, standard library) and states an
+  `audioComponent` from what it read. The read happens in
+  `buildShapeDocument`, not in `getClipAdditionalMediaFiles`: the
+  ordinary import route never needs those numbers, so it opens nothing
+  and a corrupt sidecar cannot break a clip that was importing fine. A
+  `.wav` that cannot be read fails the clip by name; a sample width that
+  has never been measured omits `sampleFormat` instead of extrapolating
+  it.
 
 #### Import Configuration
 
@@ -281,12 +369,22 @@ def getImportOptions(self):
 - Extensions: `.R3D`
 - Searches root folder and subfolders
 
-**Metadata Extracted**:
-- Clip name, UMID, duration, timecode
-- Camera model, serial number, firmware
-- Resolution, frame rate, codec
-- ISO, color temperature, tint
-- Lens information
+**Metadata Extracted** — the fifteen `--printMeta 3` columns
+(`REDLINE_REQUIRED_COLUMNS`), every one of them required and every one
+of them copied verbatim:
+- Identity and provenance: `Clip Name`, `UUID`, `Abs TC` (timecode),
+  `Date` + `Timestamp` (shooting date), `Camera Model`, `Camera PIN`
+- Technical, since 2026-09-22 and copied **verbatim**: `Frame Width`,
+  `Frame Height`, `FPS`, `Record FPS`, `Total Frames`, `File Segments`,
+  `REDCODE`, `Camera Audio Channels`. Nothing is derived at capture
+  time; they are converted at one place only, `buildShapeDocument`,
+  which states the shape Vidispine could not deduce (see *The main
+  file's own video component*)
+
+REDline is invoked **once per clip**; a run that prints no data row, or
+a row missing any of the fifteen, raises `TapelessIngestException`
+naming REDline, its exit status and what is missing. REDline exits `1`
+on success, so the exit status never gates parsing.
 
 **Spanned Clips**:
 - Detects when R3D files span multiple parts

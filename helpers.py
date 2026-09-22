@@ -16,6 +16,13 @@ import urllib.parse
 
 from django.core.cache import cache  # type: ignore
 
+import simplejson as json  # type: ignore
+
+from RestAPIBase.resturl import RestURL  # type: ignore
+from RestAPIBase.utility import (  # type: ignore
+    perform_request,
+    prepare_request,
+)
 from VidiRest.itemapi import ItemAPI  # type: ignore
 
 from portal.api import client  # type: ignore
@@ -102,6 +109,76 @@ class TapelessIngestItemAPI(ItemAPI):
             runasuser=runasuser,
             return_format=return_format,
         )
+
+    def createShapeFromDocument(
+        self,
+        item_id,
+        shape_document,
+        tag="original",
+        update_item_metadata=True,
+        runasuser=None,
+        return_format="json",
+    ):
+        """`POST /API/item/{id}/shape/create`, with the query Vidispine needs.
+
+        NOT `ItemAPI.createItemShape`, which posts the same body to the
+        same path and passes NO query: without `updateItemMetadata=true`
+        the shape is created correctly and the ITEM stays mute —
+        `mediaType = 'none'`, `durationSeconds` empty — so nothing finds
+        it by duration or by type. Measured on `VX-216898`, 2026-09-22.
+        The tag has to travel the same way: it is what makes the new
+        shape the item's `original`.
+
+        The endpoint ADDS a shape; it never refuses one and never
+        replaces one (measured on `VX-216897`). The caller owns the
+        idempotency guard — see `Clip._post_shape_document`.
+        """
+        rest_url = RestURL(
+            "%sAPI/item/%s/shape/create" % (self.vsapi.super_url, item_id)
+        )
+        query = {"tag": tag}
+        if update_item_metadata:
+            query["updateItemMetadata"] = "true"
+        rest_url.addQuery(query)
+        param_dict = prepare_request(
+            self.vsapi.base64string,
+            rest_url.geturl(),
+            method="POST",
+            body=json.dumps(shape_document),
+            header_contenttype="json",
+            runasuser=runasuser,
+            return_format=return_format,
+        )
+        result = perform_request(**param_dict)
+        if result and return_format == "json":
+            result = json.loads(result)
+        return result
+
+    def requestItemTranscode(self, item_id, tag, runasuser=None, return_format="json"):
+        """`POST /API/item/{id}/transcode?tag=...` — ask for a proxy.
+
+        The ITEM endpoint, not `ItemAPI.retranscode`'s
+        `/shape/{id}/transcode`: this runs on a route where no shape id
+        of ours is in hand and Vidispine picks the source shape itself.
+
+        It has to be asked for at all. On the ordinary import route the
+        ANCHOR's import job is what evaluates the placeholder and starts
+        the transcode; a shape posted whole starts no job, so nothing
+        would ever ask.
+        """
+        rest_url = RestURL("%sAPI/item/%s/transcode" % (self.vsapi.super_url, item_id))
+        rest_url.addQuery({"tag": tag})
+        param_dict = prepare_request(
+            self.vsapi.base64string,
+            rest_url.geturl(),
+            method="POST",
+            runasuser=runasuser,
+            return_format=return_format,
+        )
+        result = perform_request(**param_dict)
+        if result and return_format == "json":
+            result = json.loads(result)
+        return result
 
 
 class TapelessIngestHelper(IngestHelper):

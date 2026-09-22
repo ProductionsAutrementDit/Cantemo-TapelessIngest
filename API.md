@@ -267,6 +267,16 @@ Retrieves detailed clip information.
 - `2` - Registered (file registered in Vidispine)
 - `3` - Placeholder created
 - `4` - Imported (fully imported with transcode)
+- `5` - Shape posted (the plugin stated the item's `original` shape
+  itself, because Vidispine could deduce none from the media, and asked
+  for the proxy explicitly). This route starts no import job, so
+  `job_id` is empty on such a clip by design.
+
+Since 2026-09-22 these are **declared choices** on the model, so a
+`status` outside `0`-`5` sent to a clip-creating endpoint is rejected
+with `400` instead of being stored. Every value the plugin itself writes
+is in the list; only an out-of-range value from a client changes
+behaviour.
 
 #### List Clips
 ```http
