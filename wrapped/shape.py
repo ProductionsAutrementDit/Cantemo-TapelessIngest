@@ -78,6 +78,10 @@ def build_document_from_template(
     audio_file_ids: Sequence[str],
     timing: Timing,
 ) -> Dict[str, Any]:
+    if not template.get("containerComponent"):
+        raise ShapeMismatch("template has no containerComponent")
+    if not template.get("videoComponent"):
+        raise ShapeMismatch("template has no videoComponent")
     if audio_file_ids and not template.get("audioComponent"):
         raise ShapeMismatch(
             f"template has no audio component for {len(audio_file_ids)} "

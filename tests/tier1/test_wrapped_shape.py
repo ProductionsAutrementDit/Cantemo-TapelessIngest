@@ -163,3 +163,11 @@ def test_a_template_without_audio_is_refused_for_audio_originals():
     del template["audioComponent"]
     with pytest.raises(ShapeMismatch, match="no audio component"):
         _from_template(template=template)
+
+
+@pytest.mark.parametrize("name", ["containerComponent", "videoComponent"])
+def test_a_template_missing_a_component_raises_shape_mismatch(name):
+    template = p2_template()
+    del template[name]
+    with pytest.raises(ShapeMismatch, match=name):
+        _from_template(template=template)

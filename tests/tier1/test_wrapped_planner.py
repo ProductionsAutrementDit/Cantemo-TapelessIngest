@@ -1,5 +1,7 @@
 """Tier 1: one verdict per item, and the exact plan for the writable ones."""
 
+import pytest
+
 from portal.plugins.TapelessIngest.wrapped import verdicts
 from portal.plugins.TapelessIngest.wrapped.archive import CachedArchive
 from portal.plugins.TapelessIngest.wrapped.paths import to_absolute
@@ -405,4 +407,33 @@ def test_a_template_that_is_itself_a_proxy_copy_is_refused():
     assert result.verdict == verdicts.UNEXPECTED
     assert result.reason == (
         f"proxy-copied technical description; template {KEY} is itself a " f"proxy copy"
+    )
+
+
+def _without(name):
+    template = p2_template()
+    del template[name]
+    return template
+
+
+def _two_videos():
+    template = p2_template()
+    template["videoComponent"] *= 2
+    return template
+
+
+@pytest.mark.parametrize(
+    "template, why",
+    [
+        (_without("containerComponent"), "no containerComponent"),
+        (_without("videoComponent"), "0 videoComponent(s), expected 1"),
+        (_two_videos(), "2 videoComponent(s), expected 1"),
+        (_without("audioComponent"), "no audioComponent for 4 audio original(s)"),
+    ],
+)
+def test_a_malformed_template_is_refused_at_plan_time(template, why):
+    result = _proxy_plan(templates={KEY: {"template": template}})
+    assert result.verdict == verdicts.UNEXPECTED
+    assert result.reason == (
+        f"proxy-copied technical description; template {KEY} is malformed: {why}"
     )

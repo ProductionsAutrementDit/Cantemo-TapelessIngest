@@ -91,6 +91,19 @@ def _attachment_problem(shape: Shape, output_file: Optional[str]) -> Optional[st
     return None
 
 
+def _template_problem(template: Mapping[str, Any], audio_count: int) -> Optional[str]:
+    """Checked at plan time so apply never finds a template it cannot
+    build from (build_document_from_template keeps a backstop)."""
+    if not isinstance(template.get("containerComponent"), Mapping):
+        return "no containerComponent"
+    videos = template.get("videoComponent") or []
+    if len(videos) != 1:
+        return f"{len(videos)} videoComponent(s), expected 1"
+    if audio_count and not template.get("audioComponent"):
+        return f"no audioComponent for {audio_count} audio original(s)"
+    return None
+
+
 def _technical_source(
     shape: Shape,
     originals: Sequence[OriginalFile],
@@ -99,8 +112,9 @@ def _technical_source(
 ) -> Dict[str, Any]:
     """What the new shape's technical description is stated from, as the
     plan fields to add; ``{"problem": ...}`` when it cannot be stated."""
+    audio_count = sum(1 for o in originals if o.kind == "audio")
     if not is_proxy_copy(shape):
-        problem = mismatch(shape, sum(1 for o in originals if o.kind == "audio"))
+        problem = mismatch(shape, audio_count)
         return {"problem": problem} if problem else {"technical_source": "wrapped"}
     key = template_key(clip_metadata)
     if key is None:
@@ -110,6 +124,9 @@ def _technical_source(
     template = templates[key]["template"]
     if is_proxy_copy(parse_shape(template)):
         return {"problem": f"{PROXY_COPY}; template {key} is itself a proxy copy"}
+    malformed = _template_problem(template, audio_count)
+    if malformed:
+        return {"problem": f"{PROXY_COPY}; template {key} is malformed: {malformed}"}
     try:
         clip_timing = timing(clip_metadata)
     except ValueError as error:
