@@ -1,0 +1,399 @@
+{
+  "AVC-I_1080/25p|25p|AVC-I100|A16": {
+    "reference_item": "VX-39331",
+    "references": 601,
+    "share": 1.0,
+    "template": {
+      "audioComponent": [
+        {
+          "bitrate": 768000,
+          "channelCount": 1,
+          "channelLayout": 0,
+          "codec": "pcm_s16le",
+          "frameSize": 1,
+          "sampleFormat": "AV_SAMPLE_FMT_S16",
+          "timeBase": {
+            "denominator": 48000,
+            "numerator": 1
+          }
+        }
+      ],
+      "containerComponent": {
+        "dropFrame": false,
+        "format": "mxf",
+        "roundedTimeBase": 25
+      },
+      "mimeType": [
+        "video/x-mxf-h264-pcm_s16le"
+      ],
+      "videoComponent": [
+        {
+          "averageFrameRate": {
+            "denominator": 1,
+            "numerator": 25
+          },
+          "bitDepth": 10,
+          "bitsPerPixel": 20,
+          "codec": "h264",
+          "codecTimeBase": {
+            "denominator": 50,
+            "numerator": 1
+          },
+          "containerSAR": {
+            "horizontal": 1,
+            "vertical": 1
+          },
+          "displayHeight": {
+            "denominator": 1,
+            "numerator": 1080
+          },
+          "displayWidth": {
+            "denominator": 1,
+            "numerator": 1920
+          },
+          "extradata": "00000001091000000001677A1029B6D4202A331DC762A1084054663B8EC5420210256B93D7D7E4FE33F11F19E08B88C5443C0780227E2701E301010140000003004000000CA10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000168CE3348D000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+          "fieldOrder": "progressive",
+          "level": 41,
+          "maxBFrames": 0,
+          "max_packet_size": 584292,
+          "pixelAspectRatio": {
+            "horizontal": 1,
+            "vertical": 1
+          },
+          "pixelFormat": "yuv422p10le",
+          "profile": 2170,
+          "realBaseFrameRate": {
+            "denominator": 1,
+            "numerator": 25
+          },
+          "resolution": {
+            "height": 1080,
+            "width": 1920
+          },
+          "ticks_per_frame": 2,
+          "timeBase": {
+            "denominator": 25,
+            "numerator": 1
+          }
+        }
+      ]
+    }
+  },
+  "AVC-I_1080/25p|25p|AVC-I100|A24": {
+    "reference_item": "VX-39084",
+    "references": 169,
+    "share": 1.0,
+    "template": {
+      "audioComponent": [
+        {
+          "bitrate": 1152000,
+          "channelCount": 1,
+          "channelLayout": 0,
+          "codec": "pcm_s24le",
+          "frameSize": 1,
+          "sampleFormat": "AV_SAMPLE_FMT_S32",
+          "timeBase": {
+            "denominator": 48000,
+            "numerator": 1
+          }
+        }
+      ],
+      "containerComponent": {
+        "dropFrame": false,
+        "format": "mxf",
+        "roundedTimeBase": 25
+      },
+      "mimeType": [
+        "video/x-mxf-h264-pcm_s24le"
+      ],
+      "videoComponent": [
+        {
+          "averageFrameRate": {
+            "denominator": 1,
+            "numerator": 25
+          },
+          "bitDepth": 10,
+          "bitsPerPixel": 20,
+          "codec": "h264",
+          "codecTimeBase": {
+            "denominator": 50,
+            "numerator": 1
+          },
+          "containerSAR": {
+            "horizontal": 1,
+            "vertical": 1
+          },
+          "displayHeight": {
+            "denominator": 1,
+            "numerator": 1080
+          },
+          "displayWidth": {
+            "denominator": 1,
+            "numerator": 1920
+          },
+          "extradata": "00000001091000000001677A1029B6D4202A331DC762A1084054663B8EC5420210256B93D7D7E4FE33F11F19E08B88C5443C0780227E2701E301010140000003004000000CA10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000168CE3348D000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+          "fieldOrder": "progressive",
+          "level": 41,
+          "maxBFrames": 0,
+          "max_packet_size": 591972,
+          "pixelAspectRatio": {
+            "horizontal": 1,
+            "vertical": 1
+          },
+          "pixelFormat": "yuv422p10le",
+          "profile": 2170,
+          "realBaseFrameRate": {
+            "denominator": 1,
+            "numerator": 25
+          },
+          "resolution": {
+            "height": 1080,
+            "width": 1920
+          },
+          "ticks_per_frame": 2,
+          "timeBase": {
+            "denominator": 25,
+            "numerator": 1
+          }
+        }
+      ]
+    }
+  },
+  "AVC-I_1080/50i|50i|AVC-I100|A16": {
+    "reference_item": "VX-10037",
+    "references": 4942,
+    "share": 1.0,
+    "template": {
+      "audioComponent": [
+        {
+          "bitrate": 768000,
+          "channelCount": 1,
+          "channelLayout": 0,
+          "codec": "pcm_s16le",
+          "frameSize": 1,
+          "sampleFormat": "AV_SAMPLE_FMT_S16",
+          "timeBase": {
+            "denominator": 48000,
+            "numerator": 1
+          }
+        }
+      ],
+      "containerComponent": {
+        "dropFrame": false,
+        "format": "mxf",
+        "roundedTimeBase": 25
+      },
+      "mimeType": [
+        "video/x-mxf-h264-pcm_s16le"
+      ],
+      "videoComponent": [
+        {
+          "averageFrameRate": {
+            "denominator": 1,
+            "numerator": 25
+          },
+          "bitDepth": 10,
+          "bitsPerPixel": 20,
+          "codec": "h264",
+          "codecTimeBase": {
+            "denominator": 50,
+            "numerator": 1
+          },
+          "containerSAR": {
+            "horizontal": 1,
+            "vertical": 1
+          },
+          "displayHeight": {
+            "denominator": 1,
+            "numerator": 1080
+          },
+          "displayWidth": {
+            "denominator": 1,
+            "numerator": 1920
+          },
+          "extradata": "00000001091000000001677A1029B6D420223319C6632321011198CE33191821033A46656A6524ADE91232141A2634ADA441822301502B1A24694830402E111208C68C0441284C34F01E0113F2E03C6020202800000300080000030194200000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000168CE3348D000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+          "fieldOrder": "F2",
+          "level": 41,
+          "maxBFrames": 0,
+          "max_packet_size": 584292,
+          "pixelAspectRatio": {
+            "horizontal": 1,
+            "vertical": 1
+          },
+          "pixelFormat": "yuv422p10le",
+          "profile": 2170,
+          "realBaseFrameRate": {
+            "denominator": 1,
+            "numerator": 25
+          },
+          "resolution": {
+            "height": 1080,
+            "width": 1920
+          },
+          "ticks_per_frame": 2,
+          "timeBase": {
+            "denominator": 25,
+            "numerator": 1
+          }
+        }
+      ]
+    }
+  },
+  "DV100_1080/50i|50i|A16": {
+    "reference_item": "VX-20035",
+    "references": 2573,
+    "share": 0.9743,
+    "template": {
+      "audioComponent": [
+        {
+          "bitrate": 768000,
+          "channelCount": 1,
+          "channelLayout": 0,
+          "codec": "pcm_s16le",
+          "frameSize": 1,
+          "sampleFormat": "AV_SAMPLE_FMT_S16",
+          "timeBase": {
+            "denominator": 48000,
+            "numerator": 1
+          }
+        }
+      ],
+      "containerComponent": {
+        "dropFrame": false,
+        "format": "mxf",
+        "roundedTimeBase": 25
+      },
+      "mimeType": [
+        "video/x-mxf-dvvideo-pcm_s16le"
+      ],
+      "videoComponent": [
+        {
+          "averageFrameRate": {
+            "denominator": 1,
+            "numerator": 25
+          },
+          "bitDepth": 8,
+          "bitsPerPixel": 16,
+          "codec": "dvvideo",
+          "codecTimeBase": {
+            "denominator": 25,
+            "numerator": 1
+          },
+          "containerSAR": {
+            "horizontal": 1,
+            "vertical": 1
+          },
+          "displayHeight": {
+            "denominator": 1,
+            "numerator": 1080
+          },
+          "displayWidth": {
+            "denominator": 1,
+            "numerator": 1920
+          },
+          "fieldOrder": "F2",
+          "maxBFrames": 0,
+          "max_packet_size": 591460,
+          "pixelAspectRatio": {
+            "horizontal": 4,
+            "vertical": 3
+          },
+          "pixelFormat": "yuv422p",
+          "realBaseFrameRate": {
+            "denominator": 1,
+            "numerator": 25
+          },
+          "resolution": {
+            "height": 1080,
+            "width": 1440
+          },
+          "timeBase": {
+            "denominator": 25,
+            "numerator": 1
+          }
+        }
+      ]
+    }
+  },
+  "DV50_422|50i|A16": {
+    "reference_item": "VX-70535",
+    "references": 156,
+    "share": 1.0,
+    "template": {
+      "audioComponent": [
+        {
+          "bitrate": 768000,
+          "channelCount": 1,
+          "channelLayout": 0,
+          "codec": "pcm_s16le",
+          "frameSize": 1,
+          "sampleFormat": "AV_SAMPLE_FMT_S16",
+          "timeBase": {
+            "denominator": 48000,
+            "numerator": 1
+          }
+        }
+      ],
+      "containerComponent": {
+        "dropFrame": false,
+        "format": "mxf",
+        "roundedTimeBase": 25
+      },
+      "mimeType": [
+        "video/x-mxf-dvvideo-pcm_s16le"
+      ],
+      "videoComponent": [
+        {
+          "averageFrameRate": {
+            "denominator": 1,
+            "numerator": 25
+          },
+          "bitDepth": 8,
+          "bitrate": 48883200,
+          "bitsPerPixel": 16,
+          "codec": "dvvideo",
+          "codecTimeBase": {
+            "denominator": 25,
+            "numerator": 1
+          },
+          "containerSAR": {
+            "horizontal": 64,
+            "vertical": 45
+          },
+          "displayHeight": {
+            "denominator": 1,
+            "numerator": 576
+          },
+          "displayWidth": {
+            "denominator": 1,
+            "numerator": 720
+          },
+          "fieldOrder": "F2",
+          "maxBFrames": 0,
+          "max_packet_size": 303460,
+          "pixelAspectRatio": {
+            "horizontal": 64,
+            "vertical": 45
+          },
+          "pixelFormat": "yuv422p",
+          "realBaseFrameRate": {
+            "denominator": 1,
+            "numerator": 25
+          },
+          "resolution": {
+            "height": 576,
+            "width": 720
+          },
+          "timeBase": {
+            "denominator": 25,
+            "numerator": 1
+          },
+          "videoStandard": {
+            "type": "PAL",
+            "value": "576i50"
+          }
+        }
+      ]
+    }
+  }
+}
