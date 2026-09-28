@@ -29,14 +29,21 @@ LEGACY = "/Volumes/ActiveMedia/AA - RUSHES TAPELESS/"
 
 
 def _world(
-    items=("VX-1",), storage="VX-2", documents=None, metadata=None, duration="8.72"
+    items=("VX-1",),
+    storage="VX-2",
+    documents=None,
+    metadata=None,
+    duration="8.72",
+    cpaa_marker=None,
 ):
     gateway, archive = InMemoryGateway(), FakeArchive()
     for n, item_id in enumerate(items):
         document = (documents or {}).get(item_id) or wrapped_p2_document(
             storage=storage
         )
-        seed_item(gateway, item_id, document, duration=duration)
+        seed_item(
+            gateway, item_id, document, duration=duration, cpaa_marker=cpaa_marker
+        )
         clip = Clip.objects.create(
             umid=f"U{n}",
             path="2016/AH_TEST",
@@ -304,6 +311,7 @@ def _proxy_world(items=("VX-1",)):
         documents={i: proxy_copy_document() for i in items},
         metadata={i: p2_clip_metadata() for i in items},
         duration="19.88",
+        cpaa_marker="true",
     )
 
 
@@ -331,6 +339,7 @@ def test_plan_reads_each_clips_own_metadata(migrated_db):
         documents={i: proxy_copy_document() for i in ("VX-1", "VX-2")},
         metadata={"VX-1": p2_clip_metadata(), "VX-2": {"video_codec": "X"}},
         duration="19.88",
+        cpaa_marker="true",
     )
     _run(world, "plan", templates={KEY: {"template": p2_template()}})
     verdicts = dict(WrappedMigration.objects.values_list("item_id", "verdict"))

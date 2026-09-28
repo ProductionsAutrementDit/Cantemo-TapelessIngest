@@ -43,6 +43,7 @@ ROLLBACK_ITEM_FIELDS = (
     fields.BARCODES_FIELD,
     fields.TAPE_LABELS_FIELD,
     fields.TAPE_NAMES_FIELD,
+    fields.CPAA_MIGRATION_FIELD,
 )
 
 
@@ -54,7 +55,14 @@ class PlanResult:
     rollback: Dict[str, Any] = field(default_factory=dict)
 
 
-def _rollback(item_id: str, shape: Shape, gateway: Gateway) -> Dict[str, Any]:
+def _rollback(
+    item_id: str,
+    shape: Shape,
+    gateway: Gateway,
+    item_values: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    if item_values is None:
+        item_values = gateway.item_fields(item_id, ROLLBACK_ITEM_FIELDS)
     return {
         "wrapped_shape_id": shape.shape_id,
         "shape_files": [asdict(f) for f in shape.files().values()],
@@ -64,7 +72,7 @@ def _rollback(item_id: str, shape: Shape, gateway: Gateway) -> Dict[str, Any]:
             )
             for c in shape.components
         },
-        "item_fields": gateway.item_fields(item_id, ROLLBACK_ITEM_FIELDS),
+        "item_fields": item_values,
         "lowres_shape_ids": gateway.shape_ids(item_id, fields.LOWRES_TAG),
     }
 
@@ -109,6 +117,7 @@ def _technical_source(
     originals: Sequence[OriginalFile],
     clip_metadata: Mapping[str, Any],
     templates: Mapping[str, Any],
+    item_values: Mapping[str, Any],
 ) -> Dict[str, Any]:
     """What the new shape's technical description is stated from, as the
     plan fields to add; ``{"problem": ...}`` when it cannot be stated."""
@@ -116,6 +125,12 @@ def _technical_source(
     if not is_proxy_copy(shape):
         problem = mismatch(shape, audio_count)
         return {"problem": problem} if problem else {"technical_source": "wrapped"}
+    marker = item_values.get(fields.CPAA_MIGRATION_FIELD) or [None]
+    if marker[0] != fields.CPAA_MIGRATION_DONE:
+        return {
+            "problem": f"{PROXY_COPY} without the CPAA marker "
+            f"({fields.CPAA_MIGRATION_FIELD})"
+        }
     key = template_key(clip_metadata)
     if key is None:
         return {"problem": PROXY_COPY_INCOMPLETE}
@@ -163,15 +178,13 @@ def _locate(
 
 
 def _duration_problem(
-    item_id: str, gateway: Gateway, clip_timing: Mapping[str, int]
+    item_values: Mapping[str, Any], clip_timing: Mapping[str, int]
 ) -> Optional[str]:
     """Before any write: the P2 duration must be the item's current
     durationSeconds (the proxy analysis), which apply leaves unchanged and
     verify re-checks. A disagreement means the ClipMetadata does not
     describe this item's essence."""
-    values = gateway.item_fields(item_id, [fields.DURATION_FIELD]).get(
-        fields.DURATION_FIELD
-    )
+    values = item_values.get(fields.DURATION_FIELD)
     if not values:
         return f"{PROXY_COPY}; no durationSeconds to cross-check"
     current = values[0]
@@ -226,11 +239,16 @@ def plan_item(
     problem = _attachment_problem(shape, output_file)
     if problem:
         return PlanResult(verdicts.UNEXPECTED, problem)
-    technical = _technical_source(shape, originals, clip_metadata, templates)
+    # One read, reused by rollback: it carries the CPAA marker and the
+    # durationSeconds the template route is cross-checked against.
+    item_values = gateway.item_fields(item_id, ROLLBACK_ITEM_FIELDS)
+    technical = _technical_source(
+        shape, originals, clip_metadata, templates, item_values
+    )
     if "problem" in technical:
         return PlanResult(verdicts.UNEXPECTED, technical["problem"])
     if "timing" in technical:
-        problem = _duration_problem(item_id, gateway, technical["timing"])
+        problem = _duration_problem(item_values, technical["timing"])
         if problem:
             return PlanResult(verdicts.UNEXPECTED, problem)
 
@@ -267,5 +285,5 @@ def plan_item(
             "originals": located,
             **technical,
         },
-        rollback=_rollback(item_id, shape, gateway),
+        rollback=_rollback(item_id, shape, gateway, item_values),
     )

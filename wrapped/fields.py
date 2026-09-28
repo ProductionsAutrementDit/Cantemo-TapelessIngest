@@ -20,6 +20,12 @@ TAPE_NAMES_FIELD = "af_p5_tape_names"
 SHA1_FIELD = "portal_sha1"
 ORIGINAL_FILENAME_FIELD = "componentOriginalFilename"
 DURATION_FIELD = "durationSeconds"
+# Set by Cantemo's archiware migrate_cpaa, which cloned the lowres shape as
+# ``original`` for items that had none (cpaa.py register_new_shape). Present
+# on every sampled proxy-copied item, but also on some genuine ones: it
+# corroborates a proxy copy, it does not detect one.
+CPAA_MIGRATION_FIELD = "portal_p5_migration_done"
+CPAA_MIGRATION_DONE = "true"
 
 ARCHIWARE_PLUGIN_GUID = "c4c1d403-801b-4b1a-95a1-6a692f64c262"
 # P5 archive plan "Airbus Helicopters", whose index is AirbusHelicopters.

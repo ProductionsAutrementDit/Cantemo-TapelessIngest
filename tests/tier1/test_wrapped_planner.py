@@ -22,9 +22,15 @@ ITEM = "VX-35313"
 OUTPUT = "/Volumes/ActiveMedia/CANTEMO_FILES/060A2B34.MXF"
 
 
-def _world(document=None, archived=True, on_disk=(), duration="8.72"):
+def _world(document=None, archived=True, on_disk=(), duration="8.72", cpaa_marker=None):
     gateway = InMemoryGateway()
-    seed_item(gateway, ITEM, document or wrapped_p2_document(), duration=duration)
+    seed_item(
+        gateway,
+        ITEM,
+        document or wrapped_p2_document(),
+        duration=duration,
+        cpaa_marker=cpaa_marker,
+    )
     gateway.component_md[(ITEM, "VX-SW", "VX-SW-C")] = {
         "portal_archive_external_id": "Default-Archive#OLD"
     }
@@ -227,8 +233,8 @@ TEMPLATES = {
 P2_SECONDS = "19.88"
 
 
-def _proxy_world(duration=P2_SECONDS):
-    return _world(proxy_copy_document(), duration=duration)
+def _proxy_world(duration=P2_SECONDS, cpaa_marker="true"):
+    return _world(proxy_copy_document(), duration=duration, cpaa_marker=cpaa_marker)
 
 
 def _proxy_plan(templates=TEMPLATES, world=None, **metadata):
@@ -437,3 +443,62 @@ def test_a_malformed_template_is_refused_at_plan_time(template, why):
     assert result.reason == (
         f"proxy-copied technical description; template {KEY} is malformed: {why}"
     )
+
+
+# the CPAA migration marker (portal_p5_migration_done)
+
+NO_MARKER = (
+    "proxy-copied technical description without the CPAA marker "
+    "(portal_p5_migration_done)"
+)
+
+
+def test_a_proxy_copy_without_the_cpaa_marker_is_unexpected():
+    result = _proxy_plan(world=_proxy_world(cpaa_marker=None))
+    assert result.verdict == verdicts.UNEXPECTED
+    assert result.reason == NO_MARKER
+    assert result.plan == {}
+
+
+@pytest.mark.parametrize("marker", ["false", "True", "TRUE", "", " true"])
+def test_only_the_exact_true_marker_opens_the_template_route(marker):
+    result = _proxy_plan(world=_proxy_world(cpaa_marker=marker))
+    assert result.verdict == verdicts.UNEXPECTED
+    assert result.reason == NO_MARKER
+
+
+def test_the_marker_is_checked_before_the_template_and_the_duration():
+    world = _proxy_world(duration="8.72", cpaa_marker=None)
+    result = _proxy_plan(templates={}, world=world, video_codec=None)
+    assert result.reason == NO_MARKER
+
+
+def test_a_genuine_wrapped_shape_with_the_marker_plans_from_wrapped():
+    result = _plan(*_world(cpaa_marker="true"))
+    assert result.verdict == verdicts.READY
+    assert result.plan["technical_source"] == "wrapped"
+
+
+def test_a_genuine_wrapped_shape_ignores_a_false_marker():
+    assert _plan(*_world(cpaa_marker="false")).verdict == verdicts.READY
+
+
+def test_the_marker_is_recorded_in_rollback():
+    result = _proxy_plan()
+    assert result.verdict == verdicts.READY
+    assert result.rollback["item_fields"]["portal_p5_migration_done"] == ["true"]
+    assert result.rollback["item_fields"]["durationSeconds"] == ["19.88"]
+
+
+def test_the_template_route_reads_the_item_fields_once():
+    world = _proxy_world()
+    calls = []
+    real = world[0].item_fields
+
+    def counting(item_id, names):
+        calls.append(tuple(names))
+        return real(item_id, names)
+
+    world[0].item_fields = counting
+    assert _proxy_plan(world=world).verdict == verdicts.READY
+    assert len(calls) == 1

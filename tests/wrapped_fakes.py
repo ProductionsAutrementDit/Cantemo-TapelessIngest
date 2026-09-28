@@ -230,11 +230,21 @@ def p2_originals(clip_dir="2016/AH_TEST/CONTENTS", stem="00924E", audio_count=4)
     ]
 
 
-def seed_item(gateway, item_id, document, lowres=("VX-LOW",), duration="8.72"):
+def seed_item(
+    gateway,
+    item_id,
+    document,
+    lowres=("VX-LOW",),
+    duration="8.72",
+    cpaa_marker=None,
+):
     gateway.shapes.setdefault(item_id, []).append(copy.deepcopy(document))
     for shape_id in lowres:
         gateway.shapes[item_id].append({"id": shape_id, "tag": ["lowres"]})
     gateway.items.setdefault(item_id, {})["durationSeconds"] = [duration]
+    if cpaa_marker is not None:
+        # portal_p5_migration_done, as Cantemo's migrate_cpaa writes it
+        gateway.items[item_id]["portal_p5_migration_done"] = [cpaa_marker]
 
 
 def proxy_copy_document(

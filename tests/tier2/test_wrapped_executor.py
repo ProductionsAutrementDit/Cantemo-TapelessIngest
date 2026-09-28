@@ -62,6 +62,7 @@ def _setup(
     on_disk=False,
     document=None,
     duration="8.72",
+    cpaa_marker=None,
     **extra,
 ):
     seed_item(
@@ -69,6 +70,7 @@ def _setup(
         ITEM,
         document or wrapped_p2_document(storage=storage, state=state),
         duration=duration,
+        cpaa_marker=cpaa_marker,
     )
     originals = p2_originals()
     fake = FakeArchive()
@@ -460,6 +462,7 @@ def test_a_proxy_copied_item_is_posted_from_its_template(migrated_db):
         gateway,
         document=proxy_copy_document(),
         duration="19.88",
+        cpaa_marker="true",
         clip_metadata=p2_clip_metadata(),
         templates={key: {"template": p2_template()}},
     )
