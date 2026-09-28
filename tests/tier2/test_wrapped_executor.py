@@ -12,12 +12,17 @@ from portal.plugins.TapelessIngest.wrapped.dryrun import RecordingGateway
 from portal.plugins.TapelessIngest.wrapped.executor import Executor, StepError
 from portal.plugins.TapelessIngest.wrapped.paths import to_absolute
 from portal.plugins.TapelessIngest.wrapped.planner import plan_item
+from portal.plugins.TapelessIngest.wrapped.shape import build_document_from_template
+from portal.plugins.TapelessIngest.wrapped.templates import Timing
 from portal.plugins.TapelessIngest.wrapped.verifier import verify_item
 from tests.wrapped_fakes import (
     FakeArchive,
     FakeDisk,
     InMemoryGateway,
+    p2_clip_metadata,
     p2_originals,
+    p2_template,
+    proxy_copy_document,
     seed_item,
     wrapped_p2_document,
 )
@@ -50,8 +55,12 @@ class CrashingGateway(InMemoryGateway):
         return attribute
 
 
-def _setup(gateway, storage="VX-2", state="ARCHIVED", on_disk=False):
-    seed_item(gateway, ITEM, wrapped_p2_document(storage=storage, state=state))
+def _setup(
+    gateway, storage="VX-2", state="ARCHIVED", on_disk=False, document=None, **extra
+):
+    seed_item(
+        gateway, ITEM, document or wrapped_p2_document(storage=storage, state=state)
+    )
     originals = p2_originals()
     fake = FakeArchive()
     for n, original in enumerate(originals):
@@ -76,6 +85,7 @@ def _setup(gateway, storage="VX-2", state="ARCHIVED", on_disk=False):
         gateway=gateway,
         archive=CachedArchive(fake),
         disk=disk,
+        **extra,
     )
     row = WrappedMigration.objects.create(
         item_id=ITEM,
@@ -432,3 +442,42 @@ def test_stop_before_must_name_a_phase(migrated_db):
     row, disk = _setup(gateway)
     with pytest.raises(ValueError):
         Executor(gateway, disk).run(row, stop_before="verifed")
+
+
+def test_a_proxy_copied_item_is_posted_from_its_template(migrated_db):
+    gateway = InMemoryGateway()
+    key = "AVC-I_1080/50i|50i|AVC-I100"
+    row, disk = _setup(
+        gateway,
+        document=proxy_copy_document(),
+        clip_metadata=p2_clip_metadata(),
+        templates={key: {"template": p2_template()}},
+    )
+    assert row.plan["technical_source"] == f"template:{key}"
+    Executor(gateway, disk).run(row)
+
+    row.refresh_from_db()
+    assert row.phase == "done" and row.error == ""
+    (posted,) = [w[2] for w in gateway.writes if w[0] == "post_shape"]
+    ids = [o["file_id"] for o in row.plan["originals"]]
+    assert posted == build_document_from_template(
+        p2_template(),
+        ids[0],
+        ids[1:],
+        Timing(frames=497, num=1, den=25, start_tc_frames=1657612),
+    )
+    assert posted["containerComponent"]["format"] == "mxf_d10"
+    assert "video/mp4" not in posted["mimeType"]
+
+
+def test_a_row_planned_before_technical_source_is_restated_from_wrapped(
+    migrated_db,
+):
+    gateway = InMemoryGateway()
+    row, disk = _setup(gateway)
+    del row.plan["technical_source"]
+    row.save()
+    Executor(gateway, disk).run(row)
+    (posted,) = [w[2] for w in gateway.writes if w[0] == "post_shape"]
+    assert posted["containerComponent"]["format"] == "mxf"
+    assert posted["videoComponent"][0]["codec"] == "dvvideo"

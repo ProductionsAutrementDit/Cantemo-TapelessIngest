@@ -17,7 +17,11 @@ from portal.plugins.TapelessIngest.wrapped.metadata import (
     component_fields,
     item_fields,
 )
-from portal.plugins.TapelessIngest.wrapped.shape import build_document
+from portal.plugins.TapelessIngest.wrapped.shape import (
+    build_document,
+    build_document_from_template,
+)
+from portal.plugins.TapelessIngest.wrapped.templates import Timing
 from portal.plugins.TapelessIngest.wrapped.verifier import verify_item
 
 WRAP_PHASES = (
@@ -166,11 +170,22 @@ class Executor:
                 f"original shapes are {live_ids}, expected only the wrapped "
                 f"{row.plan['wrapped_shape_id']}"
             )
-        document = build_document(
-            parse_shape(row.plan["wrapped_shape"]),
-            self._file_ids(row, "video")[0],
-            self._file_ids(row, "audio"),
-        )
+        video_id = self._file_ids(row, "video")[0]
+        audio_ids = self._file_ids(row, "audio")
+        # The planner stored the template and timing: apply never reads
+        # p2_templates.json. A row planned before technical_source existed
+        # was always restated from its wrapped shape.
+        if row.plan.get("technical_source", "wrapped").startswith("template:"):
+            document = build_document_from_template(
+                row.plan["template"],
+                video_id,
+                audio_ids,
+                Timing(**row.plan["timing"]),
+            )
+        else:
+            document = build_document(
+                parse_shape(row.plan["wrapped_shape"]), video_id, audio_ids
+            )
         row.plan["new_shape_id"] = self.gateway.post_shape(row.item_id, document)
 
     def _write_metadata(self, row) -> None:
