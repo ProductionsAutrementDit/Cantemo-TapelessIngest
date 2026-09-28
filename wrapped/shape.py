@@ -116,3 +116,36 @@ def build_document_from_template(
     if template.get("mimeType"):
         document["mimeType"] = list(template["mimeType"])
     return document
+
+
+_COMPARED = ("containerComponent", "videoComponent", "audioComponent")
+
+
+def template_disagreements(
+    template: Mapping[str, Any], wrapped: Shape, timing: Timing
+) -> List[str]:
+    """Rebuild a genuine wrapped shape from ``template`` and ``timing`` and
+    name every value (``component.key``) where the result differs from
+    restating the wrapped shape itself. File ids are not compared; a key
+    the genuine restatement lacks counts as a difference. Empty: the
+    template and the timing derivation reproduce this reference."""
+    audio_ids = [f"A{n}" for n in range(len(wrapped.of_kind("audio")))]
+    try:
+        genuine = build_document(wrapped, "V", audio_ids)
+        rebuilt = build_document_from_template(template, "V", audio_ids, timing)
+    except ShapeMismatch as error:
+        return [f"unbuildable: {error}"]
+    differs = set()
+    if rebuilt.get("mimeType") != genuine.get("mimeType"):
+        differs.add("mimeType")
+    for component in _COMPARED:
+        ours, theirs = rebuilt.get(component), genuine.get(component)
+        ours = ours if isinstance(ours, list) else [ours] if ours else []
+        theirs = theirs if isinstance(theirs, list) else [theirs] if theirs else []
+        if len(ours) != len(theirs):
+            differs.add(f"{component} count")
+        for mine, reference in zip(ours, theirs):
+            for key, value in mine.items():
+                if key != "file" and (key not in reference or reference[key] != value):
+                    differs.add(f"{component}.{key}")
+    return sorted(differs)

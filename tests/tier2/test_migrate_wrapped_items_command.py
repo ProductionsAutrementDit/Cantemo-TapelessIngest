@@ -16,6 +16,7 @@ from tests.wrapped_fakes import (
     FakeArchive,
     FakeDisk,
     InMemoryGateway,
+    genuine_p2_document,
     p2_clip_metadata,
     p2_originals,
     p2_template,
@@ -367,7 +368,7 @@ def _ready_clip(n, document, **metadata):
 
 
 def _odd():
-    document = wrapped_p2_document()
+    document = genuine_p2_document()
     document["videoComponent"][0]["pixelFormat"] = "yuv420p10le"
     return document
 
@@ -395,23 +396,23 @@ def _snapshot():
 
 def test_templates_keeps_the_majority_signature(migrated_db, tmp_path):
     for n in range(1, 4):
-        _ready_clip(n, wrapped_p2_document(shape_id=f"VX-S{n}"))
+        _ready_clip(n, genuine_p2_document(shape_id=f"VX-S{n}"))
     _ready_clip(4, _odd())
     for n in range(5, 7):
-        _ready_clip(n, wrapped_p2_document(), video_codec="DV100_1080/50i")
+        _ready_clip(n, genuine_p2_document(), video_codec="DV100_1080/50i")
     before = _snapshot()
     path = tmp_path / "p2_templates.json"
     out, _ = _templates("--out", str(path), "--min-refs", "2", "--min-share", "0.7")
     written = json.loads(path.read_text())
     assert written == {
         KEY: {
-            "template": strip_for_template(wrapped_p2_document()),
+            "template": strip_for_template(genuine_p2_document()),
             "reference_item": "VX-01",
             "references": 3,
             "share": 0.75,
         },
         "DV100_1080/50i|50i": {
-            "template": strip_for_template(wrapped_p2_document()),
+            "template": strip_for_template(genuine_p2_document()),
             "reference_item": "VX-05",
             "references": 2,
             "share": 1.0,
@@ -424,9 +425,9 @@ def test_templates_keeps_the_majority_signature(migrated_db, tmp_path):
 
 def test_templates_rejects_a_key_below_the_thresholds(migrated_db, tmp_path):
     for n in range(1, 4):
-        _ready_clip(n, wrapped_p2_document())
+        _ready_clip(n, genuine_p2_document())
     _ready_clip(4, _odd())
-    _ready_clip(5, wrapped_p2_document(), video_codec="DV100_1080/50i")
+    _ready_clip(5, genuine_p2_document(), video_codec="DV100_1080/50i")
     path = tmp_path / "p2_templates.json"
     out, _ = _templates("--out", str(path), "--min-refs", "2")
     assert json.loads(path.read_text()) == {}
@@ -440,11 +441,11 @@ def test_templates_rejects_a_key_below_the_thresholds(migrated_db, tmp_path):
 
 def test_templates_defaults_to_20_references(migrated_db):
     for n in range(1, 20):
-        _ready_clip(n, wrapped_p2_document())
+        _ready_clip(n, genuine_p2_document())
     out, err = _templates()
     assert json.loads(out) == {}
     assert "rejected, fewer than 20 references" in err
-    _ready_clip(20, wrapped_p2_document())
+    _ready_clip(20, genuine_p2_document())
     out, err = _templates()
     assert json.loads(out)[KEY]["references"] == 20
     assert f"{KEY}: 20 ref(s), majority 20 (100.0%): kept" in err
@@ -452,17 +453,17 @@ def test_templates_defaults_to_20_references(migrated_db):
 
 def test_templates_only_learns_from_genuine_ready_rows(migrated_db):
     for n in range(1, 3):
-        _ready_clip(n, wrapped_p2_document())
+        _ready_clip(n, genuine_p2_document())
     templated = _ready_clip(3, _odd())
     templated.plan = {**templated.plan, "technical_source": f"template:{KEY}"}
     templated.save()
-    legacy = _ready_clip(4, wrapped_p2_document())
+    legacy = _ready_clip(4, genuine_p2_document())
     del legacy.plan["technical_source"]
     legacy.save()
     unexpected = _ready_clip(5, _odd())
     unexpected.verdict = "unexpected"
     unexpected.save()
-    _ready_clip(6, wrapped_p2_document(), video_codec=None)
+    _ready_clip(6, genuine_p2_document(), video_codec=None)
     out, err = _templates("--min-refs", "3", "--min-share", "1")
     assert json.loads(out)[KEY]["references"] == 3
     assert "no template key: 1" in err
@@ -498,10 +499,10 @@ def test_report_counts_ready_rows_per_technical_source(migrated_db):
 
 def test_templates_never_learns_from_a_proxy_copy_or_a_frozen_row(migrated_db):
     for n in range(1, 3):
-        _ready_clip(n, wrapped_p2_document())
+        _ready_clip(n, genuine_p2_document())
     # a ready 'wrapped' row whose shape is a proxy copy: never a reference
     _ready_clip(3, proxy_copy_document())
-    frozen = _ready_clip(4, wrapped_p2_document())
+    frozen = _ready_clip(4, genuine_p2_document())
     frozen.phase = "shape_posted"
     frozen.save()
     out, err = _templates("--min-refs", "2", "--min-share", "1")
@@ -511,7 +512,7 @@ def test_templates_never_learns_from_a_proxy_copy_or_a_frozen_row(migrated_db):
 
 def test_templates_drops_per_file_values_that_vary(migrated_db):
     for n, (packets, bitrate) in enumerate([(218, 114_000_000), (497, 113_500_000)]):
-        document = wrapped_p2_document()
+        document = genuine_p2_document()
         for body in [document["containerComponent"], *document["videoComponent"]]:
             body.update(numberOfPackets=packets, bitrate=bitrate)
         _ready_clip(n + 1, document)
@@ -519,9 +520,42 @@ def test_templates_drops_per_file_values_that_vary(migrated_db):
     template = json.loads(out)[KEY]["template"]
     for body in [template["containerComponent"], *template["videoComponent"]]:
         assert "numberOfPackets" not in body and "bitrate" not in body
-    assert template == strip_for_template(wrapped_p2_document())
+    assert template == strip_for_template(genuine_p2_document())
     assert (
         f"{KEY}: dropped per-file values containerComponent.bitrate, "
         f"containerComponent.numberOfPackets, videoComponent.bitrate, "
         f"videoComponent.numberOfPackets" in err.splitlines()
     )
+
+
+@pytest.mark.parametrize(
+    "metadata, differs",
+    [
+        ({"timecode_start": "18:25:04:13"}, "containerComponent.startTimecode"),
+        ({"duration": "498", "data_size": "283860000"}, "videoComponent.duration"),
+    ],
+)
+def test_templates_rejects_a_format_whose_round_trip_disagrees(
+    migrated_db, metadata, differs
+):
+    for n in range(1, 3):
+        _ready_clip(n, genuine_p2_document())
+    _ready_clip(3, genuine_p2_document(), **metadata)
+    out, err = _templates("--min-refs", "2")
+    assert json.loads(out) == {}
+    lines = err.splitlines()
+    assert (
+        f"{KEY}: 3 ref(s), majority 3 (100.0%): rejected, round trip disagrees "
+        f"for 1 reference(s)" in lines
+    )
+    (detail,) = [line for line in lines if "VX-03 disagrees on" in line]
+    assert differs in detail
+
+
+def test_templates_rejects_a_reference_without_timing(migrated_db):
+    for n in range(1, 3):
+        _ready_clip(n, genuine_p2_document())
+    _ready_clip(3, genuine_p2_document(), timecode_start=None)
+    out, err = _templates("--min-refs", "2")
+    assert json.loads(out) == {}
+    assert "VX-03 disagrees on timing: timecode_start" in err

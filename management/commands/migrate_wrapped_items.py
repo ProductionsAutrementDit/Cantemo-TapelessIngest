@@ -42,12 +42,14 @@ from portal.plugins.TapelessIngest.wrapped.resolver import (
     resolve_p2,
     wrapped_p2_clips,
 )
+from portal.plugins.TapelessIngest.wrapped.shape import template_disagreements
 from portal.plugins.TapelessIngest.wrapped.templates import (
     common_template,
     is_proxy_copy,
     load_templates,
     signature,
     template_key,
+    timing,
 )
 from portal.plugins.TapelessIngest.wrapped.verifier import verify_item
 
@@ -57,6 +59,7 @@ _MIN_REFS = 20
 _MIN_SHARE = 0.95
 _TEMPLATE_OPTIONS = (("out", "--out"), ("min_refs", "--min-refs"))
 _TEMPLATE_OPTIONS += (("min_share", "--min-share"),)
+_SHOWN_DISAGREEMENTS = 5
 
 
 def _vidispine_gateway():
@@ -353,14 +356,15 @@ class Command(BaseCommand):
             if is_proxy_copy(wrapped):
                 continue
             clip = Clip.objects.filter(umid=row.clip_umid).first()
-            key = template_key(_clip_metadata(clip)) if clip else None
+            metadata = _clip_metadata(clip) if clip else {}
+            key = template_key(metadata)
             if key is None:
                 unkeyed += 1
                 continue
             found = signature(wrapped)
             by_key[key][found] += 1
             references.setdefault((key, found), []).append(
-                (row.item_id, plan["wrapped_shape"])
+                (row.item_id, plan["wrapped_shape"], metadata)
             )
         summary = self.stdout if options["out"] else self.stderr
         kept = {}
@@ -375,12 +379,19 @@ class Command(BaseCommand):
             if share < min_share:
                 summary.write(line + f"rejected, share below {min_share:.1%}")
                 continue
-            summary.write(line + "kept")
             majority_refs = references[(key, majority)]
-            template, dropped = common_template([doc for _, doc in majority_refs])
+            template, dropped = common_template([ref[1] for ref in majority_refs])
             names = [f"{c}.{k}" for c, keys in sorted(dropped.items()) for k in keys]
             if names:
                 self.stderr.write(f"{key}: dropped per-file values {', '.join(names)}")
+            disagreeing = self._round_trip(key, template, majority_refs)
+            if disagreeing:
+                summary.write(
+                    line + f"rejected, round trip disagrees for {disagreeing} "
+                    f"reference(s)"
+                )
+                continue
+            summary.write(line + "kept")
             kept[key] = {
                 "template": template,
                 "reference_item": majority_refs[0][0],
@@ -395,3 +406,21 @@ class Command(BaseCommand):
             self.stdout.write(f"wrote {len(kept)} template(s) to {options['out']}")
         else:
             self.stdout.write(text)
+
+    def _round_trip(self, key, template, refs) -> int:
+        """How many references the template, with each one's own P2 timing,
+        does not rebuild exactly; the first few are named on stderr."""
+        disagreeing = 0
+        for item_id, document, metadata in refs:
+            try:
+                differs = template_disagreements(
+                    template, parse_shape(document), timing(metadata)
+                )
+            except ValueError as error:
+                differs = [f"timing: {error}"]
+            if not differs:
+                continue
+            disagreeing += 1
+            if disagreeing <= _SHOWN_DISAGREEMENTS:
+                self.stderr.write(f"{key}: {item_id} disagrees on {', '.join(differs)}")
+        return disagreeing

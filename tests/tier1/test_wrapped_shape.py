@@ -8,9 +8,11 @@ from portal.plugins.TapelessIngest.wrapped.shape import (
     build_document,
     build_document_from_template,
     mismatch,
+    template_disagreements,
 )
 from portal.plugins.TapelessIngest.wrapped.templates import Timing
-from tests.wrapped_fakes import p2_template, wrapped_p2_document
+from portal.plugins.TapelessIngest.wrapped.templates import strip_for_template
+from tests.wrapped_fakes import genuine_p2_document, p2_template, wrapped_p2_document
 
 AUDIO_IDS = ["VX-A0", "VX-A1", "VX-A2", "VX-A3"]
 
@@ -175,3 +177,45 @@ def test_a_template_missing_a_component_raises_shape_mismatch(name):
 
 def test_the_template_video_is_track_v1():
     assert _from_template()["videoComponent"][0]["itemTrack"] == "V1"
+
+
+# template_disagreements: the round trip a template must survive
+
+
+def _round_trip(document, timing=TIMING, template=None):
+    return template_disagreements(
+        template or strip_for_template(document), parse_shape(document), timing
+    )
+
+
+def test_a_template_rebuilding_its_reference_agrees():
+    assert _round_trip(genuine_p2_document()) == []
+
+
+def test_a_timecode_derivation_that_disagrees_is_reported():
+    document = genuine_p2_document(start_tc_frames=1657611)
+    assert _round_trip(document) == ["containerComponent.startTimecode"]
+
+
+def test_a_duration_derivation_that_disagrees_is_reported():
+    assert _round_trip(genuine_p2_document(frames=498)) == [
+        "audioComponent.duration",
+        "containerComponent.duration",
+        "videoComponent.duration",
+    ]
+
+
+def test_a_template_value_the_reference_does_not_have_is_reported():
+    document = genuine_p2_document()
+    template = strip_for_template(document)
+    template["videoComponent"][0]["pixelFormat"] = "yuv422p10le"
+    template["mimeType"] = ["application/octet-stream"]
+    assert _round_trip(document, template=template) == [
+        "mimeType",
+        "videoComponent.pixelFormat",
+    ]
+
+
+def test_file_ids_are_not_compared():
+    document = genuine_p2_document(file_id="VX-OTHER")
+    assert _round_trip(document) == []

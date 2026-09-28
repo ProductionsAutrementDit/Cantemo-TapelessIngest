@@ -313,3 +313,21 @@ def p2_template(audio_codec="pcm_s24le"):
             {"codec": audio_codec, "channelCount": 1, "sampleFormat": "s32"}
         ],
     }
+
+
+def genuine_p2_document(frames=497, start_tc_frames=1657612, **kwargs):
+    """A genuine wrapped shape whose timing agrees with ``p2_clip_metadata``
+    (VX-35313: 497 frames at 1/25, starting at 18:25:04:12)."""
+    document = wrapped_p2_document(**kwargs)
+    bodies = [
+        document["containerComponent"],
+        *document["videoComponent"],
+        *document["audioComponent"],
+    ]
+    for body in bodies:
+        body["duration"] = {
+            "samples": frames,
+            "timeBase": {"numerator": 1, "denominator": 25},
+        }
+    document["containerComponent"]["startTimecode"] = start_tc_frames
+    return document
