@@ -8,7 +8,10 @@ from tests.wrapped_fakes import (
     FakeArchive,
     FakeDisk,
     InMemoryGateway,
+    p2_clip_metadata,
     p2_originals,
+    p2_template,
+    proxy_copy_document,
     seed_item,
     wrapped_p2_document,
 )
@@ -32,7 +35,7 @@ def _world(document=None, archived=True, on_disk=()):
     return gateway, fake, disk, originals
 
 
-def _plan(gateway, fake, disk, originals, spanned=False, output_file=OUTPUT):
+def _plan(gateway, fake, disk, originals, spanned=False, output_file=OUTPUT, **extra):
     return plan_item(
         item_id=ITEM,
         originals=originals,
@@ -41,6 +44,7 @@ def _plan(gateway, fake, disk, originals, spanned=False, output_file=OUTPUT):
         gateway=gateway,
         archive=CachedArchive(fake),
         disk=disk,
+        **extra,
     )
 
 
@@ -202,3 +206,146 @@ def test_already_migrated_rollback_keeps_what_apply_will_overwrite():
     }
     assert result.rollback["lowres_shape_ids"] == ["VX-LOW"]
     assert result.rollback["item_fields"]["durationSeconds"] == ["8.72"]
+
+
+# proxy-copied technical description (P2 templates)
+
+KEY = "AVC-I_1080/50i|50i|AVC-I100"
+TEMPLATES = {
+    KEY: {
+        "template": p2_template(),
+        "reference_item": "VX-REF",
+        "references": 499,
+        "share": 0.998,
+    }
+}
+
+
+def _proxy_plan(templates=TEMPLATES, **metadata):
+    world = _world(proxy_copy_document())
+    return _plan(
+        *world,
+        clip_metadata=p2_clip_metadata(**metadata),
+        templates=templates,
+    )
+
+
+def test_a_proxy_copy_with_a_template_is_ready_from_the_template():
+    result = _proxy_plan()
+    assert result.verdict == verdicts.READY, result.reason
+    assert result.plan["technical_source"] == f"template:{KEY}"
+    assert result.plan["template"] == p2_template()
+    assert result.plan["timing"] == {
+        "frames": 497,
+        "num": 1,
+        "den": 25,
+        "start_tc_frames": 1657612,
+    }
+    assert result.plan["kind"] == "wrap"
+    assert result.plan["wrapped_shape_id"] == "VX-SW"
+    assert [o["entry"]["handle"] for o in result.plan["originals"]] == [
+        f"AirbusHelicopters#{n}" for n in range(5)
+    ]
+    assert result.rollback["wrapped_shape_id"] == "VX-SW"
+
+
+def test_the_plan_carries_a_copy_of_the_template():
+    templates = {KEY: {"template": p2_template()}}
+    result = _proxy_plan(templates=templates)
+    templates[KEY]["template"]["mimeType"].append("changed")
+    assert result.plan["template"] == p2_template()
+
+
+def test_a_proxy_copy_without_a_template_is_unexpected_and_names_the_key():
+    result = _proxy_plan(templates={})
+    assert result.verdict == verdicts.UNEXPECTED
+    assert result.reason == (
+        f"proxy-copied technical description; no template for {KEY}"
+    )
+    assert result.plan == {}
+
+
+def test_a_proxy_copy_with_incomplete_metadata_is_unexpected():
+    result = _proxy_plan(video_codec=None)
+    assert result.verdict == verdicts.UNEXPECTED
+    assert result.reason == (
+        "proxy-copied technical description; P2 metadata incomplete for a template"
+    )
+
+
+def test_a_proxy_copy_with_a_malformed_timecode_is_unexpected():
+    result = _proxy_plan(timecode_start="18:25:04")
+    assert result.verdict == verdicts.UNEXPECTED
+    assert result.reason.startswith(
+        "proxy-copied technical description; P2 metadata incomplete for a template"
+    )
+    assert "18:25:04" in result.reason
+
+
+def test_a_proxy_copy_is_unexpected_without_any_metadata_or_template():
+    result = _plan(*_world(proxy_copy_document()))
+    assert result.verdict == verdicts.UNEXPECTED
+    assert "P2 metadata incomplete" in result.reason
+
+
+def test_a_proxy_copy_still_checks_the_attached_file_first():
+    world = _world(proxy_copy_document())
+    result = _plan(
+        *world,
+        output_file="/mnt/ActiveMedia/CANTEMO_FILES/OTHER.MXF",
+        clip_metadata=p2_clip_metadata(),
+        templates=TEMPLATES,
+    )
+    assert result.verdict == verdicts.UNEXPECTED
+    assert "OTHER.MXF" in result.reason
+
+
+def test_a_proxy_copy_still_refuses_missing_originals():
+    gateway, fake, disk, originals = _world(proxy_copy_document())
+    del fake.entries[to_absolute(originals[3].relative)]
+    result = _plan(
+        gateway,
+        fake,
+        disk,
+        originals,
+        clip_metadata=p2_clip_metadata(),
+        templates=TEMPLATES,
+    )
+    assert result.verdict == verdicts.ORIGINALS_MISSING
+
+
+def test_a_proxy_copy_still_refuses_a_stale_vx41_entity():
+    gateway, fake, disk, originals = _world(proxy_copy_document())
+    gateway.files[("VX-41", originals[2].relative)] = "VX-STALE"
+    gateway.file_states[("VX-41", "VX-STALE")] = "LOST"
+    result = _plan(
+        gateway,
+        fake,
+        disk,
+        originals,
+        clip_metadata=p2_clip_metadata(),
+        templates=TEMPLATES,
+    )
+    assert result.verdict == verdicts.UNEXPECTED
+    assert "stale VX-41 entity VX-STALE" in result.reason
+
+
+def test_a_genuine_wrapped_shape_ignores_templates():
+    result = _plan(*_world(), clip_metadata=p2_clip_metadata(), templates=TEMPLATES)
+    assert result.verdict == verdicts.READY
+    assert result.plan["technical_source"] == "wrapped"
+    assert "template" not in result.plan and "timing" not in result.plan
+
+
+def test_a_genuine_wrapped_shape_with_a_bad_layout_stays_unexpected():
+    world = _world(wrapped_p2_document(audio_count=1))
+    result = _plan(*world, clip_metadata=p2_clip_metadata(), templates=TEMPLATES)
+    assert result.verdict == verdicts.UNEXPECTED
+    assert "1 audio component(s) for 4 audio original(s)" in result.reason
+
+
+def test_an_already_migrated_item_keeps_its_existing_description():
+    gateway, fake, disk, originals = _world()
+    gateway.shapes[ITEM] = [_migrated_shape(originals)]
+    result = _plan(gateway, fake, disk, originals)
+    assert result.plan["technical_source"] == "existing"

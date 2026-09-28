@@ -3,17 +3,33 @@
 Reads the item's REAL original shape (never ``output_file``, which is
 not always what is attached), locates every original on disk, on VX-41
 and in P5, and records what is needed to undo the migration.
+
+An original shape whose technical description is a copy of the lowres
+proxy is planned from its P2 format's template (``wrapped.templates``)
+when there is one; the template and the clip's timing are stored in the
+plan, so apply never depends on ``p2_templates.json``.
 """
 
+import copy
 import posixpath
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, Optional, Sequence
+from types import MappingProxyType
+from typing import Any, Dict, Mapping, Optional, Sequence
 
 from portal.plugins.TapelessIngest.wrapped import fields, verdicts
 from portal.plugins.TapelessIngest.wrapped.archive import CachedArchive
 from portal.plugins.TapelessIngest.wrapped.gateway import Gateway, Shape
 from portal.plugins.TapelessIngest.wrapped.paths import OriginalFile, to_absolute
 from portal.plugins.TapelessIngest.wrapped.shape import mismatch
+from portal.plugins.TapelessIngest.wrapped.templates import (
+    is_proxy_copy,
+    template_key,
+    timing,
+)
+
+_NO_METADATA: Mapping[str, Any] = MappingProxyType({})
+PROXY_COPY = "proxy-copied technical description"
+PROXY_COPY_INCOMPLETE = f"{PROXY_COPY}; P2 metadata incomplete for a template"
 
 ROLLBACK_ITEM_FIELDS = (
     fields.DURATION_FIELD,
@@ -58,9 +74,7 @@ def _names_originals(shape: Shape, originals: Sequence[OriginalFile]) -> bool:
     } == {o.relative for o in originals}
 
 
-def _wrapped_problem(
-    shape: Shape, originals: Sequence[OriginalFile], output_file: Optional[str]
-) -> Optional[str]:
+def _attachment_problem(shape: Shape, output_file: Optional[str]) -> Optional[str]:
     files = shape.files()
     if len(files) != 1:
         return f"{len(files)} distinct files on the original shape, expected 1"
@@ -72,7 +86,34 @@ def _wrapped_problem(
             f"attached file {attached.path} is not the wrapped output_file "
             f"{output_file}"
         )
-    return mismatch(shape, sum(1 for o in originals if o.kind == "audio"))
+    return None
+
+
+def _technical_source(
+    shape: Shape,
+    originals: Sequence[OriginalFile],
+    clip_metadata: Mapping[str, Any],
+    templates: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """What the new shape's technical description is stated from, as the
+    plan fields to add; ``{"problem": ...}`` when it cannot be stated."""
+    if not is_proxy_copy(shape):
+        problem = mismatch(shape, sum(1 for o in originals if o.kind == "audio"))
+        return {"problem": problem} if problem else {"technical_source": "wrapped"}
+    key = template_key(clip_metadata)
+    if key is None:
+        return {"problem": PROXY_COPY_INCOMPLETE}
+    if key not in templates:
+        return {"problem": f"{PROXY_COPY}; no template for {key}"}
+    try:
+        clip_timing = timing(clip_metadata)
+    except ValueError as error:
+        return {"problem": f"{PROXY_COPY_INCOMPLETE}: {error}"}
+    return {
+        "technical_source": f"template:{key}",
+        "template": copy.deepcopy(templates[key]["template"]),
+        "timing": asdict(clip_timing),
+    }
 
 
 def _locate(
@@ -108,6 +149,8 @@ def plan_item(
     gateway: Gateway,
     archive: CachedArchive,
     disk,
+    clip_metadata: Mapping[str, Any] = _NO_METADATA,
+    templates: Mapping[str, Any] = _NO_METADATA,
 ) -> PlanResult:
     if spanned:
         return PlanResult(verdicts.SPANNED, "spanned P2 clip: a later slice")
@@ -128,15 +171,19 @@ def plan_item(
             verdicts.ALREADY_MIGRATED,
             plan={
                 "kind": "complete",
+                "technical_source": "existing",
                 "new_shape_id": shape.shape_id,
                 "originals": located,
             },
             rollback=_rollback(item_id, shape, gateway),
         )
 
-    problem = _wrapped_problem(shape, originals, output_file)
+    problem = _attachment_problem(shape, output_file)
     if problem:
         return PlanResult(verdicts.UNEXPECTED, problem)
+    technical = _technical_source(shape, originals, clip_metadata, templates)
+    if "problem" in technical:
+        return PlanResult(verdicts.UNEXPECTED, technical["problem"])
 
     located = [_locate(o, gateway, archive, disk, None) for o in originals]
     missing = [o["relative"] for o in located if not o["on_disk"] and not o["entry"]]
@@ -169,6 +216,7 @@ def plan_item(
                 "path": wrapped_file.path,
             },
             "originals": located,
+            **technical,
         },
         rollback=_rollback(item_id, shape, gateway),
     )
