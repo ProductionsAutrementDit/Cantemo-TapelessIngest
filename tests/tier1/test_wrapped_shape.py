@@ -171,3 +171,7 @@ def test_a_template_missing_a_component_raises_shape_mismatch(name):
     del template[name]
     with pytest.raises(ShapeMismatch, match=name):
         _from_template(template=template)
+
+
+def test_the_template_video_is_track_v1():
+    assert _from_template()["videoComponent"][0]["itemTrack"] == "V1"

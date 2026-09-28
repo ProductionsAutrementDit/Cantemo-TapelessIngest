@@ -101,6 +101,7 @@ def build_document_from_template(
     container["startTimecode"] = timing.start_tc_frames
     video = body(template["videoComponent"][0], video_file_id)
     video["essenceStreamId"] = 0
+    video["itemTrack"] = "V1"
     audios = []
     for n, file_id in enumerate(audio_file_ids, start=1):
         audio = body(template["audioComponent"][0], file_id)
