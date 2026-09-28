@@ -70,6 +70,7 @@ class InMemoryGateway:
         self.component_md = {}  # (item, shape, component) -> {key: value}
         self.items = {}  # item_id -> {field: [values]}
         self.files = {}  # (storage_id, relative) -> file_id
+        self.file_states = {}  # (storage_id, file_id) -> state, None means gone
         self.writes = []
         self._minted = 0
 
@@ -103,6 +104,9 @@ class InMemoryGateway:
     def find_file(self, storage_id, relative):
         file_id = self.files.get((storage_id, relative))
         return FileEntity(file_id) if file_id else None
+
+    def file_state(self, storage_id, file_id):
+        return self.file_states.get((storage_id, file_id), "CLOSED")
 
     # writes
     def register_file(self, storage_id, relative, archived):
@@ -155,6 +159,7 @@ class InMemoryGateway:
         self.writes.append(("retag_shape", item_id, shape_id, add, remove))
 
     def delete_file(self, storage_id, file_id):
+        self.file_states[(storage_id, file_id)] = None
         self.writes.append(("delete_file", storage_id, file_id))
 
 

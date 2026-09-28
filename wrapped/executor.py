@@ -7,6 +7,7 @@ VX-216897), so the shape phase first looks for an original shape that
 already names these files.
 """
 
+import copy
 from typing import Callable, List, Optional, Tuple
 
 from portal.plugins.TapelessIngest.models.clip import Clip
@@ -41,6 +42,9 @@ class Executor:
         self.gateway = gateway
         self.disk = disk
         self.persist = persist
+        # Only ever filled by a dry run (persist=False): what _update_clip
+        # would have written, since it cannot touch the Clip table itself.
+        self.planned_clip_updates: List[dict] = []
 
     def _steps(self, row) -> List[Tuple[str, Callable]]:
         steps = {
@@ -58,11 +62,28 @@ class Executor:
     def run(self, row, stop_before: Optional[str] = None) -> None:
         steps = self._steps(row)
         names = [name for name, _ in steps]
+        if stop_before is not None and stop_before not in names:
+            raise ValueError(
+                f"stop_before={stop_before!r} does not name a phase of this "
+                f"row's plan ({', '.join(names)})"
+            )
+        if not self.persist:
+            # A dry run must never mutate the caller's row: a later save,
+            # or a real run on the same object, would otherwise carry the
+            # DRYRUN file/shape ids this run invents.
+            row = copy.copy(row)
+            row.plan = copy.deepcopy(row.plan)
         start = names.index(row.phase) + 1 if row.phase else 0
         for name, step in steps[start:]:
             if name == stop_before:
                 return
-            step(row)
+            if name == "verified" and not self.persist:
+                # A dry run cannot verify DRYRUN ids the real gateway never
+                # wrote; skip the check but still fall through to "done" so
+                # a would-be delete is recorded.
+                pass
+            else:
+                step(row)
             row.phase = name
             if self.persist:
                 row.save(update_fields=["phase", "plan", "updated_on"])
@@ -143,14 +164,29 @@ class Executor:
             )
 
     def _update_clip(self, row) -> None:
+        video_file_id = self._file_ids(row, "video")[0]
         if not self.persist:
+            self.planned_clip_updates.append(
+                {
+                    "umid": row.clip_umid,
+                    "file_id": video_file_id,
+                    "output_file": None,
+                    "status": Clip.STATUS_SHAPE_POSTED,
+                    "job_id": "",
+                }
+            )
             return
-        Clip.objects.filter(umid=row.clip_umid).update(
-            file_id=self._file_ids(row, "video")[0],
+        updated = Clip.objects.filter(umid=row.clip_umid).update(
+            file_id=video_file_id,
             output_file=None,
             status=Clip.STATUS_SHAPE_POSTED,
             job_id="",
         )
+        if updated != 1:
+            raise StepError(
+                f"clip update matched {updated} row(s) for umid "
+                f"{row.clip_umid!r}, expected 1"
+            )
 
     def _verify(self, row) -> None:
         problems = verify_item(row, self.gateway)
@@ -159,9 +195,12 @@ class Executor:
 
     def _finish(self, row) -> None:
         wrapped = row.plan.get("wrapped_file")
-        if (
-            wrapped
-            and wrapped["storage_id"] in fields.ONLINE_LEGACY_STORAGES
-            and wrapped["state"] not in _OFFLINE_STATES
-        ):
-            self.gateway.delete_file(wrapped["storage_id"], wrapped["file_id"])
+        if not wrapped or wrapped["storage_id"] not in fields.ONLINE_LEGACY_STORAGES:
+            return
+        # Re-checked against Vidispine, never decided from the state the
+        # plan captured: a resumed run must not delete an already-deleted
+        # file (or one Vidispine otherwise moved offline since planning).
+        state = self.gateway.file_state(wrapped["storage_id"], wrapped["file_id"])
+        if state is None or state in _OFFLINE_STATES:
+            return
+        self.gateway.delete_file(wrapped["storage_id"], wrapped["file_id"])

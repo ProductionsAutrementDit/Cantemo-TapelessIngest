@@ -18,6 +18,7 @@ class RecordingGateway:
         self._files = {}
         self._posted = {}
         self._retagged = set()
+        self._deleted_files = set()
         self._minted = 0
 
     def _mint(self, prefix):
@@ -37,6 +38,11 @@ class RecordingGateway:
         if (storage_id, relative) in self._files:
             return FileEntity(self._files[(storage_id, relative)])
         return self._inner.find_file(storage_id, relative)
+
+    def file_state(self, storage_id, file_id):
+        if (storage_id, file_id) in self._deleted_files:
+            return None
+        return self._inner.file_state(storage_id, file_id)
 
     def __getattr__(self, name):
         return getattr(self._inner, name)
@@ -72,4 +78,5 @@ class RecordingGateway:
         self.writes.append(("retag_shape", item_id, shape_id, add, remove))
 
     def delete_file(self, storage_id, file_id):
+        self._deleted_files.add((storage_id, file_id))
         self.writes.append(("delete_file", storage_id, file_id))

@@ -151,6 +151,7 @@ def test_every_crash_point_resumes_to_the_same_end_state(migrated_db, crash_afte
     assert row.phase == "done"
     assert len(gateway.original_shapes(ITEM)) == 1
     assert gateway.write_names().count("post_shape") == 1
+    assert gateway.write_names().count("register_file") == 5
 
 
 def test_an_online_wrapped_file_is_deleted_only_after_verification(migrated_db):
@@ -160,6 +161,30 @@ def test_an_online_wrapped_file_is_deleted_only_after_verification(migrated_db):
     names = gateway.write_names()
     assert names[-1] == "delete_file"
     assert gateway.writes[-1] == ("delete_file", "VX-26", "VX-W1")
+
+
+def test_crash_after_delete_does_not_delete_twice(migrated_db):
+    gateway = CrashingGateway(crash_after="delete_file")
+    row, disk = _setup(gateway, storage="VX-26", state="CLOSED")
+    with pytest.raises(Crash):
+        Executor(gateway, disk).run(row)
+    row.refresh_from_db()
+    assert row.phase == "verified"
+
+    Executor(gateway, disk).run(row)
+    row.refresh_from_db()
+    assert row.phase == "done"
+    assert gateway.write_names().count("delete_file") == 1
+
+
+def test_a_file_already_gone_is_not_deleted(migrated_db):
+    gateway = InMemoryGateway()
+    row, disk = _setup(gateway, storage="VX-26", state="CLOSED")
+    gateway.file_states[("VX-26", "VX-W1")] = None
+    Executor(gateway, disk).run(row)
+    row.refresh_from_db()
+    assert row.phase == "done"
+    assert "delete_file" not in gateway.write_names()
 
 
 def test_on_disk_originals_get_a_sha1(migrated_db):
@@ -210,7 +235,8 @@ def test_dry_run_writes_nothing_and_lists_every_write(migrated_db):
     gateway = InMemoryGateway()
     row, disk = _setup(gateway)
     recording = RecordingGateway(gateway)
-    Executor(recording, disk, persist=False).run(row, stop_before="verified")
+    executor = Executor(recording, disk, persist=False)
+    executor.run(row)
     assert gateway.writes == []
     names = [w[0] for w in recording.writes]
     assert names.count("register_file") == 5
@@ -218,3 +244,34 @@ def test_dry_run_writes_nothing_and_lists_every_write(migrated_db):
     assert "retag_shape" in names
     assert WrappedMigration.objects.get(item_id=ITEM).phase == ""
     assert Clip.objects.get(umid="U1").output_file == OUTPUT
+    # the caller's row object is untouched
+    assert row.phase == ""
+    assert row.plan["originals"][0]["file_id"] is None
+    assert [u["umid"] for u in executor.planned_clip_updates] == ["U1"]
+
+
+def test_dry_run_lists_the_delete_of_an_online_wrapped_file(migrated_db):
+    gateway = InMemoryGateway()
+    row, disk = _setup(gateway, storage="VX-26", state="CLOSED")
+    recording = RecordingGateway(gateway)
+    Executor(recording, disk, persist=False).run(row)
+    assert gateway.writes == []
+    assert recording.writes[-1] == ("delete_file", "VX-26", "VX-W1")
+
+
+def test_a_clip_update_matching_no_row_fails(migrated_db):
+    gateway = InMemoryGateway()
+    row, disk = _setup(gateway)
+    row.clip_umid = "NOPE"
+    row.save()
+    with pytest.raises(Exception, match="NOPE"):
+        Executor(gateway, disk).run(row)
+    row.refresh_from_db()
+    assert row.phase == "old_shape_removed"
+
+
+def test_stop_before_must_name_a_phase(migrated_db):
+    gateway = InMemoryGateway()
+    row, disk = _setup(gateway)
+    with pytest.raises(ValueError):
+        Executor(gateway, disk).run(row, stop_before="verifed")
