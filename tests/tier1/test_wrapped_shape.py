@@ -272,3 +272,59 @@ def test_an_audio_duration_not_exact_in_audio_samples_is_refused():
     timing = Timing(frames=1, num=1, den=25, start_tc_frames=0)
     with pytest.raises(ShapeMismatch, match="audio samples"):
         build_document_from_template(template, "VX-V", AUDIO_IDS, timing)
+
+
+# durations compare by exact value in seconds, whatever their time base
+
+
+def _audio_durations(document, duration):
+    for body in document["audioComponent"]:
+        body["duration"] = duration
+    return document
+
+
+def test_an_audio_duration_in_frames_with_the_right_value_agrees():
+    # measured: 445 clips of AVC-I 1080/50i state audio as frames at 1/25
+    document = _audio_durations(genuine_p2_document(), _duration(497, 25))
+    assert _round_trip(document) == []
+
+
+def test_a_single_track_in_frames_agrees_too():
+    document = genuine_p2_document()
+    document["audioComponent"][2]["duration"] = _duration(497, 25)
+    assert _round_trip(document) == []
+
+
+def test_an_audio_duration_one_sample_off_disagrees():
+    document = _audio_durations(genuine_p2_document(), _duration(954241, 48000))
+    assert _round_trip(document) == ["audioComponent.duration"]
+
+
+def test_a_container_duration_in_frames_with_the_right_value_agrees():
+    document = genuine_p2_document()
+    document["containerComponent"]["duration"] = _duration(497, 25)
+    assert _round_trip(document) == []
+
+
+@pytest.mark.parametrize(
+    "duration",
+    [
+        None,
+        {},
+        {"samples": 954240},
+        {"samples": "954240", "timeBase": {"numerator": 1, "denominator": 48000}},
+        {"samples": 954240, "timeBase": {"numerator": 1, "denominator": 0}},
+        {"samples": 954240, "timeBase": {"numerator": 1}},
+        {"samples": 954240.0, "timeBase": {"numerator": 1, "denominator": 48000}},
+        {"samples": True, "timeBase": {"numerator": 1, "denominator": 1}},
+        "19.88",
+    ],
+)
+def test_a_malformed_reference_duration_disagrees(duration):
+    document = genuine_p2_document()
+    if duration is None:
+        for body in document["audioComponent"]:
+            del body["duration"]
+    else:
+        _audio_durations(document, duration)
+    assert _round_trip(document) == ["audioComponent.duration"]

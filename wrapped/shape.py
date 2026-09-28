@@ -14,6 +14,7 @@ format's template and the timing from the clip's P2 metadata instead.
 """
 
 import copy
+from fractions import Fraction
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from portal.plugins.TapelessIngest.wrapped.gateway import Component, Shape
@@ -169,13 +170,44 @@ def build_document_from_template(
 _COMPARED = ("containerComponent", "videoComponent", "audioComponent")
 
 
+def _whole(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def duration_seconds(duration: Any) -> Optional[Fraction]:
+    """A Vidispine duration's exact value in seconds; None when malformed.
+    Genuine shapes state one duration in several time bases (measured:
+    audio as samples at 1/48000 or as frames at 1/25), so durations are
+    compared by value, never by representation."""
+    if not isinstance(duration, Mapping):
+        return None
+    samples, time_base = duration.get("samples"), duration.get("timeBase")
+    if not _whole(samples) or not isinstance(time_base, Mapping):
+        return None
+    numerator, denominator = time_base.get("numerator"), time_base.get("denominator")
+    if not _whole(numerator) or not _whole(denominator) or denominator <= 0:
+        return None
+    return Fraction(samples * numerator, denominator)
+
+
+def _agrees(key: str, mine: Any, reference: Mapping[str, Any]) -> bool:
+    if key not in reference:
+        return False
+    if key == "duration":
+        ours, theirs = duration_seconds(mine), duration_seconds(reference[key])
+        return ours is not None and ours == theirs
+    return reference[key] == mine
+
+
 def template_disagreements(
     template: Mapping[str, Any], wrapped: Shape, timing: Timing
 ) -> List[str]:
     """Rebuild a genuine wrapped shape from ``template`` and ``timing`` and
     name every value (``component.key``) where the result differs from
     restating the wrapped shape itself. File ids are not compared; a key
-    the genuine restatement lacks counts as a difference. Empty: the
+    the genuine restatement lacks counts as a difference; a ``duration``
+    is compared by its exact value in seconds (a malformed one on either
+    side differs), every other key by exact equality. Empty: the
     template and the timing derivation reproduce this reference."""
     audio_ids = [f"A{n}" for n in range(len(wrapped.of_kind("audio")))]
     try:
@@ -194,6 +226,6 @@ def template_disagreements(
             differs.add(f"{component} count")
         for mine, reference in zip(ours, theirs):
             for key, value in mine.items():
-                if key != "file" and (key not in reference or reference[key] != value):
+                if key != "file" and not _agrees(key, value, reference):
                     differs.add(f"{component}.{key}")
     return sorted(differs)
