@@ -568,3 +568,19 @@ def test_templates_rejects_a_reference_without_timing(migrated_db):
     out, err = _templates("--min-refs", "2")
     assert json.loads(out) == {}
     assert "VX-03 disagrees on timing: timecode_start" in err
+
+
+def test_a_share_rejection_shows_the_top_two_signatures(migrated_db):
+    for n in range(1, 4):
+        _ready_clip(n, genuine_p2_document())
+    _ready_clip(4, _odd())
+    out, err = _templates("--min-refs", "2")
+    lines = err.splitlines()
+    at = lines.index(
+        f"{KEY}: 4 ref(s), majority 3 (75.0%): rejected, share below 95.0%"
+    )
+    assert lines[at + 1 : at + 4] == [
+        f"{KEY}:   top signatures: 3 vs 1, differing in video.pixelFormat",
+        f"{KEY}:     video.pixelFormat: None (3) vs 'yuv420p10le' (1)",
+        "no template key: 0",
+    ]

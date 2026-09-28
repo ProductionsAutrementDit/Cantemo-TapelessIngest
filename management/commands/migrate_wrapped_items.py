@@ -54,6 +54,7 @@ from portal.plugins.TapelessIngest.wrapped.templates import (
     is_proxy_copy,
     load_templates,
     signature,
+    signature_difference,
     template_key,
     timing,
 )
@@ -384,6 +385,7 @@ class Command(BaseCommand):
                 continue
             if share < min_share:
                 summary.write(line + f"rejected, share below {min_share:.1%}")
+                self._show_split(summary, key, by_key[key])
                 continue
             majority_refs = references[(key, majority)]
             template, dropped = common_template([ref[1] for ref in majority_refs])
@@ -430,3 +432,19 @@ class Command(BaseCommand):
             if disagreeing <= _SHOWN_DISAGREEMENTS:
                 self.stderr.write(f"{key}: {item_id} disagrees on {', '.join(differs)}")
         return disagreeing
+
+    def _show_split(self, summary, key, signatures) -> None:
+        """Why a format has no majority: its two commonest signatures, and
+        the values of the fields they differ in."""
+        (first, first_count), (second, second_count) = signatures.most_common(2)
+        differs = signature_difference(first, second)
+        summary.write(
+            f"{key}:   top signatures: {first_count} vs {second_count}, "
+            f"differing in {', '.join(differs)}"
+        )
+        ours, theirs = dict(first), dict(second)
+        for name in differs:
+            summary.write(
+                f"{key}:     {name}: {ours.get(name)!r} ({first_count}) vs "
+                f"{theirs.get(name)!r} ({second_count})"
+            )

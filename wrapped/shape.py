@@ -14,7 +14,7 @@ format's template and the timing from the clip's P2 metadata instead.
 """
 
 import copy
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from portal.plugins.TapelessIngest.wrapped.gateway import Component, Shape
 from portal.plugins.TapelessIngest.wrapped.templates import Timing
@@ -72,6 +72,51 @@ def build_document(
     return document
 
 
+MICROSECONDS = {"numerator": 1, "denominator": 1_000_000}
+
+
+def _exact(numerator: int, denominator: int, unit: str) -> int:
+    if numerator % denominator:
+        raise ShapeMismatch(
+            f"duration {numerator}/{denominator} is not a whole number of {unit}"
+        )
+    return numerator // denominator
+
+
+def audio_time_base(body: Mapping[str, Any]) -> Tuple[int, int]:
+    """(numerator, denominator) of an audio body's own sample rate."""
+    time_base = body.get("timeBase")
+    try:
+        rate_num = int(time_base["numerator"])
+        rate_den = int(time_base["denominator"])
+    except (TypeError, KeyError, ValueError):
+        raise ShapeMismatch("audioComponent has no timeBase") from None
+    if rate_num <= 0 or rate_den <= 0:
+        raise ShapeMismatch(f"audioComponent timeBase {time_base} is not positive")
+    return rate_num, rate_den
+
+
+def _durations(template: Mapping[str, Any], timing: Timing, audio: bool):
+    """Each component's duration in the time base Vidispine itself uses
+    for it (measured on genuine wrapped shapes): the container in
+    microseconds, the video in frames at the EditUnit, each audio in
+    samples at the template audio's own timeBase. Exact or refused."""
+    frames, num, den = timing.frames, timing.num, timing.den
+    container = {
+        "samples": _exact(frames * num * 1_000_000, den, "microseconds"),
+        "timeBase": dict(MICROSECONDS),
+    }
+    video = {"samples": frames, "timeBase": {"numerator": num, "denominator": den}}
+    if not audio:
+        return container, video, None
+    rate_num, rate_den = audio_time_base(template["audioComponent"][0])
+    sound = {
+        "samples": _exact(frames * num * rate_den, den * rate_num, "audio samples"),
+        "timeBase": {"numerator": rate_num, "denominator": rate_den},
+    }
+    return container, video, sound
+
+
 def build_document_from_template(
     template: Mapping[str, Any],
     video_file_id: str,
@@ -88,23 +133,26 @@ def build_document_from_template(
             f"audio original(s)"
         )
 
-    def body(source: Mapping[str, Any], file_id: str) -> Dict[str, Any]:
+    container_duration, video_duration, audio_duration = _durations(
+        template, timing, bool(audio_file_ids)
+    )
+
+    def body(
+        source: Mapping[str, Any], file_id: str, duration: Mapping[str, Any]
+    ) -> Dict[str, Any]:
         restated = copy.deepcopy(dict(source))
-        restated["duration"] = {
-            "samples": timing.frames,
-            "timeBase": {"numerator": timing.num, "denominator": timing.den},
-        }
+        restated["duration"] = copy.deepcopy(dict(duration))
         restated["file"] = [{"id": file_id}]
         return restated
 
-    container = body(template["containerComponent"], video_file_id)
+    container = body(template["containerComponent"], video_file_id, container_duration)
     container["startTimecode"] = timing.start_tc_frames
-    video = body(template["videoComponent"][0], video_file_id)
+    video = body(template["videoComponent"][0], video_file_id, video_duration)
     video["essenceStreamId"] = 0
     video["itemTrack"] = "V1"
     audios = []
     for n, file_id in enumerate(audio_file_ids, start=1):
-        audio = body(template["audioComponent"][0], file_id)
+        audio = body(template["audioComponent"][0], file_id, audio_duration)
         audio["essenceStreamId"] = 0
         audio["itemTrack"] = f"A{n}"
         audios.append(audio)

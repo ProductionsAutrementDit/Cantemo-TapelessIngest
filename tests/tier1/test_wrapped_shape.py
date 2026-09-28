@@ -99,7 +99,13 @@ def test_a_buildable_shape_has_no_mismatch():
 # build_document_from_template
 
 TIMING = Timing(frames=497, num=1, den=25, start_tc_frames=1657612)
-DURATION = {"samples": 497, "timeBase": {"numerator": 1, "denominator": 25}}
+
+
+def _duration(samples, denominator):
+    return {
+        "samples": samples,
+        "timeBase": {"numerator": 1, "denominator": denominator},
+    }
 
 
 def _from_template(audio_ids=AUDIO_IDS, template=None):
@@ -132,7 +138,14 @@ def test_timing_comes_from_the_clip_metadata_on_every_component():
         *document["videoComponent"],
         *document["audioComponent"],
     ]
-    assert all(body["duration"] == DURATION for body in bodies)
+    # VX-35313: 497 frames at 1/25, in Vidispine's time base per component
+    assert document["containerComponent"]["duration"] == _duration(19880000, 1000000)
+    assert document["videoComponent"][0]["duration"] == _duration(497, 25)
+    assert all(
+        body["duration"] == _duration(954240, 48000)
+        for body in document["audioComponent"]
+    )
+    assert len(bodies) == 6
     assert document["containerComponent"]["startTimecode"] == 1657612
     assert "startTimecode" not in document["videoComponent"][0]
 
@@ -156,7 +169,7 @@ def test_building_never_mutates_the_template():
 def test_the_audio_components_do_not_share_one_body():
     document = _from_template()
     document["audioComponent"][0]["duration"]["samples"] = 1
-    assert document["audioComponent"][1]["duration"]["samples"] == 497
+    assert document["audioComponent"][1]["duration"]["samples"] == 954240
     assert document["videoComponent"][0]["duration"]["samples"] == 497
 
 
@@ -219,3 +232,43 @@ def test_a_template_value_the_reference_does_not_have_is_reported():
 def test_file_ids_are_not_compared():
     document = genuine_p2_document(file_id="VX-OTHER")
     assert _round_trip(document) == []
+
+
+def test_a_50p_clip_counts_its_frames_at_1_50():
+    timing = Timing(frames=497, num=1, den=50, start_tc_frames=0)
+    document = build_document_from_template(p2_template(), "VX-V", AUDIO_IDS, timing)
+    assert document["containerComponent"]["duration"] == _duration(9940000, 1000000)
+    assert document["videoComponent"][0]["duration"] == _duration(497, 50)
+    assert document["audioComponent"][0]["duration"] == _duration(477120, 48000)
+
+
+def test_the_audio_time_base_is_the_templates():
+    template = p2_template()
+    template["audioComponent"][0]["timeBase"] = {"numerator": 1, "denominator": 96000}
+    document = _from_template(template=template)
+    assert document["audioComponent"][0]["duration"] == _duration(1908480, 96000)
+    assert document["audioComponent"][0]["timeBase"] == {
+        "numerator": 1,
+        "denominator": 96000,
+    }
+
+
+def test_a_template_audio_without_a_time_base_is_refused():
+    template = p2_template()
+    del template["audioComponent"][0]["timeBase"]
+    with pytest.raises(ShapeMismatch, match="timeBase"):
+        _from_template(template=template)
+
+
+def test_a_container_duration_not_exact_in_microseconds_is_refused():
+    timing = Timing(frames=1, num=1, den=7, start_tc_frames=0)
+    with pytest.raises(ShapeMismatch, match="microseconds"):
+        build_document_from_template(p2_template(), "VX-V", AUDIO_IDS, timing)
+
+
+def test_an_audio_duration_not_exact_in_audio_samples_is_refused():
+    template = p2_template()
+    template["audioComponent"][0]["timeBase"] = {"numerator": 1, "denominator": 44101}
+    timing = Timing(frames=1, num=1, den=25, start_tc_frames=0)
+    with pytest.raises(ShapeMismatch, match="audio samples"):
+        build_document_from_template(template, "VX-V", AUDIO_IDS, timing)

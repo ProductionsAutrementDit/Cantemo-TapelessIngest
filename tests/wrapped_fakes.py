@@ -320,24 +320,35 @@ def p2_template(audio_codec="pcm_s24le"):
             }
         ],
         "audioComponent": [
-            {"codec": audio_codec, "channelCount": 1, "sampleFormat": "s32"}
+            {
+                "codec": audio_codec,
+                "channelCount": 1,
+                "sampleFormat": "s32",
+                "timeBase": {"numerator": 1, "denominator": 48000},
+            }
         ],
     }
 
 
 def genuine_p2_document(frames=497, start_tc_frames=1657612, **kwargs):
     """A genuine wrapped shape whose timing agrees with ``p2_clip_metadata``
-    (VX-35313: 497 frames at 1/25, starting at 18:25:04:12)."""
+    (VX-35313: 497 frames at 1/25, starting at 18:25:04:12), each duration
+    in the time base Vidispine uses for that component (measured on prod):
+    container in microseconds, video in frames, audio in audio samples."""
     document = wrapped_p2_document(**kwargs)
-    bodies = [
-        document["containerComponent"],
-        *document["videoComponent"],
-        *document["audioComponent"],
-    ]
-    for body in bodies:
+    document["containerComponent"]["duration"] = {
+        "samples": frames * 1_000_000 // 25,
+        "timeBase": {"numerator": 1, "denominator": 1_000_000},
+    }
+    document["videoComponent"][0]["duration"] = {
+        "samples": frames,
+        "timeBase": {"numerator": 1, "denominator": 25},
+    }
+    for body in document["audioComponent"]:
+        body["timeBase"] = {"numerator": 1, "denominator": 48000}
         body["duration"] = {
-            "samples": frames,
-            "timeBase": {"numerator": 1, "denominator": 25},
+            "samples": frames * 48000 // 25,
+            "timeBase": {"numerator": 1, "denominator": 48000},
         }
     document["containerComponent"]["startTimecode"] = start_tc_frames
     return document

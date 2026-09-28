@@ -10,6 +10,7 @@ from portal.plugins.TapelessIngest.wrapped.templates import (
     is_proxy_copy,
     common_template,
     load_templates,
+    signature_difference,
     signature,
     strip_for_template,
     template_key,
@@ -291,3 +292,21 @@ def test_identical_references_lose_nothing():
         "videoComponent": [],
         "audioComponent": [],
     }
+
+
+# signature_difference
+
+
+def test_the_fields_two_signatures_differ_in_are_named():
+    one = wrapped_p2_document()
+    two = wrapped_p2_document()
+    two["videoComponent"][0]["pixelFormat"] = "yuv420p10le"
+    two["audioComponent"][1]["channelCount"] = 2
+    assert signature_difference(
+        signature(parse_shape(one)), signature(parse_shape(two))
+    ) == ["audio.channelCount", "video.pixelFormat"]
+
+
+def test_identical_signatures_differ_in_nothing():
+    base = signature(parse_shape(wrapped_p2_document()))
+    assert signature_difference(base, base) == []

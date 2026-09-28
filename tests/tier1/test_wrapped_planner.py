@@ -502,3 +502,26 @@ def test_the_template_route_reads_the_item_fields_once():
     world[0].item_fields = counting
     assert _proxy_plan(world=world).verdict == verdicts.READY
     assert len(calls) == 1
+
+
+def test_a_template_audio_without_a_time_base_is_refused_at_plan_time():
+    template = p2_template()
+    del template["audioComponent"][0]["timeBase"]
+    result = _proxy_plan(templates={KEY: {"template": template}})
+    assert result.verdict == verdicts.UNEXPECTED
+    assert result.reason == (
+        f"proxy-copied technical description; template {KEY} is malformed: "
+        f"audioComponent has no timeBase"
+    )
+
+
+def test_a_template_that_cannot_state_this_items_duration_is_refused():
+    template = p2_template()
+    template["audioComponent"][0]["timeBase"] = {"numerator": 1, "denominator": 44101}
+    result = _proxy_plan(templates={KEY: {"template": template}})
+    assert result.verdict == verdicts.UNEXPECTED
+    assert result.reason.startswith(
+        f"proxy-copied technical description; template {KEY} cannot state "
+        f"this item: "
+    )
+    assert "audio samples" in result.reason

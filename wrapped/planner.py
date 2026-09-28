@@ -20,7 +20,12 @@ from portal.plugins.TapelessIngest.wrapped import fields, verdicts
 from portal.plugins.TapelessIngest.wrapped.archive import CachedArchive
 from portal.plugins.TapelessIngest.wrapped.gateway import Gateway, Shape, parse_shape
 from portal.plugins.TapelessIngest.wrapped.paths import OriginalFile, to_absolute
-from portal.plugins.TapelessIngest.wrapped.shape import mismatch
+from portal.plugins.TapelessIngest.wrapped.shape import (
+    ShapeMismatch,
+    audio_time_base,
+    build_document_from_template,
+    mismatch,
+)
 from portal.plugins.TapelessIngest.wrapped.templates import (
     is_proxy_copy,
     template_key,
@@ -107,8 +112,14 @@ def _template_problem(template: Mapping[str, Any], audio_count: int) -> Optional
     videos = template.get("videoComponent") or []
     if len(videos) != 1:
         return f"{len(videos)} videoComponent(s), expected 1"
-    if audio_count and not template.get("audioComponent"):
-        return f"no audioComponent for {audio_count} audio original(s)"
+    if audio_count:
+        audios = template.get("audioComponent")
+        if not audios:
+            return f"no audioComponent for {audio_count} audio original(s)"
+        try:
+            audio_time_base(audios[0])
+        except ShapeMismatch as error:
+            return str(error)
     return None
 
 
@@ -146,6 +157,15 @@ def _technical_source(
         clip_timing = timing(clip_metadata)
     except ValueError as error:
         return {"problem": f"{PROXY_COPY_INCOMPLETE}: {error}"}
+    try:
+        # A dry build: every duration this item needs is exact in the
+        # template's time bases, so apply cannot fail on it after writes.
+        build_document_from_template(template, "V", ["A"] * audio_count, clip_timing)
+    except ShapeMismatch as error:
+        return {
+            "problem": f"{PROXY_COPY}; template {key} cannot state this item: "
+            f"{error}"
+        }
     return {
         "technical_source": f"template:{key}",
         "template": copy.deepcopy(template),

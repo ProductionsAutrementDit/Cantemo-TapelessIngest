@@ -127,26 +127,41 @@ def _stream_order(component: Component):
     return (int(component.body.get("essenceStreamId", 0)), component.component_id)
 
 
-def _pick(component: Optional[Component], names: Tuple[str, ...]) -> Tuple:
-    body = component.body if component else {}
-    return tuple(_freeze(body.get(name)) for name in names)
+_VIDEO_NAMES = ("codec", "resolution", "pixelFormat", "fieldOrder")
+_VIDEO_NAMES += ("averageFrameRate",)
+_AUDIO_NAMES = ("codec", "channelCount", "timeBase", "sampleFormat")
+
+
+def _body(components) -> Mapping[str, Any]:
+    return components[0].body if components else {}
 
 
 def signature(shape: Shape) -> Tuple:
-    """The content-level values two shapes of one P2 format share."""
-    containers = shape.of_kind("container")
-    videos = shape.of_kind("video")
+    """The content-level values two shapes of one P2 format share, as
+    ``(("field", value), ...)``; an audio field's value is its tuple
+    across tracks in stream order."""
+    container = _body(shape.of_kind("container"))
+    video = _body(shape.of_kind("video"))
     audios = sorted(shape.of_kind("audio"), key=_stream_order)
-    video_names = ("codec", "resolution", "pixelFormat", "fieldOrder")
-    video_names += ("averageFrameRate",)
-    audio_names = ("codec", "channelCount", "timeBase", "sampleFormat")
-    return (
-        _pick(containers[0] if containers else None, ("format",)),
-        tuple(shape.mime_types),
-        _pick(videos[0] if videos else None, video_names),
-        len(audios),
-        tuple(_pick(audio, audio_names) for audio in audios),
-    )
+    items = [
+        ("container.format", _freeze(container.get("format"))),
+        ("mimeType", tuple(shape.mime_types)),
+    ]
+    items += [(f"video.{n}", _freeze(video.get(n))) for n in _VIDEO_NAMES]
+    items.append(("audio.count", len(audios)))
+    items += [
+        (f"audio.{n}", tuple(_freeze(a.body.get(n)) for a in audios))
+        for n in _AUDIO_NAMES
+    ]
+    return tuple(items)
+
+
+def signature_difference(one: Tuple, other: Tuple) -> List[str]:
+    """The fields in which two signatures differ, sorted."""
+    theirs = dict(other)
+    names = {name for name, _ in one} | set(theirs)
+    ours = dict(one)
+    return sorted(n for n in names if ours.get(n) != theirs.get(n))
 
 
 def _strip(body: Mapping[str, Any]) -> Dict[str, Any]:
