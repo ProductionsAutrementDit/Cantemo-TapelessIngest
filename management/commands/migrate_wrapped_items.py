@@ -16,6 +16,7 @@ Never interactive. A row whose phase is non-empty is frozen against plan.
 from collections import Counter
 
 from django.core.management.base import BaseCommand, CommandError
+from django.db import transaction
 
 from portal.plugins.TapelessIngest.models.clip import Clip
 from portal.plugins.TapelessIngest.models.wrapped_migration import WrappedMigration
@@ -153,17 +154,26 @@ class Command(BaseCommand):
                     "status": clip.status,
                     "job_id": clip.job_id,
                 }
-            WrappedMigration.objects.update_or_create(
-                item_id=clip.item_id,
-                defaults={
-                    "clip_umid": clip.umid,
-                    "verdict": result.verdict,
-                    "reason": result.reason,
-                    "plan": result.plan,
-                    "rollback": result.rollback,
-                    "error": "",
-                },
-            )
+            try:
+                with transaction.atomic():
+                    WrappedMigration.objects.update_or_create(
+                        item_id=clip.item_id,
+                        defaults={
+                            "clip_umid": clip.umid,
+                            "verdict": result.verdict,
+                            "reason": result.reason,
+                            "plan": result.plan,
+                            "rollback": result.rollback,
+                            "error": "",
+                        },
+                    )
+            except Exception as error:  # noqa: BLE001 - isolate the item
+                self.stdout.write(
+                    f"{clip.item_id}: FAILED to save plan: "
+                    f"{type(error).__name__}: {error}"
+                )
+                counts["save-failed"] += 1
+                continue
             counts[result.verdict] += 1
         for name, count in sorted(counts.items()):
             self.stdout.write(f"{name}: {count}")

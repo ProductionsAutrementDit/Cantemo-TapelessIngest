@@ -94,6 +94,25 @@ def test_p5_failure_marks_item_error_and_run_continues(migrated_db):
     assert WrappedMigration.objects.get(item_id="VX-1").verdict == "ready"
 
 
+def test_plan_isolates_a_save_failure_and_continues(migrated_db, monkeypatch):
+    world = _world(("VX-1", "VX-2"))
+    real_update_or_create = WrappedMigration.objects.update_or_create
+
+    def flaky_update_or_create(*, item_id, defaults):
+        if item_id == "VX-1":
+            raise RuntimeError("boom")
+        return real_update_or_create(item_id=item_id, defaults=defaults)
+
+    monkeypatch.setattr(
+        WrappedMigration.objects, "update_or_create", flaky_update_or_create
+    )
+    out = _run(world, "plan")
+    assert "VX-1: FAILED to save plan: RuntimeError: boom" in out
+    assert "save-failed: 1" in out
+    assert not WrappedMigration.objects.filter(item_id="VX-1").exists()
+    assert WrappedMigration.objects.get(item_id="VX-2").verdict == "ready"
+
+
 def test_apply_isolates_a_failing_item(migrated_db):
     world = _world(("VX-1", "VX-2"))
     _run(world, "plan")
