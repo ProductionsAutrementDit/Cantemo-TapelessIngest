@@ -8,6 +8,7 @@ from portal.plugins.TapelessIngest.wrapped.gateway import parse_shape
 from portal.plugins.TapelessIngest.wrapped.templates import (
     Timing,
     is_proxy_copy,
+    common_template,
     load_templates,
     signature,
     strip_for_template,
@@ -237,3 +238,56 @@ def test_templates_are_read_from_the_json_file(tmp_path):
     path = tmp_path / "p2_templates.json"
     path.write_text(json.dumps({"DV100_1080/50i|50i": entry}))
     assert load_templates(path) == {"DV100_1080/50i|50i": entry}
+
+
+# common_template
+
+
+def _varying(packets, bitrate, audio_packets=(10, 10, 10, 10)):
+    document = wrapped_p2_document()
+    document["containerComponent"].update(numberOfPackets=packets, bitrate=bitrate)
+    document["videoComponent"][0].update(numberOfPackets=packets, bitrate=bitrate)
+    for body, count in zip(document["audioComponent"], audio_packets):
+        body["numberOfPackets"] = count
+    return document
+
+
+def test_values_that_vary_across_references_are_dropped():
+    template, dropped = common_template(
+        [_varying(218, 114_000_000), _varying(497, 113_500_000)]
+    )
+    expected = strip_for_template(wrapped_p2_document())
+    # identical in both references: not per-file, so kept
+    expected["audioComponent"][0]["numberOfPackets"] = 10
+    assert template == expected
+    assert dropped == {
+        "containerComponent": ["bitrate", "numberOfPackets"],
+        "videoComponent": ["bitrate", "numberOfPackets"],
+        "audioComponent": [],
+    }
+
+
+def test_a_value_varying_between_tracks_of_one_reference_is_dropped():
+    template, dropped = common_template([_varying(1, 2, audio_packets=(1, 1, 1, 2))])
+    assert "numberOfPackets" not in template["audioComponent"][0]
+    assert dropped["audioComponent"] == ["numberOfPackets"]
+    assert template["containerComponent"]["numberOfPackets"] == 1
+
+
+def test_a_value_missing_from_one_reference_is_dropped():
+    one = _varying(1, 2)
+    two = _varying(1, 2)
+    del two["containerComponent"]["bitrate"]
+    template, dropped = common_template([one, two])
+    assert "bitrate" not in template["containerComponent"]
+    assert dropped["containerComponent"] == ["bitrate"]
+
+
+def test_identical_references_lose_nothing():
+    template, dropped = common_template([_varying(1, 2), _varying(1, 2)])
+    assert template == strip_for_template(_varying(1, 2))
+    assert dropped == {
+        "containerComponent": [],
+        "videoComponent": [],
+        "audioComponent": [],
+    }

@@ -507,3 +507,21 @@ def test_templates_never_learns_from_a_proxy_copy_or_a_frozen_row(migrated_db):
     out, err = _templates("--min-refs", "2", "--min-share", "1")
     assert json.loads(out)[KEY]["references"] == 2
     assert f"{KEY}: 2 ref(s), majority 2 (100.0%): kept" in err
+
+
+def test_templates_drops_per_file_values_that_vary(migrated_db):
+    for n, (packets, bitrate) in enumerate([(218, 114_000_000), (497, 113_500_000)]):
+        document = wrapped_p2_document()
+        for body in [document["containerComponent"], *document["videoComponent"]]:
+            body.update(numberOfPackets=packets, bitrate=bitrate)
+        _ready_clip(n + 1, document)
+    out, err = _templates("--min-refs", "2")
+    template = json.loads(out)[KEY]["template"]
+    for body in [template["containerComponent"], *template["videoComponent"]]:
+        assert "numberOfPackets" not in body and "bitrate" not in body
+    assert template == strip_for_template(wrapped_p2_document())
+    assert (
+        f"{KEY}: dropped per-file values containerComponent.bitrate, "
+        f"containerComponent.numberOfPackets, videoComponent.bitrate, "
+        f"videoComponent.numberOfPackets" in err.splitlines()
+    )

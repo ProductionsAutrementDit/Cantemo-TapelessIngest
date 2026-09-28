@@ -16,7 +16,7 @@ import json
 import os
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from portal.plugins.TapelessIngest.wrapped.gateway import Component, Shape, parse_shape
 
@@ -168,6 +168,44 @@ def strip_for_template(document: Mapping[str, Any]) -> Dict[str, Any]:
     if audios:
         template["audioComponent"] = [_strip(audios[0].body)]
     return template
+
+
+def _common_keys(bodies) -> Tuple[set, set]:
+    """(keys whose value is identical in every body, every key seen)."""
+    seen = set().union(*(body.keys() for body in bodies)) if bodies else set()
+    first = bodies[0] if bodies else {}
+    same = {
+        k for k in seen if all(k in body and body[k] == first.get(k) for body in bodies)
+    }
+    return same, seen
+
+
+def common_template(
+    documents: Sequence[Mapping[str, Any]],
+) -> Tuple[Dict[str, Any], Dict[str, List[str]]]:
+    """The first document's template, keeping in each component only the
+    values identical across ALL documents (and, for audio, all their
+    tracks): a value that varies is per-file (numberOfPackets, bitrate...)
+    and must never be stated onto another item. Returns the template and
+    the dropped keys per component."""
+    template = strip_for_template(documents[0])
+    dropped: Dict[str, List[str]] = {}
+    for component in ("containerComponent", "videoComponent", "audioComponent"):
+        bodies = []
+        for document in documents:
+            raw = document.get(component)
+            for body in raw if isinstance(raw, list) else [raw] if raw else []:
+                bodies.append(_strip(body))
+        same, seen = _common_keys(bodies)
+        dropped[component] = sorted(seen - same)
+        kept = template.get(component)
+        if isinstance(kept, list):
+            template[component] = [
+                {k: v for k, v in body.items() if k in same} for body in kept
+            ]
+        elif kept is not None:
+            template[component] = {k: v for k, v in kept.items() if k in same}
+    return template, dropped
 
 
 def load_templates(path: str = DEFAULT_PATH) -> Dict[str, Dict[str, Any]]:

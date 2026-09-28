@@ -43,10 +43,10 @@ from portal.plugins.TapelessIngest.wrapped.resolver import (
     wrapped_p2_clips,
 )
 from portal.plugins.TapelessIngest.wrapped.templates import (
+    common_template,
     is_proxy_copy,
     load_templates,
     signature,
-    strip_for_template,
     template_key,
 )
 from portal.plugins.TapelessIngest.wrapped.verifier import verify_item
@@ -359,7 +359,9 @@ class Command(BaseCommand):
                 continue
             found = signature(wrapped)
             by_key[key][found] += 1
-            references.setdefault((key, found), (row.item_id, plan["wrapped_shape"]))
+            references.setdefault((key, found), []).append(
+                (row.item_id, plan["wrapped_shape"])
+            )
         summary = self.stdout if options["out"] else self.stderr
         kept = {}
         for key in sorted(by_key):
@@ -374,10 +376,14 @@ class Command(BaseCommand):
                 summary.write(line + f"rejected, share below {min_share:.1%}")
                 continue
             summary.write(line + "kept")
-            item_id, document = references[(key, majority)]
+            majority_refs = references[(key, majority)]
+            template, dropped = common_template([doc for _, doc in majority_refs])
+            names = [f"{c}.{k}" for c, keys in sorted(dropped.items()) for k in keys]
+            if names:
+                self.stderr.write(f"{key}: dropped per-file values {', '.join(names)}")
             kept[key] = {
-                "template": strip_for_template(document),
-                "reference_item": item_id,
+                "template": template,
+                "reference_item": majority_refs[0][0],
                 "references": count,
                 "share": round(share, 4),
             }
