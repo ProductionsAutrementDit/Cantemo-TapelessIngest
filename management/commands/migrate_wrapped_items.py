@@ -7,18 +7,25 @@ Spec: _bmad-output/implementation-artifacts/spec-wrapped-items-migration-p2.md
           needs --item, --collection, --limit or an explicit --all, and
           stops after --max-failures (default 20) failures in a row
   verify  re-checks every finished row
-  report  counts per verdict/phase, why items are not acted on, and the
-          errors; ``--verdict V`` lists each item of that verdict instead
+  report  counts per verdict/phase, why items are not acted on, the ready
+          rows per technical source, and the errors; ``--verdict V`` lists
+          each item of that verdict instead
+  templates
+          read-only (no Vidispine, no P5, no DB write): learns one P2
+          technical template per format from the genuine ready rows and
+          writes it as JSON to --out (default: stdout, the per-format
+          summary then going to stderr)
 
 Never interactive. A row whose phase is non-empty is frozen against plan.
 """
 
-from collections import Counter
+import json
+from collections import Counter, defaultdict
 
 from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
 
-from portal.plugins.TapelessIngest.models.clip import Clip
+from portal.plugins.TapelessIngest.models.clip import Clip, ClipMetadata
 from portal.plugins.TapelessIngest.models.wrapped_migration import WrappedMigration
 from portal.plugins.TapelessIngest.wrapped import verdicts
 from portal.plugins.TapelessIngest.wrapped.archive import (
@@ -28,16 +35,27 @@ from portal.plugins.TapelessIngest.wrapped.archive import (
 from portal.plugins.TapelessIngest.wrapped.disk import Disk
 from portal.plugins.TapelessIngest.wrapped.dryrun import RecordingGateway
 from portal.plugins.TapelessIngest.wrapped.executor import Executor
+from portal.plugins.TapelessIngest.wrapped.gateway import parse_shape
 from portal.plugins.TapelessIngest.wrapped.planner import PlanResult, plan_item
 from portal.plugins.TapelessIngest.wrapped.resolver import (
     ResolveError,
     resolve_p2,
     wrapped_p2_clips,
 )
+from portal.plugins.TapelessIngest.wrapped.templates import (
+    load_templates,
+    signature,
+    strip_for_template,
+    template_key,
+)
 from portal.plugins.TapelessIngest.wrapped.verifier import verify_item
 
 _REASON_WIDTH = 120
 _TOP_REASONS = 10
+_MIN_REFS = 20
+_MIN_SHARE = 0.95
+_TEMPLATE_OPTIONS = (("out", "--out"), ("min_refs", "--min-refs"))
+_TEMPLATE_OPTIONS += (("min_share", "--min-share"),)
 
 
 def _vidispine_gateway():
@@ -47,15 +65,22 @@ def _vidispine_gateway():
     return VidispineGateway()
 
 
+def _clip_metadata(clip):
+    return dict(ClipMetadata.objects.filter(clip=clip).values_list("name", "value"))
+
+
 class Command(BaseCommand):
     help = "Migrate legacy wrapped P2 items to their original files."
 
     gateway_factory = staticmethod(_vidispine_gateway)
     archive_factory = staticmethod(load_archive_lookup)
     disk_factory = Disk
+    templates_factory = staticmethod(load_templates)
 
     def add_arguments(self, parser):
-        parser.add_argument("action", choices=("plan", "apply", "verify", "report"))
+        parser.add_argument(
+            "action", choices=("plan", "apply", "verify", "report", "templates")
+        )
         parser.add_argument("--item", dest="item_id")
         parser.add_argument("--collection", dest="collection_id")
         parser.add_argument("--limit", type=int)
@@ -85,6 +110,24 @@ class Command(BaseCommand):
             help="apply: delete the wrapped file of a migrated item when it is "
             "on an online legacy storage (default: keep it)",
         )
+        parser.add_argument(
+            "--out",
+            help="templates: write the JSON here (default: print it to stdout)",
+        )
+        parser.add_argument(
+            "--min-refs",
+            dest="min_refs",
+            type=int,
+            help=f"templates: keep a format whose majority signature has at "
+            f"least this many references (default {_MIN_REFS})",
+        )
+        parser.add_argument(
+            "--min-share",
+            dest="min_share",
+            type=float,
+            help=f"templates: ... and at least this share of the format's "
+            f"references (default {_MIN_SHARE})",
+        )
 
     def handle(self, *args, **options):
         if options["limit"] is not None and options["limit"] < 1:
@@ -108,6 +151,13 @@ class Command(BaseCommand):
             )
         if options["verdict"] and options["action"] != "report":
             raise CommandError("--verdict only applies to 'report'")
+        for name, flag in _TEMPLATE_OPTIONS:
+            if options[name] is not None and options["action"] != "templates":
+                raise CommandError(f"{flag} only applies to 'templates'")
+        if options["min_refs"] is not None and options["min_refs"] < 1:
+            raise CommandError("--min-refs must be a positive integer")
+        if options["min_share"] is not None and not 0 < options["min_share"] <= 1:
+            raise CommandError("--min-share must be in (0, 1]")
         getattr(self, f"_{options['action']}")(options)
 
     def _rows(self, options):
@@ -124,6 +174,7 @@ class Command(BaseCommand):
     def _plan(self, options):
         archive = CachedArchive(self.archive_factory())
         gateway, disk = self.gateway_factory(), self.disk_factory()
+        templates = self.templates_factory()
         clips = wrapped_p2_clips(options["item_id"], options["collection_id"])
         if options["limit"]:
             clips = clips[: options["limit"]]
@@ -142,6 +193,8 @@ class Command(BaseCommand):
                     gateway=gateway,
                     archive=archive,
                     disk=disk,
+                    clip_metadata=_clip_metadata(clip),
+                    templates=templates,
                 )
             except ResolveError as error:
                 result = PlanResult(verdicts.UNEXPECTED, str(error))
@@ -267,5 +320,67 @@ class Command(BaseCommand):
             if plan.get("wrapped_kept")
         )
         self.stdout.write(f"wrapped kept: {kept}")
+        # A row planned before technical_source existed was always
+        # restated from its wrapped shape (as the executor assumes).
+        sources = Counter(
+            plan.get("technical_source", "wrapped")
+            for plan in rows.filter(verdict=verdicts.READY).values_list(
+                "plan", flat=True
+            )
+        )
+        for source, count in sorted(sources.items()):
+            self.stdout.write(f"technical source {source}: {count}")
         for row in rows.exclude(error="")[:50]:
             self.stdout.write(f"ERROR {row.item_id}: {row.error}")
+
+    def _templates(self, options):
+        min_refs = options["min_refs"] or _MIN_REFS
+        min_share = options["min_share"] or _MIN_SHARE
+        # Genuine wrapped shapes only: a template-planned row carries a
+        # proxy copy, which is exactly what a template must never learn.
+        by_key = defaultdict(Counter)
+        references = {}
+        unkeyed = 0
+        for row in self._rows(options).filter(verdict=verdicts.READY):
+            plan = row.plan
+            if plan.get("technical_source", "wrapped") != "wrapped":
+                continue
+            if "wrapped_shape" not in plan:
+                continue
+            clip = Clip.objects.filter(umid=row.clip_umid).first()
+            key = template_key(_clip_metadata(clip)) if clip else None
+            if key is None:
+                unkeyed += 1
+                continue
+            found = signature(parse_shape(plan["wrapped_shape"]))
+            by_key[key][found] += 1
+            references.setdefault((key, found), (row.item_id, plan["wrapped_shape"]))
+        summary = self.stdout if options["out"] else self.stderr
+        kept = {}
+        for key in sorted(by_key):
+            total = sum(by_key[key].values())
+            majority, count = by_key[key].most_common(1)[0]
+            share = count / total
+            line = f"{key}: {total} ref(s), majority {count} ({share:.1%}): "
+            if count < min_refs:
+                summary.write(line + f"rejected, fewer than {min_refs} references")
+                continue
+            if share < min_share:
+                summary.write(line + f"rejected, share below {min_share:.1%}")
+                continue
+            summary.write(line + "kept")
+            item_id, document = references[(key, majority)]
+            kept[key] = {
+                "template": strip_for_template(document),
+                "reference_item": item_id,
+                "references": count,
+                "share": round(share, 4),
+            }
+        summary.write(f"no template key: {unkeyed}")
+        text = json.dumps(kept, indent=2, sort_keys=True, ensure_ascii=True)
+        if options["out"]:
+            with open(options["out"], "w", encoding="ascii") as handle:
+                handle.write(text + "\n")
+            self.stdout.write(f"wrote {len(kept)} template(s) to {options['out']}")
+        else:
+            self.stdout.write(text)

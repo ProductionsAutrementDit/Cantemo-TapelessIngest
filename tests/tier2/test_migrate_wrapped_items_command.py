@@ -1,5 +1,6 @@
 """Tier 2: the command end to end against the plugin's own fakes."""
 
+import json
 from io import StringIO
 
 import pytest
@@ -7,14 +8,18 @@ from django.core.management import call_command
 from django.core.management.base import CommandError
 
 from portal.plugins.TapelessIngest.management.commands import migrate_wrapped_items
-from portal.plugins.TapelessIngest.models.clip import Clip, ClipFile
+from portal.plugins.TapelessIngest.models.clip import Clip, ClipFile, ClipMetadata
 from portal.plugins.TapelessIngest.models.wrapped_migration import WrappedMigration
 from portal.plugins.TapelessIngest.wrapped.paths import to_absolute
+from portal.plugins.TapelessIngest.wrapped.templates import strip_for_template
 from tests.wrapped_fakes import (
     FakeArchive,
     FakeDisk,
     InMemoryGateway,
+    p2_clip_metadata,
     p2_originals,
+    p2_template,
+    proxy_copy_document,
     seed_item,
     wrapped_p2_document,
 )
@@ -22,10 +27,13 @@ from tests.wrapped_fakes import (
 LEGACY = "/Volumes/ActiveMedia/AA - RUSHES TAPELESS/"
 
 
-def _world(items=("VX-1",), storage="VX-2"):
+def _world(items=("VX-1",), storage="VX-2", documents=None, metadata=None):
     gateway, archive = InMemoryGateway(), FakeArchive()
     for n, item_id in enumerate(items):
-        seed_item(gateway, item_id, wrapped_p2_document(storage=storage))
+        document = (documents or {}).get(item_id) or wrapped_p2_document(
+            storage=storage
+        )
+        seed_item(gateway, item_id, document)
         clip = Clip.objects.create(
             umid=f"U{n}",
             path="2016/AH_TEST",
@@ -36,6 +44,8 @@ def _world(items=("VX-1",), storage="VX-2"):
             output_file="/mnt/ActiveMedia/CANTEMO_FILES/060A2B34.MXF",
             status=Clip.STATUS_IMPORTED,
         )
+        for name, value in ((metadata or {}).get(item_id) or {}).items():
+            ClipMetadata.objects.create(clip=clip, name=name, value=value)
         for original in p2_originals(clip_dir=f"2016/AH_{n}/CONTENTS"):
             ClipFile.objects.create(
                 clip=clip, path=LEGACY + original.relative, filetype=original.kind
@@ -44,14 +54,19 @@ def _world(items=("VX-1",), storage="VX-2"):
     return gateway, archive, FakeDisk()
 
 
-def _run(world, *args):
+def _command(world, templates=None):
     gateway, archive, disk = world
     command = migrate_wrapped_items.Command()
     command.gateway_factory = lambda: gateway
     command.archive_factory = lambda: archive
     command.disk_factory = lambda: disk
+    command.templates_factory = lambda: dict(templates or {})
+    return command
+
+
+def _run(world, *args, templates=None):
     out = StringIO()
-    call_command(command, *args, stdout=out)
+    call_command(_command(world, templates), *args, stdout=out)
     return out.getvalue()
 
 
@@ -273,3 +288,205 @@ def test_max_failures_defaults_to_twenty(migrated_db):
 def test_max_failures_must_be_positive(migrated_db):
     with pytest.raises(CommandError, match="--max-failures"):
         _run(_world(), "apply", "--all", "--max-failures", "0")
+
+
+# P2 templates for proxy-copied wrapped shapes
+
+KEY = "AVC-I_1080/50i|50i|AVC-I100"
+
+
+def _proxy_world(items=("VX-1",)):
+    return _world(
+        items,
+        documents={i: proxy_copy_document() for i in items},
+        metadata={i: p2_clip_metadata() for i in items},
+    )
+
+
+def test_plan_states_a_proxy_copy_from_its_template(migrated_db):
+    world = _proxy_world()
+    out = _run(world, "plan", templates={KEY: {"template": p2_template()}})
+    assert "ready: 1" in out
+    row = WrappedMigration.objects.get(item_id="VX-1")
+    assert row.plan["technical_source"] == f"template:{KEY}"
+    assert row.plan["template"] == p2_template()
+    assert row.plan["timing"]["start_tc_frames"] == 1657612
+    assert world[0].writes == []
+
+
+def test_plan_without_the_template_names_the_missing_key(migrated_db):
+    _run(_proxy_world(), "plan")
+    row = WrappedMigration.objects.get(item_id="VX-1")
+    assert row.verdict == "unexpected"
+    assert row.reason == f"proxy-copied technical description; no template for {KEY}"
+
+
+def test_plan_reads_each_clips_own_metadata(migrated_db):
+    world = _world(
+        ("VX-1", "VX-2"),
+        documents={i: proxy_copy_document() for i in ("VX-1", "VX-2")},
+        metadata={"VX-1": p2_clip_metadata(), "VX-2": {"video_codec": "X"}},
+    )
+    _run(world, "plan", templates={KEY: {"template": p2_template()}})
+    verdicts = dict(WrappedMigration.objects.values_list("item_id", "verdict"))
+    assert verdicts == {"VX-1": "ready", "VX-2": "unexpected"}
+
+
+def test_apply_posts_the_template_planned_by_plan(migrated_db):
+    world = _proxy_world()
+    _run(world, "plan", templates={KEY: {"template": p2_template()}})
+    _run(world, "apply", "--item", "VX-1")
+    assert WrappedMigration.objects.get(item_id="VX-1").phase == "done"
+    (posted,) = [w[2] for w in world[0].writes if w[0] == "post_shape"]
+    assert posted["containerComponent"]["format"] == "mxf_d10"
+
+
+def _ready_clip(n, document, **metadata):
+    item_id = f"VX-{n:02d}"
+    Clip.objects.create(
+        umid=f"T{n}",
+        path="2016/AH_TEST",
+        storage_id="VX-41",
+        reference_file="F",
+        item_id=item_id,
+        provider_name="panasonicP2",
+    )
+    clip = Clip.objects.get(umid=f"T{n}")
+    for name, value in p2_clip_metadata(**metadata).items():
+        ClipMetadata.objects.create(clip=clip, name=name, value=value)
+    return WrappedMigration.objects.create(
+        item_id=item_id,
+        clip_umid=f"T{n}",
+        verdict="ready",
+        plan={"kind": "wrap", "technical_source": "wrapped", "wrapped_shape": document},
+    )
+
+
+def _odd():
+    document = wrapped_p2_document()
+    document["videoComponent"][0]["pixelFormat"] = "yuv420p10le"
+    return document
+
+
+def _templates(*args):
+    out, err = StringIO(), StringIO()
+    command = _command(_world(()))
+
+    def no_gateway():
+        raise AssertionError("templates must not touch Vidispine")
+
+    command.gateway_factory = no_gateway
+    command.archive_factory = no_gateway
+    call_command(command, "templates", *args, stdout=out, stderr=err)
+    return out.getvalue(), err.getvalue()
+
+
+def _snapshot():
+    return sorted(
+        WrappedMigration.objects.values_list(
+            "item_id", "verdict", "phase", "plan", "updated_on"
+        )
+    )
+
+
+def test_templates_keeps_the_majority_signature(migrated_db, tmp_path):
+    for n in range(1, 4):
+        _ready_clip(n, wrapped_p2_document(shape_id=f"VX-S{n}"))
+    _ready_clip(4, _odd())
+    for n in range(5, 7):
+        _ready_clip(n, wrapped_p2_document(), video_codec="DV100_1080/50i")
+    before = _snapshot()
+    path = tmp_path / "p2_templates.json"
+    out, _ = _templates("--out", str(path), "--min-refs", "2", "--min-share", "0.7")
+    written = json.loads(path.read_text())
+    assert written == {
+        KEY: {
+            "template": strip_for_template(wrapped_p2_document()),
+            "reference_item": "VX-01",
+            "references": 3,
+            "share": 0.75,
+        },
+        "DV100_1080/50i|50i": {
+            "template": strip_for_template(wrapped_p2_document()),
+            "reference_item": "VX-05",
+            "references": 2,
+            "share": 1.0,
+        },
+    }
+    assert f"{KEY}: 4 ref(s), majority 3 (75.0%): kept" in out.splitlines()
+    assert _snapshot() == before
+    assert Clip.objects.count() == 6 and ClipMetadata.objects.count() == 36
+
+
+def test_templates_rejects_a_key_below_the_thresholds(migrated_db, tmp_path):
+    for n in range(1, 4):
+        _ready_clip(n, wrapped_p2_document())
+    _ready_clip(4, _odd())
+    _ready_clip(5, wrapped_p2_document(), video_codec="DV100_1080/50i")
+    path = tmp_path / "p2_templates.json"
+    out, _ = _templates("--out", str(path), "--min-refs", "2")
+    assert json.loads(path.read_text()) == {}
+    lines = out.splitlines()
+    assert f"{KEY}: 4 ref(s), majority 3 (75.0%): rejected, share below 95.0%" in lines
+    assert (
+        "DV100_1080/50i|50i: 1 ref(s), majority 1 (100.0%): rejected, "
+        "fewer than 2 references" in lines
+    )
+
+
+def test_templates_defaults_to_20_references(migrated_db):
+    for n in range(1, 20):
+        _ready_clip(n, wrapped_p2_document())
+    out, err = _templates()
+    assert json.loads(out) == {}
+    assert "rejected, fewer than 20 references" in err
+    _ready_clip(20, wrapped_p2_document())
+    out, err = _templates()
+    assert json.loads(out)[KEY]["references"] == 20
+    assert f"{KEY}: 20 ref(s), majority 20 (100.0%): kept" in err
+
+
+def test_templates_only_learns_from_genuine_ready_rows(migrated_db):
+    for n in range(1, 3):
+        _ready_clip(n, wrapped_p2_document())
+    templated = _ready_clip(3, _odd())
+    templated.plan = {**templated.plan, "technical_source": f"template:{KEY}"}
+    templated.save()
+    legacy = _ready_clip(4, wrapped_p2_document())
+    del legacy.plan["technical_source"]
+    legacy.save()
+    unexpected = _ready_clip(5, _odd())
+    unexpected.verdict = "unexpected"
+    unexpected.save()
+    _ready_clip(6, wrapped_p2_document(), video_codec=None)
+    out, err = _templates("--min-refs", "3", "--min-share", "1")
+    assert json.loads(out)[KEY]["references"] == 3
+    assert "no template key: 1" in err
+
+
+@pytest.mark.parametrize(
+    "args", [("--min-refs", "0"), ("--min-share", "0"), ("--min-share", "1.5")]
+)
+def test_templates_thresholds_must_be_sane(migrated_db, args):
+    with pytest.raises(CommandError, match=args[0]):
+        _templates(*args)
+
+
+@pytest.mark.parametrize(
+    "args", [("--out", "x.json"), ("--min-refs", "3"), ("--min-share", "0.9")]
+)
+def test_templates_options_are_refused_elsewhere(migrated_db, args):
+    with pytest.raises(CommandError, match=args[0]):
+        _run(_world(()), "report", *args)
+
+
+def test_report_counts_ready_rows_per_technical_source(migrated_db):
+    _row("VX-1", "ready", plan={"technical_source": "wrapped"})
+    _row("VX-2", "ready", plan={"technical_source": "wrapped"})
+    _row("VX-3", "ready", plan={"technical_source": f"template:{KEY}"})
+    _row("VX-4", "ready", plan={})
+    _row("VX-5", "already-migrated", plan={"technical_source": "existing"})
+    lines = _run(_world(()), "report").splitlines()
+    assert "technical source wrapped: 3" in lines
+    assert f"technical source template:{KEY}: 1" in lines
+    assert not any("existing" in line for line in lines)
