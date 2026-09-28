@@ -77,8 +77,18 @@ def test_item_status_is_none_when_an_online_original_is_not_archived():
     assert item_fields(originals)[fields.ARCHIVE_STATUS_FIELD] == ""
 
 
-def test_nothing_archived_writes_nothing_at_item_level():
-    assert item_fields([_original("V.MXF", on_disk=True, handle=None)]) == {}
+def test_nothing_archived_clears_the_item_archive_fields():
+    # The wrapped file's Default-Archive values must not stay on the item.
+    assert item_fields([_original("V.MXF", on_disk=True, handle=None)]) == {
+        fields.EXTERNAL_IDS_FIELD: "",
+        fields.BARCODES_FIELD: "",
+        fields.TAPE_LABELS_FIELD: "",
+        fields.TAPE_NAMES_FIELD: "",
+        fields.ARCHIVE_STATUS_FIELD: fields.STATUS_NONE,
+        fields.ARCHIVE_TS_FIELD: "",
+        fields.ARCHIVE_PLUGIN_FIELD: "",
+        fields.ARCHIVE_POLICY_FIELD: "",
+    }
 
 
 def test_archive_ts_is_utc():

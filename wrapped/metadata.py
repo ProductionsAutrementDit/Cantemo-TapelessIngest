@@ -56,7 +56,18 @@ def _item_status(originals: Sequence[Mapping]) -> str:
 def item_fields(originals: Sequence[Mapping]) -> Dict[str, str]:
     archived = [o for o in originals if o.get("entry")]
     if not archived:
-        return {}
+        # Spec rule 4: cleared, so the wrapped file's Default-Archive values
+        # are not left on the item.
+        return {
+            fields.EXTERNAL_IDS_FIELD: "",
+            fields.BARCODES_FIELD: "",
+            fields.TAPE_LABELS_FIELD: "",
+            fields.TAPE_NAMES_FIELD: "",
+            fields.ARCHIVE_STATUS_FIELD: fields.STATUS_NONE,
+            fields.ARCHIVE_TS_FIELD: "",
+            fields.ARCHIVE_PLUGIN_FIELD: "",
+            fields.ARCHIVE_POLICY_FIELD: "",
+        }
     tapes = [tape for o in archived for tape in o.get("tapes", [])]
     result = {
         fields.EXTERNAL_IDS_FIELD: ", ".join(
