@@ -10,6 +10,7 @@ from portal.plugins.TapelessIngest.wrapped.dryrun import RecordingGateway
 from portal.plugins.TapelessIngest.wrapped.executor import Executor, StepError
 from portal.plugins.TapelessIngest.wrapped.paths import to_absolute
 from portal.plugins.TapelessIngest.wrapped.planner import plan_item
+from portal.plugins.TapelessIngest.wrapped.verifier import verify_item
 from tests.wrapped_fakes import (
     FakeArchive,
     FakeDisk,
@@ -276,6 +277,17 @@ def test_an_extra_original_shape_since_plan_stops_before_posting(migrated_db):
     assert "post_shape" not in gateway.write_names()
     row.refresh_from_db()
     assert row.phase == "files_registered"
+
+
+def test_verification_compares_lowres_shapes_as_a_set(migrated_db):
+    gateway = InMemoryGateway()
+    gateway.shapes[ITEM] = [{"id": "VX-LOW2", "tag": ["lowres"]}]
+    row, disk = _setup(gateway)
+    assert row.rollback["lowres_shape_ids"] == ["VX-LOW2", "VX-LOW"]
+    Executor(gateway, disk).run(row)
+    gateway.shapes[ITEM].reverse()
+    assert gateway.shape_ids(ITEM, "lowres") == ["VX-LOW", "VX-LOW2"]
+    assert verify_item(row, gateway) == []
 
 
 def test_a_failed_verification_stops_before_done(migrated_db):

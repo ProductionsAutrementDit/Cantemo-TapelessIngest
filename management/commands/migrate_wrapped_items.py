@@ -161,7 +161,9 @@ class Command(BaseCommand):
                 executor.run(row)
             except Exception as error:  # noqa: BLE001 - isolate the item
                 failed += 1
-                row.error = f"{row.phase or 'start'}: {type(error).__name__}: {error}"
+                row.error = (
+                    f"after {row.phase or 'start'}: {type(error).__name__}: {error}"
+                )
                 if not dry:
                     row.save(update_fields=["error", "updated_on"])
                 self.stdout.write(f"{row.item_id}: FAILED {row.error}")

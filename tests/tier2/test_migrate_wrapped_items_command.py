@@ -101,6 +101,7 @@ def test_apply_isolates_a_failing_item(migrated_db):
     _run(world, "apply")
     rows = {r.item_id: r for r in WrappedMigration.objects.all()}
     assert rows["VX-1"].phase == "clip_updated" and "lowres" in rows["VX-1"].error
+    assert rows["VX-1"].error.startswith("after clip_updated: StepError: ")
     assert rows["VX-2"].phase == "done" and rows["VX-2"].error == ""
 
 

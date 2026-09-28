@@ -69,6 +69,18 @@ def test_audio_components_follow_stream_order_not_list_order():
     assert [c["file"][0]["id"] for c in document["audioComponent"]] == AUDIO_IDS
 
 
+def test_stream_order_is_numeric_even_when_vidispine_sends_strings():
+    wrapped = wrapped_p2_document(audio_count=11)
+    for body in wrapped["audioComponent"]:
+        body["essenceStreamId"] = str(body["essenceStreamId"])
+    wrapped["audioComponent"].reverse()
+    ids = [f"VX-A{n}" for n in range(11)]
+    document = _build(wrapped, audio_ids=ids)
+    assert [c["itemTrack"] for c in document["audioComponent"]] == [
+        f"A{n}" for n in range(1, 12)
+    ]
+
+
 def test_audio_count_mismatch_is_refused():
     wrapped = parse_shape(wrapped_p2_document(audio_count=1))
     assert "1 audio component(s) for 4 audio original(s)" in mismatch(wrapped, 4)

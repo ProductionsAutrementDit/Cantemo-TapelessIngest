@@ -32,7 +32,8 @@ def mismatch(wrapped: Shape, audio_count: int) -> Optional[str]:
 
 
 def _stream_order(component: Component):
-    return (component.body.get("essenceStreamId", 0), component.component_id)
+    # Vidispine may send the stream id as a string: "10" must sort after "2".
+    return (int(component.body.get("essenceStreamId", 0)), component.component_id)
 
 
 def _restate(component: Component, file_id: str, stream: bool) -> Dict[str, Any]:

@@ -32,7 +32,7 @@ def verify_item(row, gateway) -> List[str]:
         if written != original["entry"]["handle"]:
             problems.append(f"component {component.component_id} handle is {written!r}")
     lowres = gateway.shape_ids(row.item_id, fields.LOWRES_TAG)
-    if lowres != rollback.get("lowres_shape_ids", []):
+    if set(lowres) != set(rollback.get("lowres_shape_ids", [])):
         problems.append(f"lowres shapes {lowres} != {rollback.get('lowres_shape_ids')}")
     duration = gateway.item_fields(row.item_id, [fields.DURATION_FIELD])
     before = rollback.get("item_fields", {}).get(fields.DURATION_FIELD)
