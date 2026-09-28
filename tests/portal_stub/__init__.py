@@ -212,6 +212,28 @@ class VSFile:
         return self._get("path")
 
 
+class _StoredFileFake:
+    """``StorageHelper().getFileById(id)``'s answer — id + current state.
+
+    Separate from ``VSFile``, whose docstring deliberately omits
+    ``getState`` (the pinned code paths never call it there). This one
+    models the object ``getFileById`` returns, measured on prod
+    2026-09-28: ``.getState()`` answers ``ARCHIVED``, ``NOT_IMPORTED``,
+    ``LOST``; an unknown id raises ``NotFoundError`` ("Could not find
+    file.") before a ``_StoredFileFake`` is ever built.
+    """
+
+    def __init__(self, file_id, state):
+        self._file_id = file_id
+        self._state = state
+
+    def getId(self):
+        return self._file_id
+
+    def getState(self):
+        return self._state
+
+
 class FakeStorageMethod:
     """One storage-access method on a FakeStorage (browse flag + URI)."""
 
@@ -302,12 +324,14 @@ class StorageHelperFake:
       recorded in ``get_files_in_storage_calls`` — the counter story
       2.5's "zero Vidispine calls for an already-ingested clip" rests on.
 
-    Only ``getStorage`` and ``storageapi.getFilesInStorage`` are
-    implemented — any other method access still raises AttributeError,
-    keeping tests off-server honest. The conftest autouse fixture resets
-    the class state after every test. The story-1.3 pins bypass this fake
-    entirely (preset ``_root_path``, ``context=None`` -> property fallback
-    never reaches a StorageHelper).
+    Only ``getStorage``, ``storageapi.getFilesInStorage``,
+    ``getFileByPath``, ``notifyStorageOfFile``, ``createFileEntity``,
+    ``removeFileFromStorage`` and ``getFileById`` are implemented — any
+    other method access still raises AttributeError, keeping tests
+    off-server honest. The conftest autouse fixture resets the class
+    state after every test. The story-1.3 pins bypass this fake entirely
+    (preset ``_root_path``, ``context=None`` -> property fallback never
+    reaches a StorageHelper).
     """
 
     roots = {}
@@ -320,6 +344,13 @@ class StorageHelperFake:
     # around getFilesInStorage.
     hash_errors = set()
     get_files_in_storage_calls = []
+    # (storage_id, relative path) -> file id; getFileByPath answers from it,
+    # notifyStorageOfFile / createFileEntity mint into it.
+    files = {}
+    minted = 0
+    # file id -> Vidispine state; getFileById answers from it (NotFoundError
+    # for an unknown id).
+    file_states = {}
 
     def __init__(self, slug=None, user=None, runas=None):
         self.slug = slug
@@ -350,6 +381,21 @@ class StorageHelperFake:
         cls.hash_errors.add((storage_id, file_hash))
 
     @classmethod
+    def set_file(cls, storage_id, path, file_id):
+        cls.files[(storage_id, path)] = file_id
+
+    @classmethod
+    def _mint(cls, storage_id, path):
+        cls.minted += 1
+        file_id = f"VX-STUB-FILE-{cls.minted}"
+        cls.files[(storage_id, path)] = file_id
+        return file_id
+
+    @classmethod
+    def set_file_state(cls, file_id, state):
+        cls.file_states[file_id] = state
+
+    @classmethod
     def reset(cls):
         cls.roots.clear()
         cls.no_browse.clear()
@@ -358,6 +404,9 @@ class StorageHelperFake:
         cls.hash_items.clear()
         cls.hash_errors.clear()
         cls.get_files_in_storage_calls.clear()
+        cls.files.clear()
+        cls.minted = 0
+        cls.file_states.clear()
 
     def removeFileItemRelationship(self, storage_id, file_id):
         """Detach a file from its item (the replace path's first half)."""
@@ -383,6 +432,58 @@ class StorageHelperFake:
             f"set_missing (silent success would hide unintended storage "
             f"traffic)"
         )
+
+    def getFileByPath(self, storage_id, path):
+        file_id = type(self).files.get((storage_id, path))
+        if file_id is None:
+            raise NotFoundError(f"no file {path!r} on {storage_id} (unconfigured)")
+        return VSFile(
+            {
+                "id": file_id,
+                "path": path,
+                "storage": storage_id,
+                "hash": None,
+                "size": 0,
+            }
+        )
+
+    def notifyStorageOfFile(self, storage_id, filepath, state="CLOSED"):
+        file_id = type(self)._mint(storage_id, filepath)
+        VidispineFake.record(
+            "notifyStorageOfFile",
+            storage_id=storage_id,
+            path=filepath,
+            state=state,
+            file_id=file_id,
+        )
+        return file_id
+
+    def createFileEntity(
+        self, storageId, filepath, createOnly=True, state="OPEN", return_format="json"
+    ):
+        file_id = type(self)._mint(storageId, filepath)
+        VidispineFake.record(
+            "createFileEntity",
+            storage_id=storageId,
+            path=filepath,
+            state=state,
+            create_only=createOnly,
+            file_id=file_id,
+        )
+        return {"id": file_id}
+
+    def removeFileFromStorage(
+        self, storage_id, file_id, item_id=None, priority_of_job=None
+    ):
+        VidispineFake.record(
+            "removeFileFromStorage", storage_id=storage_id, file_id=file_id
+        )
+
+    def getFileById(self, file_id):
+        cls = type(self)
+        if file_id not in cls.file_states:
+            raise NotFoundError(f"Could not find file. (file {file_id!r} unconfigured)")
+        return _StoredFileFake(file_id, cls.file_states[file_id])
 
 
 class InjectedVidispineFault(Exception):
@@ -1152,6 +1253,19 @@ class VidispineFake:
             return f"VX-PLACEHOLDER-{cls._placeholder_counter}"
 
 
+def update_or_create_item_metadata_fake(
+    item_id, field_name, value, field_type="string-exact", ith=None
+):
+    """portal.metadata.utils.update_or_create_item_metadata — recorded only."""
+    VidispineFake.record(
+        "update_or_create_item_metadata",
+        item_id=item_id,
+        field_name=field_name,
+        value=value,
+        field_type=field_type,
+    )
+
+
 class FakeItem:
     """VS item: only the two accessors the plugin calls."""
 
@@ -1283,10 +1397,23 @@ class RestTransportFake:
     """
 
     calls = []
+    routes = []
 
     @classmethod
     def reset(cls):
         cls.calls.clear()
+        cls.routes.clear()
+
+    @classmethod
+    def route(cls, method, pattern, responder):
+        """Answer ``method`` on URLs whose PATH fully matches ``pattern``.
+
+        ``responder(match, query)`` returns what Vidispine would (JSON-able),
+        or None for an empty body. Routes are per test (reset clears them)
+        and are consulted BEFORE the built-in ones, whose shape-listing
+        regex would otherwise swallow every ``/item/{id}/shape...`` URL.
+        """
+        cls.routes.append((method, re.compile(pattern), responder))
 
     @classmethod
     def prepare(
@@ -1331,6 +1458,19 @@ class RestTransportFake:
         cls.calls.append(url)
         path = urlsplit(url or "").path
         query = parse_qs(urlsplit(url or "").query)
+
+        for route_method, pattern, responder in cls.routes:
+            routed = pattern.fullmatch(path)
+            if routed and (method or "GET") == route_method:
+                VidispineFake.record(
+                    "rest",
+                    method=route_method,
+                    path=path,
+                    query=query,
+                    body=json.loads(body) if body else None,
+                )
+                answer = responder(routed, query)
+                return json.dumps(answer) if answer is not None else ""
 
         create = re.search(r"/item/([^/?]+)/shape/create$", path)
         if create:
@@ -1507,6 +1647,16 @@ class ItemHelperFake(_HelperFake):
             "setItemMetadataFieldGroup", item_id=item_id, group=group_name
         )
         VidispineFake.fault_point("setItemMetadataFieldGroup")
+
+    def setComponentMetadata(self, item_id, shape_id, component_id, key, value, *args):
+        VidispineFake.record(
+            "setComponentMetadata",
+            item_id=item_id,
+            shape_id=shape_id,
+            component_id=component_id,
+            key=key,
+            value=value,
+        )
 
 
 class IngestHelperFake(_HelperFake):
@@ -1830,6 +1980,10 @@ _MODULES = {
     },
     "portal.items": {},
     "portal.items.cache": {"invalidate_item_cache": invalidate_item_cache_fake},
+    "portal.metadata": {},
+    "portal.metadata.utils": {
+        "update_or_create_item_metadata": update_or_create_item_metadata_fake
+    },
     "portal.utils": {},
     "portal.utils.templatetags": {},
     "portal.utils.templatetags.vidispinetags": {
