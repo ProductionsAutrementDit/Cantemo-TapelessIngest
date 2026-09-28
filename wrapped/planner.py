@@ -30,6 +30,8 @@ from portal.plugins.TapelessIngest.wrapped.templates import (
 _NO_METADATA: Mapping[str, Any] = MappingProxyType({})
 PROXY_COPY = "proxy-copied technical description"
 PROXY_COPY_INCOMPLETE = f"{PROXY_COPY}; P2 metadata incomplete for a template"
+# durationSeconds is written with millisecond precision or better.
+DURATION_TOLERANCE_S = 0.0005
 
 ROLLBACK_ITEM_FIELDS = (
     fields.DURATION_FIELD,
@@ -140,6 +142,29 @@ def _locate(
     }
 
 
+def _duration_problem(
+    item_id: str, gateway: Gateway, clip_timing: Mapping[str, int]
+) -> Optional[str]:
+    """Before any write: the P2 duration must be the item's current
+    durationSeconds (the proxy analysis), which apply leaves unchanged and
+    verify re-checks. A disagreement means the ClipMetadata does not
+    describe this item's essence."""
+    values = gateway.item_fields(item_id, [fields.DURATION_FIELD]).get(
+        fields.DURATION_FIELD
+    )
+    if not values:
+        return f"{PROXY_COPY}; no durationSeconds to cross-check"
+    current = values[0]
+    p2 = clip_timing["frames"] * clip_timing["num"] / clip_timing["den"]
+    try:
+        agrees = abs(float(current) - p2) <= DURATION_TOLERANCE_S
+    except ValueError:
+        return f"{PROXY_COPY}; durationSeconds {current!r} is not a number"
+    if not agrees:
+        return f"{PROXY_COPY}; P2 duration {p2:.3f} s != durationSeconds {current}"
+    return None
+
+
 def plan_item(
     *,
     item_id: str,
@@ -184,6 +209,10 @@ def plan_item(
     technical = _technical_source(shape, originals, clip_metadata, templates)
     if "problem" in technical:
         return PlanResult(verdicts.UNEXPECTED, technical["problem"])
+    if "timing" in technical:
+        problem = _duration_problem(item_id, gateway, technical["timing"])
+        if problem:
+            return PlanResult(verdicts.UNEXPECTED, problem)
 
     located = [_locate(o, gateway, archive, disk, None) for o in originals]
     missing = [o["relative"] for o in located if not o["on_disk"] and not o["entry"]]

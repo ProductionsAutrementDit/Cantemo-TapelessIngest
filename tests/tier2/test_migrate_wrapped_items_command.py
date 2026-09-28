@@ -27,13 +27,15 @@ from tests.wrapped_fakes import (
 LEGACY = "/Volumes/ActiveMedia/AA - RUSHES TAPELESS/"
 
 
-def _world(items=("VX-1",), storage="VX-2", documents=None, metadata=None):
+def _world(
+    items=("VX-1",), storage="VX-2", documents=None, metadata=None, duration="8.72"
+):
     gateway, archive = InMemoryGateway(), FakeArchive()
     for n, item_id in enumerate(items):
         document = (documents or {}).get(item_id) or wrapped_p2_document(
             storage=storage
         )
-        seed_item(gateway, item_id, document)
+        seed_item(gateway, item_id, document, duration=duration)
         clip = Clip.objects.create(
             umid=f"U{n}",
             path="2016/AH_TEST",
@@ -300,6 +302,7 @@ def _proxy_world(items=("VX-1",)):
         items,
         documents={i: proxy_copy_document() for i in items},
         metadata={i: p2_clip_metadata() for i in items},
+        duration="19.88",
     )
 
 
@@ -326,6 +329,7 @@ def test_plan_reads_each_clips_own_metadata(migrated_db):
         ("VX-1", "VX-2"),
         documents={i: proxy_copy_document() for i in ("VX-1", "VX-2")},
         metadata={"VX-1": p2_clip_metadata(), "VX-2": {"video_codec": "X"}},
+        duration="19.88",
     )
     _run(world, "plan", templates={KEY: {"template": p2_template()}})
     verdicts = dict(WrappedMigration.objects.values_list("item_id", "verdict"))

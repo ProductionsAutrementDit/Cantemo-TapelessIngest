@@ -20,9 +20,9 @@ ITEM = "VX-35313"
 OUTPUT = "/Volumes/ActiveMedia/CANTEMO_FILES/060A2B34.MXF"
 
 
-def _world(document=None, archived=True, on_disk=()):
+def _world(document=None, archived=True, on_disk=(), duration="8.72"):
     gateway = InMemoryGateway()
-    seed_item(gateway, ITEM, document or wrapped_p2_document())
+    seed_item(gateway, ITEM, document or wrapped_p2_document(), duration=duration)
     gateway.component_md[(ITEM, "VX-SW", "VX-SW-C")] = {
         "portal_archive_external_id": "Default-Archive#OLD"
     }
@@ -221,8 +221,16 @@ TEMPLATES = {
 }
 
 
-def _proxy_plan(templates=TEMPLATES, **metadata):
-    world = _world(proxy_copy_document())
+# 497 frames at 1/25: the item's durationSeconds agrees with the P2 metadata
+P2_SECONDS = "19.88"
+
+
+def _proxy_world(duration=P2_SECONDS):
+    return _world(proxy_copy_document(), duration=duration)
+
+
+def _proxy_plan(templates=TEMPLATES, world=None, **metadata):
+    world = world or _proxy_world()
     return _plan(
         *world,
         clip_metadata=p2_clip_metadata(**metadata),
@@ -283,13 +291,13 @@ def test_a_proxy_copy_with_a_malformed_timecode_is_unexpected():
 
 
 def test_a_proxy_copy_is_unexpected_without_any_metadata_or_template():
-    result = _plan(*_world(proxy_copy_document()))
+    result = _plan(*_proxy_world())
     assert result.verdict == verdicts.UNEXPECTED
     assert "P2 metadata incomplete" in result.reason
 
 
 def test_a_proxy_copy_still_checks_the_attached_file_first():
-    world = _world(proxy_copy_document())
+    world = _proxy_world()
     result = _plan(
         *world,
         output_file="/mnt/ActiveMedia/CANTEMO_FILES/OTHER.MXF",
@@ -301,7 +309,7 @@ def test_a_proxy_copy_still_checks_the_attached_file_first():
 
 
 def test_a_proxy_copy_still_refuses_missing_originals():
-    gateway, fake, disk, originals = _world(proxy_copy_document())
+    gateway, fake, disk, originals = _proxy_world()
     del fake.entries[to_absolute(originals[3].relative)]
     result = _plan(
         gateway,
@@ -315,7 +323,7 @@ def test_a_proxy_copy_still_refuses_missing_originals():
 
 
 def test_a_proxy_copy_still_refuses_a_stale_vx41_entity():
-    gateway, fake, disk, originals = _world(proxy_copy_document())
+    gateway, fake, disk, originals = _proxy_world()
     gateway.files[("VX-41", originals[2].relative)] = "VX-STALE"
     gateway.file_states[("VX-41", "VX-STALE")] = "LOST"
     result = _plan(
@@ -349,3 +357,42 @@ def test_an_already_migrated_item_keeps_its_existing_description():
     gateway.shapes[ITEM] = [_migrated_shape(originals)]
     result = _plan(gateway, fake, disk, originals)
     assert result.plan["technical_source"] == "existing"
+
+
+def test_a_p2_duration_disagreeing_with_durationseconds_is_unexpected():
+    result = _proxy_plan(world=_proxy_world(duration="8.72"))
+    assert result.verdict == verdicts.UNEXPECTED
+    assert result.reason == (
+        "proxy-copied technical description; P2 duration 19.880 s "
+        "!= durationSeconds 8.72"
+    )
+    assert result.plan == {}
+
+
+def test_the_duration_cross_check_tolerates_half_a_millisecond():
+    assert _proxy_plan(world=_proxy_world("19.8804")).verdict == verdicts.READY
+    assert _proxy_plan(world=_proxy_world("19.8806")).verdict == (verdicts.UNEXPECTED)
+
+
+def test_a_proxy_copy_without_durationseconds_is_unexpected():
+    world = _proxy_world()
+    del world[0].items[ITEM]["durationSeconds"]
+    result = _proxy_plan(world=world)
+    assert result.verdict == verdicts.UNEXPECTED
+    assert result.reason == (
+        "proxy-copied technical description; no durationSeconds to cross-check"
+    )
+
+
+def test_a_genuine_wrapped_shape_is_not_duration_checked():
+    # wrapped_p2_document says 218 frames, the item 8.72 s, P2 497 frames
+    result = _plan(*_world(), clip_metadata=p2_clip_metadata(), templates=TEMPLATES)
+    assert result.verdict == verdicts.READY
+
+
+def test_a_durationseconds_that_is_not_a_number_is_unexpected():
+    result = _proxy_plan(world=_proxy_world(duration="n/a"))
+    assert result.verdict == verdicts.UNEXPECTED
+    assert result.reason == (
+        "proxy-copied technical description; durationSeconds 'n/a' is not a number"
+    )

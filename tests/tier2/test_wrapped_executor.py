@@ -56,10 +56,19 @@ class CrashingGateway(InMemoryGateway):
 
 
 def _setup(
-    gateway, storage="VX-2", state="ARCHIVED", on_disk=False, document=None, **extra
+    gateway,
+    storage="VX-2",
+    state="ARCHIVED",
+    on_disk=False,
+    document=None,
+    duration="8.72",
+    **extra,
 ):
     seed_item(
-        gateway, ITEM, document or wrapped_p2_document(storage=storage, state=state)
+        gateway,
+        ITEM,
+        document or wrapped_p2_document(storage=storage, state=state),
+        duration=duration,
     )
     originals = p2_originals()
     fake = FakeArchive()
@@ -450,6 +459,7 @@ def test_a_proxy_copied_item_is_posted_from_its_template(migrated_db):
     row, disk = _setup(
         gateway,
         document=proxy_copy_document(),
+        duration="19.88",
         clip_metadata=p2_clip_metadata(),
         templates={key: {"template": p2_template()}},
     )
