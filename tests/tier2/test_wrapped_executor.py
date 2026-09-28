@@ -267,6 +267,17 @@ def test_an_unarchived_original_gone_from_disk_since_plan_stops_the_row(
     assert row.phase == ""
 
 
+def test_an_extra_original_shape_since_plan_stops_before_posting(migrated_db):
+    gateway = InMemoryGateway()
+    row, disk = _setup(gateway)
+    gateway.shapes[ITEM].append(wrapped_p2_document(shape_id="VX-SX"))
+    with pytest.raises(StepError, match=r"\['VX-SW', 'VX-SX'\]"):
+        Executor(gateway, disk).run(row)
+    assert "post_shape" not in gateway.write_names()
+    row.refresh_from_db()
+    assert row.phase == "files_registered"
+
+
 def test_a_failed_verification_stops_before_done(migrated_db):
     gateway = InMemoryGateway()
     row, disk = _setup(gateway)

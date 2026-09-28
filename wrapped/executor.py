@@ -127,10 +127,19 @@ class Executor:
 
     def _post_shape(self, row) -> None:
         wanted = frozenset(o["file_id"] for o in row.plan["originals"])
-        for shape in self.gateway.original_shapes(row.item_id):
+        live = self.gateway.original_shapes(row.item_id)
+        for shape in live:
             if shape.file_ids() == wanted:
                 row.plan["new_shape_id"] = shape.shape_id
                 return
+        # shape/create ADDS a shape: never POST onto an item whose originals
+        # are no longer exactly the planned wrapped shape.
+        live_ids = [s.shape_id for s in live]
+        if live_ids != [row.plan["wrapped_shape_id"]]:
+            raise StepError(
+                f"original shapes are {live_ids}, expected only the wrapped "
+                f"{row.plan['wrapped_shape_id']}"
+            )
         document = build_document(
             parse_shape(row.plan["wrapped_shape"]),
             self._file_ids(row, "video")[0],
