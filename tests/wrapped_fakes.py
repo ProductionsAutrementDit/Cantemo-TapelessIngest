@@ -235,3 +235,81 @@ def seed_item(gateway, item_id, document, lowres=("VX-LOW",), duration="8.72"):
     for shape_id in lowres:
         gateway.shapes[item_id].append({"id": shape_id, "tag": ["lowres"]})
     gateway.items.setdefault(item_id, {})["durationSeconds"] = [duration]
+
+
+def proxy_copy_document(
+    shape_id="VX-SW",
+    file_id="VX-W1",
+    storage="VX-2",
+    state="ARCHIVED",
+    name="060A2B34.MXF",
+):
+    """An original shape that names the wrapped MXF but whose technical
+    description is a copy of the lowres proxy (measured: VX-10019)."""
+    wrapped = {"id": file_id, "storage": storage, "state": state, "path": name}
+    duration = {"samples": 39, "timeBase": {"numerator": 1, "denominator": 25}}
+    return {
+        "id": shape_id,
+        "tag": ["original"],
+        "mimeType": ["video/mp4"],
+        "containerComponent": {
+            "id": f"{shape_id}-C",
+            "file": [dict(wrapped)],
+            "format": "mov,mp4,m4a,3gp,3g2,mj2",
+            "duration": duration,
+        },
+        "videoComponent": [
+            {
+                "id": f"{shape_id}-V",
+                "file": [dict(wrapped)],
+                "codec": "h264",
+                "resolution": {"width": 480, "height": 272},
+                "duration": duration,
+                "essenceStreamId": 0,
+            }
+        ],
+        "audioComponent": [
+            {
+                "id": f"{shape_id}-A0",
+                "file": [dict(wrapped)],
+                "codec": "aac",
+                "channelCount": 2,
+                "duration": duration,
+                "essenceStreamId": 1,
+            }
+        ],
+    }
+
+
+def p2_clip_metadata(**overrides):
+    """ClipMetadata of an AVC-Intra 100 1080/50i clip (measured: VX-35313)."""
+    metadata = {
+        "video_codec": "AVC-I_1080/50i",
+        "framerate": "50i",
+        "EditUnit": "1/25",
+        "duration": "497",
+        "timecode_start": "18:25:04:12",
+        # ~114 Mb/s over 19.88 s
+        "data_size": str(114_000_000 * 1988 // 800),
+    }
+    metadata.update(overrides)
+    return {k: v for k, v in metadata.items() if v is not None}
+
+
+def p2_template(audio_codec="pcm_s24le"):
+    """A stripped template as ``p2_templates.json`` stores it."""
+    return {
+        "mimeType": ["application/mxf"],
+        "containerComponent": {"format": "mxf_d10", "bitrate": 114000000},
+        "videoComponent": [
+            {
+                "codec": "h264",
+                "resolution": {"width": 1920, "height": 1080},
+                "pixelFormat": "yuv422p10le",
+                "fieldOrder": "tt",
+            }
+        ],
+        "audioComponent": [
+            {"codec": audio_codec, "channelCount": 1, "sampleFormat": "s32"}
+        ],
+    }
