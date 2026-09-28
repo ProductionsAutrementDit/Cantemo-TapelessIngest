@@ -97,6 +97,17 @@ class Executor:
 
     # phases
     def _register_files(self, row) -> None:
+        # Plan-time on_disk can be stale. Re-probed before ANY write: an
+        # archived original gone since plan is registered ARCHIVED (no
+        # sha1); an unarchived one stops the row untouched.
+        for original in row.plan["originals"]:
+            if original["on_disk"] and not self.disk.exists(original["relative"]):
+                if not original["entry"]:
+                    raise StepError(
+                        f"on-disk original {original['relative']} disappeared "
+                        f"since plan and is not in P5"
+                    )
+                original["on_disk"] = False
         for original in row.plan["originals"]:
             if original["file_id"]:
                 continue

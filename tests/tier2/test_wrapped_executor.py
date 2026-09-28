@@ -7,7 +7,7 @@ from portal.plugins.TapelessIngest.models.wrapped_migration import WrappedMigrat
 from portal.plugins.TapelessIngest.wrapped import fields
 from portal.plugins.TapelessIngest.wrapped.archive import CachedArchive
 from portal.plugins.TapelessIngest.wrapped.dryrun import RecordingGateway
-from portal.plugins.TapelessIngest.wrapped.executor import Executor
+from portal.plugins.TapelessIngest.wrapped.executor import Executor, StepError
 from portal.plugins.TapelessIngest.wrapped.paths import to_absolute
 from portal.plugins.TapelessIngest.wrapped.planner import plan_item
 from tests.wrapped_fakes import (
@@ -229,6 +229,42 @@ def test_on_disk_originals_get_a_sha1(migrated_db):
     )
     assert written[fields.SHA1_FIELD] == disk.sha1(row.plan["originals"][0]["relative"])
     assert [w[3] for w in gateway.writes if w[0] == "register_file"] == [False] * 5
+
+
+def test_an_archived_original_gone_from_disk_since_plan_is_registered_archived(
+    migrated_db,
+):
+    gateway = InMemoryGateway()
+    row, disk = _setup(gateway, on_disk=True)
+    gone = row.plan["originals"][2]["relative"]
+    del disk.contents[gone]
+    Executor(gateway, disk).run(row)
+    row.refresh_from_db()
+    assert row.phase == "done"
+    registered = {w[2]: w[3] for w in gateway.writes if w[0] == "register_file"}
+    assert registered[gone] is True
+    assert [a for rel, a in registered.items() if rel != gone] == [False] * 4
+    assert row.plan["originals"][2]["on_disk"] is False
+    assert "sha1" not in row.plan["originals"][2]
+
+
+def test_an_unarchived_original_gone_from_disk_since_plan_stops_the_row(
+    migrated_db,
+):
+    gateway = InMemoryGateway()
+    row, disk = _setup(gateway, on_disk=True)
+    row.plan["originals"][2]["entry"] = None
+    row.save()
+    gone = row.plan["originals"][2]["relative"]
+    del disk.contents[gone]
+    with pytest.raises(
+        StepError,
+        match=f"on-disk original {gone} disappeared since plan and is not in P5",
+    ):
+        Executor(gateway, disk).run(row)
+    assert gateway.writes == []
+    row.refresh_from_db()
+    assert row.phase == ""
 
 
 def test_a_failed_verification_stops_before_done(migrated_db):
