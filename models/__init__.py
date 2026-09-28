@@ -16,3 +16,8 @@
 # This mirrors how the sibling collection_to_folder_mapper plugin wires its
 # own listener, from its models/__init__.py.
 from portal.plugins.TapelessIngest import plistner  # noqa: F401
+
+# The wrapped-items migration's state table (spec-wrapped-items-migration-p2).
+from portal.plugins.TapelessIngest.models.wrapped_migration import (  # noqa: F401
+    WrappedMigration,
+)
