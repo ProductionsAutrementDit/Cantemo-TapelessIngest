@@ -3,6 +3,8 @@
 Reads stay coherent with the recorded writes (a posted shape is listed,
 a re-tagged one disappears from the originals), so a dry run walks the
 same phases a real run would and prints every write it would make.
+Every Gateway method is defined here explicitly: there is no attribute
+fallback that could let an unlisted write through to the real gateway.
 """
 
 import copy
@@ -44,8 +46,14 @@ class RecordingGateway:
             return None
         return self._inner.file_state(storage_id, file_id)
 
-    def __getattr__(self, name):
-        return getattr(self._inner, name)
+    def shape_ids(self, item_id, tag):
+        return self._inner.shape_ids(item_id, tag)
+
+    def component_metadata(self, item_id, shape_id, component_id):
+        return self._inner.component_metadata(item_id, shape_id, component_id)
+
+    def item_fields(self, item_id, names):
+        return self._inner.item_fields(item_id, names)
 
     # writes
     def register_file(self, storage_id, relative, archived):

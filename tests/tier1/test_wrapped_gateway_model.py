@@ -1,6 +1,7 @@
 """Tier 1: Vidispine shape JSON <-> the migration's value objects."""
 
-from portal.plugins.TapelessIngest.wrapped.gateway import parse_shape
+from portal.plugins.TapelessIngest.wrapped.dryrun import RecordingGateway
+from portal.plugins.TapelessIngest.wrapped.gateway import Gateway, parse_shape
 from tests.wrapped_fakes import InMemoryGateway, seed_item, wrapped_p2_document
 
 
@@ -47,3 +48,16 @@ def test_the_fake_gateway_posts_and_retags_like_vidispine():
     (posted,) = gateway.original_shapes("VX-1")
     (file,) = posted.files().values()
     assert (file.file_id, file.path) == ("VX-F9", "2016/X/V.MXF")
+
+
+def test_the_recording_gateway_defines_every_gateway_method_itself():
+    # No attribute fallback: a write added to the Protocol but not to the
+    # dry run would otherwise reach the real Vidispine.
+    wanted = {
+        name
+        for name, member in vars(Gateway).items()
+        if callable(member) and not name.startswith("_")
+    }
+    assert wanted  # the Protocol really was inspected
+    assert wanted - set(vars(RecordingGateway)) == set()
+    assert "__getattr__" not in vars(RecordingGateway)
