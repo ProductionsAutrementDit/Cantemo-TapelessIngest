@@ -145,3 +145,58 @@ def test_apply_delete_online_wrapped_deletes_it(migrated_db):
     _run(world, "plan")
     _run(world, "apply", "--item", "VX-1", "--delete-online-wrapped")
     assert world[0].writes[-1] == ("delete_file", "VX-26", "VX-W1")
+
+
+def _row(item_id, verdict, reason="", **extra):
+    return WrappedMigration.objects.create(
+        item_id=item_id,
+        clip_umid=f"U-{item_id}",
+        verdict=verdict,
+        reason=reason,
+        **extra,
+    )
+
+
+def test_report_explains_every_verdict_that_is_not_acted_on(migrated_db):
+    for n in range(3):
+        _row(f"VX-U{n}", "unexpected", "2 original shapes")
+    _row("VX-U9", "unexpected", "x" * 200)
+    for n in range(12):
+        _row(f"VX-M{n}", "originals-missing", f"neither on disk nor in P5: F{n}")
+    _row("VX-M99", "originals-missing", "neither on disk nor in P5: F0")
+    _row("VX-R1", "ready", "should not be listed")
+    _row("VX-D1", "ready", phase="done", plan={"wrapped_kept": True})
+    _row("VX-D2", "ready", phase="done", plan={"wrapped_kept": True})
+    _row("VX-D3", "ready", phase="done", plan={})
+    lines = _run(_world(()), "report").splitlines()
+
+    at = lines.index("unexpected reasons:")
+    assert lines[at + 1 : at + 3] == ["  3  2 original shapes", "  1  " + "x" * 120]
+    at = lines.index("originals-missing reasons:")
+    listed = lines[at + 1 : at + 11]
+    assert listed[0] == "  2  neither on disk nor in P5: F0"
+    assert len(listed) == 10 and all(line.startswith("  1  ") for line in listed[1:])
+    assert not lines[at + 11].startswith("  ")
+    assert "ready reasons:" not in lines
+    assert "should not be listed" not in "\n".join(lines)
+    assert "wrapped kept: 2" in lines
+
+
+def test_report_verdict_lists_the_items_and_their_reasons(migrated_db):
+    _row("VX-3", "unexpected", "third")
+    _row("VX-1", "unexpected", "first")
+    _row("VX-2", "spanned", "spanned P2 clip")
+    out = _run(_world(()), "report", "--verdict", "unexpected")
+    assert out.splitlines() == ["VX-1: first", "VX-3: third"]
+    out = _run(_world(()), "report", "--verdict", "unexpected", "--limit", "1")
+    assert out.splitlines() == ["VX-1: first"]
+
+
+def test_report_verdict_must_name_a_verdict(migrated_db):
+    with pytest.raises(CommandError, match="--verdict"):
+        _run(_world(()), "report", "--verdict", "nope")
+
+
+def test_verdict_is_refused_outside_report(migrated_db):
+    with pytest.raises(CommandError, match="--verdict"):
+        _run(_world(()), "verify", "--verdict", "unexpected")

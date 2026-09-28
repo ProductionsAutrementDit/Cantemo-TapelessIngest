@@ -5,7 +5,8 @@ Spec: _bmad-output/implementation-artifacts/spec-wrapped-items-migration-p2.md
   plan    read-only; one WrappedMigration row per item, with its verdict
   apply   ready / already-migrated rows, one resumable phase at a time
   verify  re-checks every finished row
-  report  counts per verdict/phase, and the errors
+  report  counts per verdict/phase, why items are not acted on, and the
+          errors; ``--verdict V`` lists each item of that verdict instead
 
 Never interactive. A row whose phase is non-empty is frozen against plan.
 """
@@ -32,6 +33,9 @@ from portal.plugins.TapelessIngest.wrapped.resolver import (
 )
 from portal.plugins.TapelessIngest.wrapped.verifier import verify_item
 
+_REASON_WIDTH = 120
+_TOP_REASONS = 10
+
 
 def _vidispine_gateway():
     # Imported lazily: it is the only module that needs a live Portal.
@@ -54,6 +58,11 @@ class Command(BaseCommand):
         parser.add_argument("--limit", type=int)
         parser.add_argument("--dryrun", action="store_true")
         parser.add_argument(
+            "--verdict",
+            choices=verdicts.ALL,
+            help="report: list 'item_id: reason' for the rows of this verdict",
+        )
+        parser.add_argument(
             "--delete-online-wrapped",
             dest="delete_online_wrapped",
             action="store_true",
@@ -66,6 +75,8 @@ class Command(BaseCommand):
             raise CommandError("--limit must be a positive integer")
         if options["dryrun"] and options["action"] != "apply":
             raise CommandError("--dryrun only applies to 'apply'")
+        if options["verdict"] and options["action"] != "report":
+            raise CommandError("--verdict only applies to 'report'")
         getattr(self, f"_{options['action']}")(options)
 
     def _rows(self, options):
@@ -176,8 +187,35 @@ class Command(BaseCommand):
 
     def _report(self, options):
         rows = self._rows(options)
+        if options["verdict"]:
+            listed = rows.filter(verdict=options["verdict"])
+            if options["limit"]:
+                listed = listed[: options["limit"]]
+            for item_id, reason in listed.values_list("item_id", "reason"):
+                self.stdout.write(f"{item_id}: {reason}")
+            return
         counts = Counter((r.verdict, r.phase or "-") for r in rows)
         for (verdict, phase), count in sorted(counts.items()):
             self.stdout.write(f"{verdict}/{phase}: {count}")
+        for verdict in verdicts.ALL:
+            if verdict in verdicts.WRITABLE:
+                continue
+            reasons = Counter(
+                reason[:_REASON_WIDTH]
+                for reason in rows.filter(verdict=verdict).values_list(
+                    "reason", flat=True
+                )
+            )
+            if not reasons:
+                continue
+            self.stdout.write(f"{verdict} reasons:")
+            for reason, count in reasons.most_common(_TOP_REASONS):
+                self.stdout.write(f"  {count}  {reason}")
+        kept = sum(
+            1
+            for plan in rows.values_list("plan", flat=True)
+            if plan.get("wrapped_kept")
+        )
+        self.stdout.write(f"wrapped kept: {kept}")
         for row in rows.exclude(error="")[:50]:
             self.stdout.write(f"ERROR {row.item_id}: {row.error}")
