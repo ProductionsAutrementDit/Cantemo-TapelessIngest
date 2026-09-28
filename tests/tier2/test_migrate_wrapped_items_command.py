@@ -98,7 +98,7 @@ def test_apply_isolates_a_failing_item(migrated_db):
     world = _world(("VX-1", "VX-2"))
     _run(world, "plan")
     world[0].shapes["VX-1"].append({"id": "VX-EXTRA-LOW", "tag": ["lowres"]})
-    _run(world, "apply")
+    _run(world, "apply", "--all")
     rows = {r.item_id: r for r in WrappedMigration.objects.all()}
     assert rows["VX-1"].phase == "clip_updated" and "lowres" in rows["VX-1"].error
     assert rows["VX-1"].error.startswith("after clip_updated: StepError: ")
@@ -108,7 +108,7 @@ def test_apply_isolates_a_failing_item(migrated_db):
 def test_apply_dryrun_prints_writes_and_changes_nothing(migrated_db):
     world = _world()
     _run(world, "plan")
-    out = _run(world, "apply", "--dryrun")
+    out = _run(world, "apply", "--all", "--dryrun")
     assert "post_shape" in out and "retag_shape" in out
     assert world[0].writes == []
     assert WrappedMigration.objects.get(item_id="VX-1").phase == ""
@@ -117,7 +117,7 @@ def test_apply_dryrun_prints_writes_and_changes_nothing(migrated_db):
 def test_apply_dryrun_lists_the_clip_update(migrated_db):
     world = _world()
     _run(world, "plan")
-    out = _run(world, "apply", "--dryrun")
+    out = _run(world, "apply", "--all", "--dryrun")
     assert "clip_update" in out and "VX-1" in out
     clip = Clip.objects.get(item_id="VX-1")
     assert clip.output_file == "/mnt/ActiveMedia/CANTEMO_FILES/060A2B34.MXF"
@@ -201,3 +201,51 @@ def test_report_verdict_must_name_a_verdict(migrated_db):
 def test_verdict_is_refused_outside_report(migrated_db):
     with pytest.raises(CommandError, match="--verdict"):
         _run(_world(()), "verify", "--verdict", "unexpected")
+
+
+@pytest.mark.parametrize("extra", [(), ("--dryrun",)])
+def test_bare_apply_is_refused_without_all(migrated_db, extra):
+    world = _world()
+    _run(world, "plan")
+    with pytest.raises(CommandError) as refused:
+        _run(world, "apply", *extra)
+    for flag in ("--all", "--item", "--collection", "--limit"):
+        assert flag in str(refused.value)
+    assert world[0].writes == []
+    assert WrappedMigration.objects.get(item_id="VX-1").phase == ""
+
+
+def test_all_is_refused_outside_apply(migrated_db):
+    with pytest.raises(CommandError, match="--all"):
+        _run(_world(), "verify", "--all")
+
+
+def test_apply_stops_after_max_consecutive_failures(migrated_db):
+    world = _world(("VX-1", "VX-2", "VX-3", "VX-4", "VX-5"))
+    _run(world, "plan")
+    for item_id in ("VX-1", "VX-3", "VX-4", "VX-5"):
+        world[0].shapes[item_id].append({"id": f"{item_id}-LOW", "tag": ["lowres"]})
+    out = _run(world, "apply", "--all", "--max-failures", "2")
+    rows = {r.item_id: r for r in WrappedMigration.objects.all()}
+    # VX-2's success resets the count; VX-3 and VX-4 make two in a row.
+    assert [i for i, r in sorted(rows.items()) if r.error] == ["VX-1", "VX-3", "VX-4"]
+    assert rows["VX-2"].phase == "done"
+    assert (rows["VX-5"].phase, rows["VX-5"].error) == ("", "")
+    assert "stopped after 2 consecutive failures (--max-failures 2)" in out
+    assert out.rstrip().endswith("applied: 1, failed: 3")
+
+
+def test_max_failures_defaults_to_twenty(migrated_db):
+    items = tuple(f"VX-{n:02d}" for n in range(21))
+    world = _world(items)
+    _run(world, "plan")
+    for item_id in items:
+        world[0].shapes[item_id].append({"id": f"{item_id}-LOW", "tag": ["lowres"]})
+    out = _run(world, "apply", "--all")
+    assert "stopped after 20 consecutive failures (--max-failures 20)" in out
+    assert WrappedMigration.objects.get(item_id="VX-20").error == ""
+
+
+def test_max_failures_must_be_positive(migrated_db):
+    with pytest.raises(CommandError, match="--max-failures"):
+        _run(_world(), "apply", "--all", "--max-failures", "0")

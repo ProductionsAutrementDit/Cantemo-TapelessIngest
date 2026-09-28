@@ -3,7 +3,9 @@
 Spec: _bmad-output/implementation-artifacts/spec-wrapped-items-migration-p2.md
 
   plan    read-only; one WrappedMigration row per item, with its verdict
-  apply   ready / already-migrated rows, one resumable phase at a time
+  apply   ready / already-migrated rows, one resumable phase at a time;
+          needs --item, --collection, --limit or an explicit --all, and
+          stops after --max-failures (default 20) failures in a row
   verify  re-checks every finished row
   report  counts per verdict/phase, why items are not acted on, and the
           errors; ``--verdict V`` lists each item of that verdict instead
@@ -58,6 +60,19 @@ class Command(BaseCommand):
         parser.add_argument("--limit", type=int)
         parser.add_argument("--dryrun", action="store_true")
         parser.add_argument(
+            "--all",
+            dest="all_rows",
+            action="store_true",
+            help="apply: act on every writable row (bare apply is refused)",
+        )
+        parser.add_argument(
+            "--max-failures",
+            dest="max_failures",
+            type=int,
+            default=20,
+            help="apply: stop after this many consecutive failures (default 20)",
+        )
+        parser.add_argument(
             "--verdict",
             choices=verdicts.ALL,
             help="report: list 'item_id: reason' for the rows of this verdict",
@@ -75,6 +90,19 @@ class Command(BaseCommand):
             raise CommandError("--limit must be a positive integer")
         if options["dryrun"] and options["action"] != "apply":
             raise CommandError("--dryrun only applies to 'apply'")
+        if options["max_failures"] < 1:
+            raise CommandError("--max-failures must be a positive integer")
+        if options["all_rows"] and options["action"] != "apply":
+            raise CommandError("--all only applies to 'apply'")
+        if (
+            options["action"] == "apply"
+            and not options["all_rows"]
+            and not (options["item_id"] or options["collection_id"] or options["limit"])
+        ):
+            raise CommandError(
+                "apply needs a scope: --item, --collection or --limit, or --all "
+                "to act on every writable row"
+            )
         if options["verdict"] and options["action"] != "report":
             raise CommandError("--verdict only applies to 'report'")
         getattr(self, f"_{options['action']}")(options)
@@ -148,7 +176,7 @@ class Command(BaseCommand):
         )
         if options["limit"]:
             rows = rows[: options["limit"]]
-        done = failed = 0
+        done = failed = in_a_row = 0
         for row in rows:
             used = RecordingGateway(gateway) if dry else gateway
             executor = Executor(
@@ -161,14 +189,22 @@ class Command(BaseCommand):
                 executor.run(row)
             except Exception as error:  # noqa: BLE001 - isolate the item
                 failed += 1
+                in_a_row += 1
                 row.error = (
                     f"after {row.phase or 'start'}: {type(error).__name__}: {error}"
                 )
                 if not dry:
                     row.save(update_fields=["error", "updated_on"])
                 self.stdout.write(f"{row.item_id}: FAILED {row.error}")
+                if in_a_row >= options["max_failures"]:
+                    self.stdout.write(
+                        f"stopped after {in_a_row} consecutive failures "
+                        f"(--max-failures {options['max_failures']})"
+                    )
+                    break
                 continue
             done += 1
+            in_a_row = 0
             if dry:
                 for write in used.writes:
                     self.stdout.write(f"{row.item_id}: {write[0]} {write[1:]}")
