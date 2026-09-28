@@ -99,7 +99,11 @@ class Executor:
     def _register_files(self, row) -> None:
         # Plan-time on_disk can be stale. Re-probed before ANY write: an
         # archived original gone since plan is registered ARCHIVED (no
-        # sha1); an unarchived one stops the row untouched.
+        # sha1); an unarchived one stops the row untouched. A plan-time
+        # file_id usually names an ONLINE VX-41 entity found by path while
+        # the file was still on disk: if the file is gone now, reusing that
+        # binding is exactly what the planner's F1 gate would have refused
+        # had it known — so the row must stop, not carry it to "done".
         for original in row.plan["originals"]:
             if original["on_disk"] and not self.disk.exists(original["relative"]):
                 if not original["entry"]:
@@ -107,20 +111,30 @@ class Executor:
                         f"on-disk original {original['relative']} disappeared "
                         f"since plan and is not in P5"
                     )
+                if original["file_id"]:
+                    raise StepError(
+                        f"on-disk original {original['relative']} disappeared "
+                        f"since plan and is bound to VX-41 entity "
+                        f"{original['file_id']}; re-plan"
+                    )
                 original["on_disk"] = False
         for original in row.plan["originals"]:
             if original["file_id"]:
                 continue
             found = self.gateway.find_file(fields.RUSHES_STORAGE, original["relative"])
-            original["file_id"] = (
-                found.file_id
-                if found
-                else self.gateway.register_file(
+            if found is None:
+                original["file_id"] = self.gateway.register_file(
                     fields.RUSHES_STORAGE,
                     original["relative"],
                     archived=not original["on_disk"],
                 )
-            )
+                continue
+            if not original["on_disk"] and found.state != "ARCHIVED":
+                raise StepError(
+                    f"VX-41 entity {found.file_id} ({found.state}) for "
+                    f"tape-only original {original['relative']}; re-plan"
+                )
+            original["file_id"] = found.file_id
 
     def _file_ids(self, row, kind: str) -> List[str]:
         return [o["file_id"] for o in row.plan["originals"] if o["kind"] == kind]

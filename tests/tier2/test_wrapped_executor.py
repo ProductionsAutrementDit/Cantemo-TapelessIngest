@@ -1,5 +1,7 @@
 """Tier 2: apply advances a row phase by phase, and survives a crash."""
 
+import re
+
 import pytest
 
 from portal.plugins.TapelessIngest.models.clip import Clip
@@ -266,6 +268,55 @@ def test_an_unarchived_original_gone_from_disk_since_plan_stops_the_row(
     assert gateway.writes == []
     row.refresh_from_db()
     assert row.phase == ""
+
+
+def test_apply_refuses_a_disappeared_on_disk_original_bound_to_an_entity(
+    migrated_db,
+):
+    # R1: at plan time an on-disk original's file_id usually names an
+    # ONLINE VX-41 entity found by path. If the file is gone by apply
+    # time, reusing that binding is exactly what the planner's F1 gate
+    # would have refused had it known — so the row must stop, not reuse.
+    gateway = InMemoryGateway()
+    for original in p2_originals():
+        gateway.register_file(fields.RUSHES_STORAGE, original.relative, archived=False)
+    gateway.writes.clear()
+    row, disk = _setup(gateway, on_disk=True)
+    assert all(o["file_id"] for o in row.plan["originals"])
+    gone = row.plan["originals"][2]["relative"]
+    bound = row.plan["originals"][2]["file_id"]
+    del disk.contents[gone]
+    message = (
+        f"on-disk original {gone} disappeared since plan and is bound to "
+        f"VX-41 entity {bound}; re-plan"
+    )
+    with pytest.raises(StepError, match=re.escape(message)):
+        Executor(gateway, disk).run(row)
+    assert gateway.writes == []
+    row.refresh_from_db()
+    assert row.phase == ""
+
+
+def test_apply_refuses_a_tape_only_original_whose_entity_appeared_since_plan(
+    migrated_db,
+):
+    # R1 belt and braces: a tape-only original with no file_id at plan
+    # time, for which a non-ARCHIVED VX-41 entity shows up by apply time
+    # (a stale index entry the planner never saw), must never be reused.
+    gateway = InMemoryGateway()
+    row, disk = _setup(gateway, on_disk=False)
+    first = row.plan["originals"][0]
+    assert first["file_id"] is None
+    gateway.files[(fields.RUSHES_STORAGE, first["relative"])] = "VX-STALE"
+    gateway.file_states[(fields.RUSHES_STORAGE, "VX-STALE")] = "LOST"
+    message = (
+        f"VX-41 entity VX-STALE (LOST) for tape-only original "
+        f"{first['relative']}; re-plan"
+    )
+    with pytest.raises(StepError, match=re.escape(message)):
+        Executor(gateway, disk).run(row)
+    assert "register_file" not in gateway.write_names()
+    assert "post_shape" not in gateway.write_names()
 
 
 def test_an_extra_original_shape_since_plan_stops_before_posting(migrated_db):
