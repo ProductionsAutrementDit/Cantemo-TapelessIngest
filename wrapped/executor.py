@@ -30,7 +30,6 @@ WRAP_PHASES = (
     "done",
 )
 COMPLETE_PHASES = ("metadata_written", "verified", "done")
-_OFFLINE_STATES = ("ARCHIVED", "LOST", "MISSING")
 
 
 class StepError(Exception):
@@ -38,10 +37,18 @@ class StepError(Exception):
 
 
 class Executor:
-    def __init__(self, gateway, disk, persist: bool = True):
+    def __init__(
+        self,
+        gateway,
+        disk,
+        persist: bool = True,
+        delete_online_wrapped: bool = False,
+    ):
         self.gateway = gateway
         self.disk = disk
         self.persist = persist
+        # Opt-in: by default an online wrapped file is kept and flagged.
+        self.delete_online_wrapped = delete_online_wrapped
         # Only ever filled by a dry run (persist=False): what _update_clip
         # would have written, since it cannot touch the Clip table itself.
         self.planned_clip_updates: List[dict] = []
@@ -197,10 +204,15 @@ class Executor:
         wrapped = row.plan.get("wrapped_file")
         if not wrapped or wrapped["storage_id"] not in fields.ONLINE_LEGACY_STORAGES:
             return
+        if not self.delete_online_wrapped:
+            row.plan["wrapped_kept"] = True
+            return
         # Re-checked against Vidispine, never decided from the state the
         # plan captured: a resumed run must not delete an already-deleted
         # file (or one Vidispine otherwise moved offline since planning).
+        # Only an allowlisted online state is deleted; None (gone) or any
+        # other state keeps the file.
         state = self.gateway.file_state(wrapped["storage_id"], wrapped["file_id"])
-        if state is None or state in _OFFLINE_STATES:
+        if state not in fields.ONLINE_STATES:
             return
         self.gateway.delete_file(wrapped["storage_id"], wrapped["file_id"])

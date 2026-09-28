@@ -22,10 +22,10 @@ from tests.wrapped_fakes import (
 LEGACY = "/Volumes/ActiveMedia/AA - RUSHES TAPELESS/"
 
 
-def _world(items=("VX-1",)):
+def _world(items=("VX-1",), storage="VX-2"):
     gateway, archive = InMemoryGateway(), FakeArchive()
     for n, item_id in enumerate(items):
-        seed_item(gateway, item_id, wrapped_p2_document())
+        seed_item(gateway, item_id, wrapped_p2_document(storage=storage))
         clip = Clip.objects.create(
             umid=f"U{n}",
             path="2016/AH_TEST",
@@ -130,3 +130,18 @@ def test_dryrun_is_refused_outside_apply(migrated_db):
 def test_limit_must_be_positive(migrated_db):
     with pytest.raises(CommandError, match="--limit"):
         _run(_world(), "apply", "--limit", "0")
+
+
+def test_apply_keeps_an_online_wrapped_file_by_default(migrated_db):
+    world = _world(storage="VX-26")
+    _run(world, "plan")
+    _run(world, "apply", "--item", "VX-1")
+    assert "delete_file" not in world[0].write_names()
+    assert WrappedMigration.objects.get(item_id="VX-1").plan["wrapped_kept"]
+
+
+def test_apply_delete_online_wrapped_deletes_it(migrated_db):
+    world = _world(storage="VX-26")
+    _run(world, "plan")
+    _run(world, "apply", "--item", "VX-1", "--delete-online-wrapped")
+    assert world[0].writes[-1] == ("delete_file", "VX-26", "VX-W1")

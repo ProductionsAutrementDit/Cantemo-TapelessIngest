@@ -53,6 +53,13 @@ class Command(BaseCommand):
         parser.add_argument("--collection", dest="collection_id")
         parser.add_argument("--limit", type=int)
         parser.add_argument("--dryrun", action="store_true")
+        parser.add_argument(
+            "--delete-online-wrapped",
+            dest="delete_online_wrapped",
+            action="store_true",
+            help="apply: delete the wrapped file of a migrated item when it is "
+            "on an online legacy storage (default: keep it)",
+        )
 
     def handle(self, *args, **options):
         if options["limit"] is not None and options["limit"] < 1:
@@ -133,7 +140,12 @@ class Command(BaseCommand):
         done = failed = 0
         for row in rows:
             used = RecordingGateway(gateway) if dry else gateway
-            executor = Executor(used, disk, persist=not dry)
+            executor = Executor(
+                used,
+                disk,
+                persist=not dry,
+                delete_online_wrapped=options["delete_online_wrapped"],
+            )
             try:
                 executor.run(row)
             except Exception as error:  # noqa: BLE001 - isolate the item

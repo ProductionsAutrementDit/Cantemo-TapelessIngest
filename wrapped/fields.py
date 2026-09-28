@@ -35,6 +35,11 @@ STATUS_NONE = ""
 RUSHES_STORAGE = "VX-41"
 # The wrapped files that are still on a disk, and the only ones ever deleted.
 ONLINE_LEGACY_STORAGES = ("VX-26", "VX-11")
+# The only file states a wrapped file may be deleted in (an allowlist: any
+# other state, or none, keeps the file). Portal's getState vocabulary,
+# measured on prod 2026-09-28: IMPORTED / NOT_IMPORTED / ARCHIVED / LOST;
+# CLOSED is Vidispine's raw online state.
+ONLINE_STATES = ("IMPORTED", "NOT_IMPORTED", "CLOSED")
 ORIGINAL_TAG = "original"
 LOWRES_TAG = "lowres"
 # The wrapped shape is re-tagged, never deleted: reversible, touches no file.

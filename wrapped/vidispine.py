@@ -105,6 +105,7 @@ class VidispineGateway:
         return FileEntity(found.getId(), found.getState())
 
     def file_state(self, storage_id: str, file_id: str) -> Optional[str]:
+        # getFileById is global in Vidispine: storage_id is unused here.
         try:
             return self._storage.getFileById(file_id).getState()
         except NotFoundError:

@@ -154,24 +154,56 @@ def test_every_crash_point_resumes_to_the_same_end_state(migrated_db, crash_afte
     assert gateway.write_names().count("register_file") == 5
 
 
-def test_an_online_wrapped_file_is_deleted_only_after_verification(migrated_db):
+def test_an_online_wrapped_file_is_kept_by_default(migrated_db):
     gateway = InMemoryGateway()
     row, disk = _setup(gateway, storage="VX-26", state="CLOSED")
     Executor(gateway, disk).run(row)
+    row.refresh_from_db()
+    assert row.phase == "done"
+    assert "delete_file" not in gateway.write_names()
+    assert row.plan["wrapped_kept"] is True
+
+
+def test_an_online_wrapped_file_is_deleted_only_after_verification(migrated_db):
+    gateway = InMemoryGateway()
+    row, disk = _setup(gateway, storage="VX-26", state="CLOSED")
+    Executor(gateway, disk, delete_online_wrapped=True).run(row)
     names = gateway.write_names()
     assert names[-1] == "delete_file"
     assert gateway.writes[-1] == ("delete_file", "VX-26", "VX-W1")
+    row.refresh_from_db()
+    assert "wrapped_kept" not in row.plan
+
+
+@pytest.mark.parametrize("state", ["IMPORTED", "NOT_IMPORTED", "CLOSED"])
+def test_every_online_state_is_deleted_when_asked(migrated_db, state):
+    gateway = InMemoryGateway()
+    row, disk = _setup(gateway, storage="VX-11", state="CLOSED")
+    gateway.file_states[("VX-11", "VX-W1")] = state
+    Executor(gateway, disk, delete_online_wrapped=True).run(row)
+    assert gateway.writes[-1] == ("delete_file", "VX-11", "VX-W1")
+
+
+@pytest.mark.parametrize("state", ["OPEN", "UNKNOWN", "ARCHIVED", "LOST", "MISSING"])
+def test_a_state_outside_the_online_allowlist_is_not_deleted(migrated_db, state):
+    gateway = InMemoryGateway()
+    row, disk = _setup(gateway, storage="VX-26", state="CLOSED")
+    gateway.file_states[("VX-26", "VX-W1")] = state
+    Executor(gateway, disk, delete_online_wrapped=True).run(row)
+    row.refresh_from_db()
+    assert row.phase == "done"
+    assert "delete_file" not in gateway.write_names()
 
 
 def test_crash_after_delete_does_not_delete_twice(migrated_db):
     gateway = CrashingGateway(crash_after="delete_file")
     row, disk = _setup(gateway, storage="VX-26", state="CLOSED")
     with pytest.raises(Crash):
-        Executor(gateway, disk).run(row)
+        Executor(gateway, disk, delete_online_wrapped=True).run(row)
     row.refresh_from_db()
     assert row.phase == "verified"
 
-    Executor(gateway, disk).run(row)
+    Executor(gateway, disk, delete_online_wrapped=True).run(row)
     row.refresh_from_db()
     assert row.phase == "done"
     assert gateway.write_names().count("delete_file") == 1
@@ -181,7 +213,7 @@ def test_a_file_already_gone_is_not_deleted(migrated_db):
     gateway = InMemoryGateway()
     row, disk = _setup(gateway, storage="VX-26", state="CLOSED")
     gateway.file_states[("VX-26", "VX-W1")] = None
-    Executor(gateway, disk).run(row)
+    Executor(gateway, disk, delete_online_wrapped=True).run(row)
     row.refresh_from_db()
     assert row.phase == "done"
     assert "delete_file" not in gateway.write_names()
@@ -254,9 +286,17 @@ def test_dry_run_lists_the_delete_of_an_online_wrapped_file(migrated_db):
     gateway = InMemoryGateway()
     row, disk = _setup(gateway, storage="VX-26", state="CLOSED")
     recording = RecordingGateway(gateway)
-    Executor(recording, disk, persist=False).run(row)
+    Executor(recording, disk, persist=False, delete_online_wrapped=True).run(row)
     assert gateway.writes == []
     assert recording.writes[-1] == ("delete_file", "VX-26", "VX-W1")
+
+
+def test_dry_run_lists_no_delete_without_the_flag(migrated_db):
+    gateway = InMemoryGateway()
+    row, disk = _setup(gateway, storage="VX-26", state="CLOSED")
+    recording = RecordingGateway(gateway)
+    Executor(recording, disk, persist=False).run(row)
+    assert "delete_file" not in [w[0] for w in recording.writes]
 
 
 def test_a_clip_update_matching_no_row_fails(migrated_db):
