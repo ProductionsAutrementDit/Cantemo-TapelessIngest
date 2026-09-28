@@ -133,6 +133,11 @@ def test_limit_must_be_positive(migrated_db):
         _run(_world(), "apply", "--limit", "0")
 
 
+def test_delete_online_wrapped_is_refused_outside_apply(migrated_db):
+    with pytest.raises(CommandError, match="--delete-online-wrapped"):
+        _run(_world(), "plan", "--delete-online-wrapped")
+
+
 def test_apply_keeps_an_online_wrapped_file_by_default(migrated_db):
     world = _world(storage="VX-26")
     _run(world, "plan")

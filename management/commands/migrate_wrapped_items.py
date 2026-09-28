@@ -90,6 +90,8 @@ class Command(BaseCommand):
             raise CommandError("--limit must be a positive integer")
         if options["dryrun"] and options["action"] != "apply":
             raise CommandError("--dryrun only applies to 'apply'")
+        if options["delete_online_wrapped"] and options["action"] != "apply":
+            raise CommandError("--delete-online-wrapped only applies to 'apply'")
         if options["max_failures"] < 1:
             raise CommandError("--max-failures must be a positive integer")
         if options["all_rows"] and options["action"] != "apply":
