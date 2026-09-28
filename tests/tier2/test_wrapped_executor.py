@@ -297,26 +297,33 @@ def test_apply_refuses_a_disappeared_on_disk_original_bound_to_an_entity(
     assert row.phase == ""
 
 
+@pytest.mark.parametrize("index", [0, -1])
 def test_apply_refuses_a_tape_only_original_whose_entity_appeared_since_plan(
-    migrated_db,
+    migrated_db, index
 ):
     # R1 belt and braces: a tape-only original with no file_id at plan
     # time, for which a non-ARCHIVED VX-41 entity shows up by apply time
-    # (a stale index entry the planner never saw), must never be reused.
+    # (a stale index entry the planner never saw), must never be reused —
+    # whatever position it sits at among the originals, since every
+    # entity is looked up and checked in a read-only pass before the
+    # first register_file call (fix round 2: index=-1 pins that a stale
+    # entity on the LAST original still stops the row with zero writes,
+    # rather than surfacing only after the earlier originals registered).
     gateway = InMemoryGateway()
     row, disk = _setup(gateway, on_disk=False)
-    first = row.plan["originals"][0]
-    assert first["file_id"] is None
-    gateway.files[(fields.RUSHES_STORAGE, first["relative"])] = "VX-STALE"
+    stale = row.plan["originals"][index]
+    assert stale["file_id"] is None
+    gateway.files[(fields.RUSHES_STORAGE, stale["relative"])] = "VX-STALE"
     gateway.file_states[(fields.RUSHES_STORAGE, "VX-STALE")] = "LOST"
     message = (
         f"VX-41 entity VX-STALE (LOST) for tape-only original "
-        f"{first['relative']}; re-plan"
+        f"{stale['relative']}; re-plan"
     )
     with pytest.raises(StepError, match=re.escape(message)):
         Executor(gateway, disk).run(row)
-    assert "register_file" not in gateway.write_names()
-    assert "post_shape" not in gateway.write_names()
+    assert gateway.writes == []
+    row.refresh_from_db()
+    assert row.phase == ""
 
 
 def test_an_extra_original_shape_since_plan_stops_before_posting(migrated_db):

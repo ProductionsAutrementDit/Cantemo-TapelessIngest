@@ -8,7 +8,7 @@ already names these files.
 """
 
 import copy
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from portal.plugins.TapelessIngest.models.clip import Clip
 from portal.plugins.TapelessIngest.wrapped import fields
@@ -118,23 +118,35 @@ class Executor:
                         f"{original['file_id']}; re-plan"
                     )
                 original["on_disk"] = False
-        for original in row.plan["originals"]:
+        # Read-only pre-pass: every original's VX-41 entity is looked up
+        # and its state checked BEFORE any register_file call, so a stale
+        # entity on the LAST original still stops the row with zero
+        # writes rather than surfacing only after the earlier originals
+        # were already registered.
+        found_ids: Dict[int, str] = {}
+        for index, original in enumerate(row.plan["originals"]):
             if original["file_id"]:
                 continue
             found = self.gateway.find_file(fields.RUSHES_STORAGE, original["relative"])
             if found is None:
-                original["file_id"] = self.gateway.register_file(
-                    fields.RUSHES_STORAGE,
-                    original["relative"],
-                    archived=not original["on_disk"],
-                )
                 continue
             if not original["on_disk"] and found.state != "ARCHIVED":
                 raise StepError(
                     f"VX-41 entity {found.file_id} ({found.state}) for "
                     f"tape-only original {original['relative']}; re-plan"
                 )
-            original["file_id"] = found.file_id
+            found_ids[index] = found.file_id
+        for index, original in enumerate(row.plan["originals"]):
+            if original["file_id"]:
+                continue
+            if index in found_ids:
+                original["file_id"] = found_ids[index]
+            else:
+                original["file_id"] = self.gateway.register_file(
+                    fields.RUSHES_STORAGE,
+                    original["relative"],
+                    archived=not original["on_disk"],
+                )
 
     def _file_ids(self, row, kind: str) -> List[str]:
         return [o["file_id"] for o in row.plan["originals"] if o["kind"] == kind]
