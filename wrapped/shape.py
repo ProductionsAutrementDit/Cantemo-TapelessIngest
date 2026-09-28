@@ -7,11 +7,17 @@ wrapped file (component ids, file references, analysed metadata) is
 dropped. Every original is a single-stream file, so each component's
 ``essenceStreamId`` becomes 0. Vidispine cannot analyse a tape-only
 original, which is why these values have to be stated at all.
+
+When the wrapped shape's technical description is a copy of the lowres
+proxy, ``build_document_from_template`` states the content from the P2
+format's template and the timing from the clip's P2 metadata instead.
 """
 
-from typing import Any, Dict, List, Optional, Sequence
+import copy
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from portal.plugins.TapelessIngest.wrapped.gateway import Component, Shape
+from portal.plugins.TapelessIngest.wrapped.templates import Timing
 
 _DROPPED = ("id", "file", "metadata")
 
@@ -63,4 +69,45 @@ def build_document(
     }
     if wrapped.mime_types:
         document["mimeType"] = list(wrapped.mime_types)
+    return document
+
+
+def build_document_from_template(
+    template: Mapping[str, Any],
+    video_file_id: str,
+    audio_file_ids: Sequence[str],
+    timing: Timing,
+) -> Dict[str, Any]:
+    if audio_file_ids and not template.get("audioComponent"):
+        raise ShapeMismatch(
+            f"template has no audio component for {len(audio_file_ids)} "
+            f"audio original(s)"
+        )
+
+    def body(source: Mapping[str, Any], file_id: str) -> Dict[str, Any]:
+        restated = copy.deepcopy(dict(source))
+        restated["duration"] = {
+            "samples": timing.frames,
+            "timeBase": {"numerator": timing.num, "denominator": timing.den},
+        }
+        restated["file"] = [{"id": file_id}]
+        return restated
+
+    container = body(template["containerComponent"], video_file_id)
+    container["startTimecode"] = timing.start_tc_frames
+    video = body(template["videoComponent"][0], video_file_id)
+    video["essenceStreamId"] = 0
+    audios = []
+    for n, file_id in enumerate(audio_file_ids, start=1):
+        audio = body(template["audioComponent"][0], file_id)
+        audio["essenceStreamId"] = 0
+        audio["itemTrack"] = f"A{n}"
+        audios.append(audio)
+    document: Dict[str, Any] = {
+        "containerComponent": container,
+        "videoComponent": [video],
+        "audioComponent": audios,
+    }
+    if template.get("mimeType"):
+        document["mimeType"] = list(template["mimeType"])
     return document
