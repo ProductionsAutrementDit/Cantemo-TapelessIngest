@@ -15,6 +15,7 @@ by ``migrate_wrapped_items templates`` from genuine ready rows.
 import json
 import os
 import re
+import xml.etree.ElementTree as ElementTree
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -71,6 +72,23 @@ def _frames(metadata: Mapping[str, Any]) -> int:
     return frames
 
 
+def audio_bits_per_sample(clip_xml: Optional[str]) -> Optional[str]:
+    """The first ``<BitsPerSample>`` of a stored P2 clip XML (it uses a
+    default namespace, so elements are matched by local name). ClipMetadata
+    has no audio depth, yet one P2 format comes as 16- or 24-bit audio."""
+    if not clip_xml:
+        return None
+    try:
+        root = ElementTree.fromstring(clip_xml.encode("utf-8"))
+    except ElementTree.ParseError:
+        return None
+    for element in root.iter():
+        if element.tag.rsplit("}", 1)[-1] == "BitsPerSample":
+            value = (element.text or "").strip()
+            return value if value.isdigit() else None
+    return None
+
+
 def template_key(clip_metadata: Mapping[str, Any]) -> Optional[str]:
     codec = _value(clip_metadata, "video_codec")
     framerate = _value(clip_metadata, "framerate")
@@ -81,16 +99,19 @@ def template_key(clip_metadata: Mapping[str, Any]) -> Optional[str]:
         num, den = _edit_unit(clip_metadata)
     except ValueError:
         return None
-    key = f"{codec}|{framerate}"
-    if not codec.startswith(AVC_I_PREFIX):
-        return key
-    try:
-        data_size = int(_value(clip_metadata, "data_size"))
-    except ValueError:
+    bits = _value(clip_metadata, "audio_bits_per_sample")
+    if not bits:
         return None
-    # bitrate = data_size * 8 / (frames * num / den), in integers
-    at_least_100 = data_size * 8 * den >= AVC_I_100_MIN_BPS * frames * num
-    return f"{key}|AVC-I{'100' if at_least_100 else '50'}"
+    key = f"{codec}|{framerate}"
+    if codec.startswith(AVC_I_PREFIX):
+        try:
+            data_size = int(_value(clip_metadata, "data_size"))
+        except ValueError:
+            return None
+        # bitrate = data_size * 8 / (frames * num / den), in integers
+        at_least_100 = data_size * 8 * den >= AVC_I_100_MIN_BPS * frames * num
+        key = f"{key}|AVC-I{'100' if at_least_100 else '50'}"
+    return f"{key}|A{bits}"
 
 
 def timing(clip_metadata: Mapping[str, Any]) -> Timing:

@@ -218,7 +218,7 @@ def test_already_migrated_rollback_keeps_what_apply_will_overwrite():
 
 # proxy-copied technical description (P2 templates)
 
-KEY = "AVC-I_1080/50i|50i|AVC-I100"
+KEY = "AVC-I_1080/50i|50i|AVC-I100|A24"
 TEMPLATES = {
     KEY: {
         "template": p2_template(),

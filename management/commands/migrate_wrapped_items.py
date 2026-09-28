@@ -50,6 +50,7 @@ from portal.plugins.TapelessIngest.wrapped.resolver import (
 )
 from portal.plugins.TapelessIngest.wrapped.shape import template_disagreements
 from portal.plugins.TapelessIngest.wrapped.templates import (
+    audio_bits_per_sample,
     common_template,
     is_proxy_copy,
     load_templates,
@@ -67,6 +68,7 @@ _MIN_SHARE = 0.95
 _TEMPLATE_OPTIONS = (("out", "--out"), ("min_refs", "--min-refs"))
 _TEMPLATE_OPTIONS += (("min_share", "--min-share"),)
 _SHOWN_DISAGREEMENTS = 5
+AUDIO_BITS = "audio_bits_per_sample"
 
 
 def _vidispine_gateway():
@@ -77,7 +79,14 @@ def _vidispine_gateway():
 
 
 def _clip_metadata(clip):
-    return dict(ClipMetadata.objects.filter(clip=clip).values_list("name", "value"))
+    """The clip's ClipMetadata, plus its audio depth, which only the stored
+    P2 clip XML carries (never taken from a ClipMetadata row)."""
+    metadata = dict(ClipMetadata.objects.filter(clip=clip).values_list("name", "value"))
+    metadata.pop(AUDIO_BITS, None)
+    bits = audio_bits_per_sample(clip.clip_xml)
+    if bits:
+        metadata[AUDIO_BITS] = bits
+    return metadata
 
 
 class Command(BaseCommand):

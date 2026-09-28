@@ -301,6 +301,8 @@ def p2_clip_metadata(**overrides):
         "timecode_start": "18:25:04:12",
         # ~114 Mb/s over 19.88 s
         "data_size": str(114_000_000 * 1988 // 800),
+        # not ClipMetadata: the command parses it from Clip.clip_xml
+        "audio_bits_per_sample": "24",
     }
     metadata.update(overrides)
     return {k: v for k, v in metadata.items() if v is not None}
@@ -352,3 +354,23 @@ def genuine_p2_document(frames=497, start_tc_frames=1657612, **kwargs):
         }
     document["containerComponent"]["startTimecode"] = start_tc_frames
     return document
+
+
+def p2_clip_xml(bits_per_sample="24", namespace=True):
+    """The stored P2 clip XML, reduced to what the migration reads
+    (measured: VX-39331 has 16 bits, VX-39084 24, both 48 kHz)."""
+    xmlns = ' xmlns="urn:schemas-Professional-Plug-in:P2:ClipMetadata:v3.1"'
+    depth = (
+        f"<BitsPerSample>{bits_per_sample}</BitsPerSample>"
+        if bits_per_sample is not None
+        else ""
+    )
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="no" ?>'
+        f"<P2Main{xmlns if namespace else ''}><ClipContent>"
+        "<ClipName>00924E</ClipName><EssenceList>"
+        "<Video><Codec>AVC-I_1080/50i</Codec></Video>"
+        f"<Audio><SamplingRate>48000</SamplingRate>{depth}</Audio>"
+        f"<Audio><SamplingRate>48000</SamplingRate>{depth}</Audio>"
+        "</EssenceList></ClipContent></P2Main>"
+    )

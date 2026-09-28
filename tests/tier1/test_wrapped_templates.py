@@ -9,6 +9,7 @@ from portal.plugins.TapelessIngest.wrapped.templates import (
     Timing,
     is_proxy_copy,
     common_template,
+    audio_bits_per_sample,
     load_templates,
     signature_difference,
     signature,
@@ -17,6 +18,7 @@ from portal.plugins.TapelessIngest.wrapped.templates import (
     timing,
 )
 from tests.wrapped_fakes import (
+    p2_clip_xml,
     p2_clip_metadata,
     proxy_copy_document,
     wrapped_p2_document,
@@ -26,20 +28,20 @@ from tests.wrapped_fakes import (
 
 
 def test_avc_intra_at_100_mbps_or_more_is_class_100():
-    assert template_key(p2_clip_metadata()) == "AVC-I_1080/50i|50i|AVC-I100"
+    assert template_key(p2_clip_metadata()) == "AVC-I_1080/50i|50i|AVC-I100|A24"
 
 
 def test_avc_intra_below_80_mbps_is_class_50():
     # 50 Mb/s over 497 frames at 1/25 = 19.88 s
     metadata = p2_clip_metadata(data_size=str(50_000_000 * 1988 // 800))
-    assert template_key(metadata) == "AVC-I_1080/50i|50i|AVC-I50"
+    assert template_key(metadata) == "AVC-I_1080/50i|50i|AVC-I50|A24"
 
 
 def test_the_class_threshold_is_80_mbps():
     at = p2_clip_metadata(data_size=str(80_000_000 * 1988 // 800))
     below = p2_clip_metadata(data_size=str(80_000_000 * 1988 // 800 - 1))
-    assert template_key(at).endswith("|AVC-I100")
-    assert template_key(below).endswith("|AVC-I50")
+    assert template_key(at).endswith("|AVC-I100|A24")
+    assert template_key(below).endswith("|AVC-I50|A24")
 
 
 def test_the_bitrate_uses_the_edit_unit():
@@ -50,16 +52,24 @@ def test_the_bitrate_uses_the_edit_unit():
         EditUnit="1/50",
         data_size=str(50_000_000 * 1988 // 800),
     )
-    assert template_key(metadata) == "AVC-I_720/50p|50p|AVC-I100"
+    assert template_key(metadata) == "AVC-I_720/50p|50p|AVC-I100|A24"
 
 
 def test_dv_formats_get_no_class_suffix_and_need_no_data_size():
     metadata = p2_clip_metadata(video_codec="DV100_1080/50i", data_size=None)
-    assert template_key(metadata) == "DV100_1080/50i|50i"
+    assert template_key(metadata) == "DV100_1080/50i|50i|A24"
 
 
 @pytest.mark.parametrize(
-    "missing", ["video_codec", "framerate", "duration", "EditUnit", "data_size"]
+    "missing",
+    [
+        "video_codec",
+        "framerate",
+        "duration",
+        "EditUnit",
+        "data_size",
+        "audio_bits_per_sample",
+    ],
 )
 def test_incomplete_metadata_has_no_key(missing):
     assert template_key(p2_clip_metadata(**{missing: None})) is None
@@ -310,3 +320,34 @@ def test_the_fields_two_signatures_differ_in_are_named():
 def test_identical_signatures_differ_in_nothing():
     base = signature(parse_shape(wrapped_p2_document()))
     assert signature_difference(base, base) == []
+
+
+# audio_bits_per_sample (from Clip.clip_xml)
+
+
+@pytest.mark.parametrize("bits", ["16", "24"])
+def test_the_audio_depth_is_read_from_namespaced_p2_xml(bits):
+    assert audio_bits_per_sample(p2_clip_xml(bits)) == bits
+
+
+def test_the_audio_depth_is_read_without_a_namespace():
+    assert audio_bits_per_sample(p2_clip_xml("16", namespace=False)) == "16"
+
+
+@pytest.mark.parametrize(
+    "xml",
+    [p2_clip_xml(None), p2_clip_xml("sixteen"), p2_clip_xml(""), "", "<P2Main", None],
+)
+def test_no_readable_audio_depth_is_none(xml):
+    assert audio_bits_per_sample(xml) is None
+
+
+def test_the_audio_depth_separates_the_template_keys():
+    s16 = template_key(p2_clip_metadata(audio_bits_per_sample="16"))
+    s24 = template_key(p2_clip_metadata(audio_bits_per_sample="24"))
+    assert (s16, s24) == (
+        "AVC-I_1080/50i|50i|AVC-I100|A16",
+        "AVC-I_1080/50i|50i|AVC-I100|A24",
+    )
+    dv = p2_clip_metadata(video_codec="DV100_1080/50i", audio_bits_per_sample="16")
+    assert template_key(dv) == "DV100_1080/50i|50i|A16"

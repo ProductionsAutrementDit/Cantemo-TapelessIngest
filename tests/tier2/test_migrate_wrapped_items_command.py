@@ -17,6 +17,7 @@ from tests.wrapped_fakes import (
     FakeDisk,
     InMemoryGateway,
     genuine_p2_document,
+    p2_clip_xml,
     p2_clip_metadata,
     p2_originals,
     p2_template,
@@ -54,8 +55,7 @@ def _world(
             output_file="/mnt/ActiveMedia/CANTEMO_FILES/060A2B34.MXF",
             status=Clip.STATUS_IMPORTED,
         )
-        for name, value in ((metadata or {}).get(item_id) or {}).items():
-            ClipMetadata.objects.create(clip=clip, name=name, value=value)
+        _store_metadata(clip, (metadata or {}).get(item_id) or {})
         for original in p2_originals(clip_dir=f"2016/AH_{n}/CONTENTS"):
             ClipFile.objects.create(
                 clip=clip, path=LEGACY + original.relative, filetype=original.kind
@@ -72,6 +72,16 @@ def _command(world, templates=None):
     command.disk_factory = lambda: disk
     command.templates_factory = lambda: dict(templates or {})
     return command
+
+
+def _store_metadata(clip, metadata):
+    """As prod holds it: the audio depth only in the stored P2 clip XML."""
+    metadata = dict(metadata)
+    if "audio_bits_per_sample" in metadata:
+        clip.clip_xml = p2_clip_xml(metadata.pop("audio_bits_per_sample"))
+        clip.save()
+    for name, value in metadata.items():
+        ClipMetadata.objects.create(clip=clip, name=name, value=value)
 
 
 def _run(world, *args, templates=None):
@@ -302,7 +312,7 @@ def test_max_failures_must_be_positive(migrated_db):
 
 # P2 templates for proxy-copied wrapped shapes
 
-KEY = "AVC-I_1080/50i|50i|AVC-I100"
+KEY = "AVC-I_1080/50i|50i|AVC-I100|A24"
 
 
 def _proxy_world(items=("VX-1",)):
@@ -366,8 +376,7 @@ def _ready_clip(n, document, **metadata):
         provider_name="panasonicP2",
     )
     clip = Clip.objects.get(umid=f"T{n}")
-    for name, value in p2_clip_metadata(**metadata).items():
-        ClipMetadata.objects.create(clip=clip, name=name, value=value)
+    _store_metadata(clip, p2_clip_metadata(**metadata))
     return WrappedMigration.objects.create(
         item_id=item_id,
         clip_umid=f"T{n}",
@@ -420,7 +429,7 @@ def test_templates_keeps_the_majority_signature(migrated_db, tmp_path):
             "references": 3,
             "share": 0.75,
         },
-        "DV100_1080/50i|50i": {
+        "DV100_1080/50i|50i|A24": {
             "template": strip_for_template(genuine_p2_document()),
             "reference_item": "VX-05",
             "references": 2,
@@ -443,7 +452,7 @@ def test_templates_rejects_a_key_below_the_thresholds(migrated_db, tmp_path):
     lines = out.splitlines()
     assert f"{KEY}: 4 ref(s), majority 3 (75.0%): rejected, share below 95.0%" in lines
     assert (
-        "DV100_1080/50i|50i: 1 ref(s), majority 1 (100.0%): rejected, "
+        "DV100_1080/50i|50i|A24: 1 ref(s), majority 1 (100.0%): rejected, "
         "fewer than 2 references" in lines
     )
 
@@ -584,3 +593,61 @@ def test_a_share_rejection_shows_the_top_two_signatures(migrated_db):
         f"{KEY}:     video.pixelFormat: None (3) vs 'yuv420p10le' (1)",
         "no template key: 0",
     ]
+
+
+def test_plan_reads_the_audio_depth_from_the_clip_xml(migrated_db):
+    world = _world(
+        ("VX-1", "VX-2"),
+        documents={i: proxy_copy_document() for i in ("VX-1", "VX-2")},
+        metadata={
+            "VX-1": p2_clip_metadata(),
+            "VX-2": p2_clip_metadata(audio_bits_per_sample=None),
+        },
+        duration="19.88",
+        cpaa_marker="true",
+    )
+    _run(world, "plan", templates={KEY: {"template": p2_template()}})
+    rows = {r.item_id: r for r in WrappedMigration.objects.all()}
+    assert rows["VX-1"].plan["technical_source"] == f"template:{KEY}"
+    assert rows["VX-2"].verdict == "unexpected"
+    assert rows["VX-2"].reason == (
+        "proxy-copied technical description; P2 metadata incomplete for a template"
+    )
+
+
+def test_a_clipmetadata_row_never_stands_in_for_the_clip_xml(migrated_db):
+    world = _proxy_world()
+    clip = Clip.objects.get(item_id="VX-1")
+    clip.clip_xml = ""
+    clip.save()
+    ClipMetadata.objects.create(clip=clip, name="audio_bits_per_sample", value="24")
+    _run(world, "plan", templates={KEY: {"template": p2_template()}})
+    assert WrappedMigration.objects.get(item_id="VX-1").verdict == "unexpected"
+
+
+def _s16():
+    document = genuine_p2_document()
+    for body in document["audioComponent"]:
+        body.update(codec="pcm_s16le", sampleFormat="AV_SAMPLE_FMT_S16")
+    return document
+
+
+def _s32():
+    document = genuine_p2_document()
+    for body in document["audioComponent"]:
+        body.update(codec="pcm_s24le", sampleFormat="AV_SAMPLE_FMT_S32")
+    return document
+
+
+def test_templates_separates_the_audio_depth_variants(migrated_db):
+    for n in range(1, 4):
+        _ready_clip(n, _s16(), audio_bits_per_sample="16")
+    for n in range(4, 6):
+        _ready_clip(n, _s32(), audio_bits_per_sample="24")
+    out, err = _templates("--min-refs", "2", "--min-share", "1")
+    written = json.loads(out)
+    s16, s24 = "AVC-I_1080/50i|50i|AVC-I100|A16", KEY
+    assert sorted(written) == [s16, s24]
+    assert written[s16]["references"] == 3 and written[s24]["references"] == 2
+    assert written[s16]["template"]["audioComponent"][0]["codec"] == "pcm_s16le"
+    assert written[s24]["template"]["audioComponent"][0]["codec"] == "pcm_s24le"

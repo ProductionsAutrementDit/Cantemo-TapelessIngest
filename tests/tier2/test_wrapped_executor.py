@@ -457,7 +457,7 @@ def test_stop_before_must_name_a_phase(migrated_db):
 
 def test_a_proxy_copied_item_is_posted_from_its_template(migrated_db):
     gateway = InMemoryGateway()
-    key = "AVC-I_1080/50i|50i|AVC-I100"
+    key = "AVC-I_1080/50i|50i|AVC-I100|A24"
     row, disk = _setup(
         gateway,
         document=proxy_copy_document(),
