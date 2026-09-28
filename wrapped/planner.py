@@ -7,7 +7,7 @@ and in P5, and records what is needed to undo the migration.
 
 import posixpath
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, Optional, Sequence
 
 from portal.plugins.TapelessIngest.wrapped import fields, verdicts
 from portal.plugins.TapelessIngest.wrapped.archive import CachedArchive
@@ -118,6 +118,9 @@ def plan_item(
         located = [
             _locate(o, gateway, archive, disk, by_path[o.relative]) for o in originals
         ]
+        # For a complete plan, rollback records the current original shape
+        # because the 2023 migration swapped files in place on the original shape,
+        # and this is what apply will overwrite (metadata only).
         return PlanResult(
             verdicts.ALREADY_MIGRATED,
             plan={

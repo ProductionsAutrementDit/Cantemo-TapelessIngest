@@ -1,7 +1,5 @@
 """Tier 1: one verdict per item, and the exact plan for the writable ones."""
 
-import posixpath
-
 from portal.plugins.TapelessIngest.wrapped import verdicts
 from portal.plugins.TapelessIngest.wrapped.archive import CachedArchive
 from portal.plugins.TapelessIngest.wrapped.paths import to_absolute
@@ -44,6 +42,33 @@ def _plan(gateway, fake, disk, originals, spanned=False, output_file=OUTPUT):
         archive=CachedArchive(fake),
         disk=disk,
     )
+
+
+def _migrated_shape(originals):
+    """Create a shape that references all originals on VX-41 with "original" tag."""
+    return {
+        "id": "VX-MIG",
+        "tag": ["original"],
+        "containerComponent": {
+            "id": "C",
+            "file": [{"id": "F0", "storage": "VX-41", "path": originals[0].relative}],
+        },
+        "videoComponent": [
+            {
+                "id": "V",
+                "file": [
+                    {"id": "F0", "storage": "VX-41", "path": originals[0].relative}
+                ],
+            }
+        ],
+        "audioComponent": [
+            {
+                "id": f"A{n}",
+                "file": [{"id": f"F{n}", "storage": "VX-41", "path": o.relative}],
+            }
+            for n, o in enumerate(originals[1:], start=1)
+        ],
+    }
 
 
 def test_tape_only_originals_are_ready_with_their_handles():
@@ -134,30 +159,7 @@ def test_two_original_shapes_are_unexpected():
 
 def test_a_shape_already_naming_the_originals_is_already_migrated():
     gateway, fake, disk, originals = _world()
-    migrated = {
-        "id": "VX-MIG",
-        "tag": ["original"],
-        "containerComponent": {
-            "id": "C",
-            "file": [{"id": "F0", "storage": "VX-41", "path": originals[0].relative}],
-        },
-        "videoComponent": [
-            {
-                "id": "V",
-                "file": [
-                    {"id": "F0", "storage": "VX-41", "path": originals[0].relative}
-                ],
-            }
-        ],
-        "audioComponent": [
-            {
-                "id": f"A{n}",
-                "file": [{"id": f"F{n}", "storage": "VX-41", "path": o.relative}],
-            }
-            for n, o in enumerate(originals[1:], start=1)
-        ],
-    }
-    gateway.shapes[ITEM] = [migrated]
+    gateway.shapes[ITEM] = [_migrated_shape(originals)]
     result = _plan(gateway, fake, disk, originals)
     assert result.verdict == verdicts.ALREADY_MIGRATED
     assert result.plan["kind"] == "complete"
@@ -169,3 +171,20 @@ def test_a_shape_already_naming_the_originals_is_already_migrated():
         "F3",
         "F4",
     ]
+
+
+def test_already_migrated_rollback_keeps_what_apply_will_overwrite():
+    gateway, fake, disk, originals = _world()
+    # Preserve lowres shape when replacing with migrated shape
+    lowres_shapes = [s for s in gateway.shapes[ITEM] if "lowres" in s.get("tag", [])]
+    gateway.shapes[ITEM] = [_migrated_shape(originals)] + lowres_shapes
+    gateway.component_md[(ITEM, "VX-MIG", "C")] = {
+        "portal_archive_external_id": "Default-Archive#OLD"
+    }
+    result = _plan(gateway, fake, disk, originals)
+    assert result.rollback["wrapped_shape_id"] == "VX-MIG"
+    assert result.rollback["component_metadata"]["C"] == {
+        "portal_archive_external_id": "Default-Archive#OLD"
+    }
+    assert result.rollback["lowres_shape_ids"] == ["VX-LOW"]
+    assert result.rollback["item_fields"]["durationSeconds"] == ["8.72"]
