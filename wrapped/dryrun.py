@@ -36,7 +36,7 @@ class RecordingGateway:
 
     def find_file(self, storage_id, relative):
         if (storage_id, relative) in self._files:
-            return FileEntity(self._files[(storage_id, relative)])
+            return FileEntity(*self._files[(storage_id, relative)])
         return self._inner.find_file(storage_id, relative)
 
     def file_state(self, storage_id, file_id):
@@ -50,7 +50,10 @@ class RecordingGateway:
     # writes
     def register_file(self, storage_id, relative, archived):
         file_id = self._mint("FILE")
-        self._files[(storage_id, relative)] = file_id
+        self._files[(storage_id, relative)] = (
+            file_id,
+            "ARCHIVED" if archived else "CLOSED",
+        )
         self.writes.append(("register_file", storage_id, relative, archived))
         return file_id
 

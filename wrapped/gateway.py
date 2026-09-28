@@ -68,6 +68,9 @@ class Shape:
 @dataclass(frozen=True)
 class FileEntity:
     file_id: str
+    # Portal's VSFile.getState(): a VX-41 entity can outlive its file
+    # (LOST, NOT_IMPORTED, ...), so the planner never reuses one blindly.
+    state: str
 
 
 def parse_shape(document: Mapping[str, Any]) -> Shape:

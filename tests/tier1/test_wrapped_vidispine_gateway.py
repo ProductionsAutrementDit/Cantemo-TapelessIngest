@@ -67,8 +67,10 @@ def test_item_fields_walk_the_timespans():
 
 def test_find_file_answers_none_when_vidispine_does_not_know_the_path():
     StorageHelperFake.set_file("VX-41", "2016/X/V.MXF", "VX-9")
+    StorageHelperFake.set_file_state("VX-9", "LOST")
     gateway = VidispineGateway()
-    assert gateway.find_file("VX-41", "2016/X/V.MXF").file_id == "VX-9"
+    found = gateway.find_file("VX-41", "2016/X/V.MXF")
+    assert (found.file_id, found.state) == ("VX-9", "LOST")
     assert gateway.find_file("VX-41", "2016/X/W.MXF") is None
 
 

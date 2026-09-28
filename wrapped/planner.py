@@ -82,14 +82,17 @@ def _locate(
     disk,
     file_id: Optional[str],
 ) -> Dict[str, Any]:
+    entity_state = None
     if file_id is None:
         entity = gateway.find_file(fields.RUSHES_STORAGE, original.relative)
         file_id = entity.file_id if entity else None
+        entity_state = entity.state if entity else None
     entry = archive.resolve(to_absolute(original.relative))
     return {
         "relative": original.relative,
         "kind": original.kind,
         "file_id": file_id,
+        "entity_state": entity_state,
         "on_disk": disk.exists(original.relative),
         "entry": asdict(entry) if entry else None,
         "tapes": [asdict(archive.volume(v)) for v in entry.volumes] if entry else [],
@@ -142,6 +145,16 @@ def plan_item(
             verdicts.ORIGINALS_MISSING,
             "neither on disk nor in P5: " + ", ".join(missing),
         )
+    for o in located:
+        # A tape-only original is registered ARCHIVED; any other entity the
+        # VX-41 index still holds for it (a shoot deleted from disk: LOST,
+        # NOT_IMPORTED, CLOSED...) is stale and must not be reused.
+        if not o["on_disk"] and o["file_id"] and o["entity_state"] != "ARCHIVED":
+            return PlanResult(
+                verdicts.UNEXPECTED,
+                f"stale VX-41 entity {o['file_id']} ({o['entity_state']}) "
+                f"for tape-only original {o['relative']}",
+            )
     (wrapped_file,) = shape.files().values()
     return PlanResult(
         verdicts.READY,

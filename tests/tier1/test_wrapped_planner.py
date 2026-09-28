@@ -132,6 +132,20 @@ def test_an_existing_vx41_entity_is_reused():
     result = _plan(gateway, fake, disk, originals)
     assert result.plan["originals"][0]["file_id"] == "VX-EXISTING"
     assert result.plan["originals"][1]["file_id"] is None
+    assert result.plan["originals"][0]["entity_state"] == "ARCHIVED"
+
+
+def test_a_stale_vx41_entity_for_a_tape_only_original_is_unexpected():
+    gateway, fake, disk, originals = _world()
+    gateway.files[("VX-41", originals[2].relative)] = "VX-STALE"
+    gateway.file_states[("VX-41", "VX-STALE")] = "LOST"
+    result = _plan(gateway, fake, disk, originals)
+    assert result.verdict == verdicts.UNEXPECTED
+    assert result.reason == (
+        f"stale VX-41 entity VX-STALE (LOST) for tape-only original "
+        f"{originals[2].relative}"
+    )
+    assert result.plan == {}
 
 
 def test_spanned_clips_are_deferred():

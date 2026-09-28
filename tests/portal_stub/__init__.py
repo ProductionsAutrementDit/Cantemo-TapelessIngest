@@ -166,10 +166,12 @@ class VSFile:
 
     Mapping VERIFIED on prod (2026-08-20, synthetic instantiation of vendor
     portal/externals/VidiRest/objects/storage.pyc): the getters read `_source`
-    keys path/hash/storage/id/size. `getState` is deliberately omitted (prod
-    derives NOT_IMPORTED from an empty `item` list rather than passing raw
-    `state` through; the pinned code paths never call it, so reaching it here
-    raises AttributeError rather than mismodelling it). `replace_urls`
+    keys path/hash/storage/id/size. `getState` answers ONLY a state a test
+    configured (``StorageHelperFake.set_file_state``, carried into `_source`
+    by ``getFileByPath``): prod derives NOT_IMPORTED from an empty `item`
+    list rather than passing raw `state` through, so the stub never invents
+    one — an unconfigured state raises the loud KeyError of `_get`. Only the
+    wrapped migration's ``find_file`` reads it. `replace_urls`
     (settings.VIDISPINE_REPLACE_URLS, a dict of URL-prefix rewrites; `{}` in
     Tier 2 settings) is only passed through.
     """
@@ -201,6 +203,9 @@ class VSFile:
 
     def getSize(self):
         return self._get("size")
+
+    def getState(self):
+        return self._get("state")
 
     def getFileName(self):
         return os.path.basename(self._get("path"))
@@ -434,18 +439,20 @@ class StorageHelperFake:
         )
 
     def getFileByPath(self, storage_id, path):
-        file_id = type(self).files.get((storage_id, path))
+        cls = type(self)
+        file_id = cls.files.get((storage_id, path))
         if file_id is None:
             raise NotFoundError(f"no file {path!r} on {storage_id} (unconfigured)")
-        return VSFile(
-            {
-                "id": file_id,
-                "path": path,
-                "storage": storage_id,
-                "hash": None,
-                "size": 0,
-            }
-        )
+        source = {
+            "id": file_id,
+            "path": path,
+            "storage": storage_id,
+            "hash": None,
+            "size": 0,
+        }
+        if file_id in cls.file_states:
+            source["state"] = cls.file_states[file_id]
+        return VSFile(source)
 
     def notifyStorageOfFile(self, storage_id, filepath, state="CLOSED"):
         file_id = type(self)._mint(storage_id, filepath)

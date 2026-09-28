@@ -97,9 +97,10 @@ class VidispineGateway:
 
     def find_file(self, storage_id: str, relative: str) -> Optional[FileEntity]:
         try:
-            return FileEntity(self._storage.getFileByPath(storage_id, relative).getId())
+            found = self._storage.getFileByPath(storage_id, relative)
         except NotFoundError:
             return None
+        return FileEntity(found.getId(), found.getState())
 
     def file_state(self, storage_id: str, file_id: str) -> Optional[str]:
         try:

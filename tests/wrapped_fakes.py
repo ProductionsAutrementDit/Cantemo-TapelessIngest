@@ -70,7 +70,13 @@ class InMemoryGateway:
         self.component_md = {}  # (item, shape, component) -> {key: value}
         self.items = {}  # item_id -> {field: [values]}
         self.files = {}  # (storage_id, relative) -> file_id
-        self.file_states = {}  # (storage_id, file_id) -> state, None means gone
+        # (storage_id, file_id) -> state, None means gone. find_file reads
+        # it with default "ARCHIVED" (a VX-41 entity seeded straight into
+        # ``files`` is a live archived one unless the test says otherwise);
+        # file_state reads it with default "CLOSED" (the wrapped file is
+        # online unless the test says otherwise). register_file records
+        # "ARCHIVED" or "CLOSED" for what it creates.
+        self.file_states = {}
         self.writes = []
         self._minted = 0
 
@@ -103,7 +109,11 @@ class InMemoryGateway:
 
     def find_file(self, storage_id, relative):
         file_id = self.files.get((storage_id, relative))
-        return FileEntity(file_id) if file_id else None
+        if not file_id:
+            return None
+        return FileEntity(
+            file_id, self.file_states.get((storage_id, file_id), "ARCHIVED")
+        )
 
     def file_state(self, storage_id, file_id):
         return self.file_states.get((storage_id, file_id), "CLOSED")
@@ -112,6 +122,7 @@ class InMemoryGateway:
     def register_file(self, storage_id, relative, archived):
         file_id = self._mint("VX-F")
         self.files[(storage_id, relative)] = file_id
+        self.file_states[(storage_id, file_id)] = "ARCHIVED" if archived else "CLOSED"
         self.writes.append(("register_file", storage_id, relative, archived))
         return file_id
 
