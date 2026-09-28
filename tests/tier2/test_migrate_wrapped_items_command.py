@@ -494,3 +494,16 @@ def test_report_counts_ready_rows_per_technical_source(migrated_db):
     assert "technical source wrapped: 3" in lines
     assert f"technical source template:{KEY}: 1" in lines
     assert not any("existing" in line for line in lines)
+
+
+def test_templates_never_learns_from_a_proxy_copy_or_a_frozen_row(migrated_db):
+    for n in range(1, 3):
+        _ready_clip(n, wrapped_p2_document())
+    # a ready 'wrapped' row whose shape is a proxy copy: never a reference
+    _ready_clip(3, proxy_copy_document())
+    frozen = _ready_clip(4, wrapped_p2_document())
+    frozen.phase = "shape_posted"
+    frozen.save()
+    out, err = _templates("--min-refs", "2", "--min-share", "1")
+    assert json.loads(out)[KEY]["references"] == 2
+    assert f"{KEY}: 2 ref(s), majority 2 (100.0%): kept" in err

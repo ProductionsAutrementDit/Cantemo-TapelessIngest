@@ -396,3 +396,13 @@ def test_a_durationseconds_that_is_not_a_number_is_unexpected():
     assert result.reason == (
         "proxy-copied technical description; durationSeconds 'n/a' is not a number"
     )
+
+
+def test_a_template_that_is_itself_a_proxy_copy_is_refused():
+    template = p2_template()
+    template["mimeType"] = ["video/mp4"]
+    result = _proxy_plan(templates={KEY: {"template": template}})
+    assert result.verdict == verdicts.UNEXPECTED
+    assert result.reason == (
+        f"proxy-copied technical description; template {KEY} is itself a " f"proxy copy"
+    )

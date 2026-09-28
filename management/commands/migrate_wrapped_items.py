@@ -43,6 +43,7 @@ from portal.plugins.TapelessIngest.wrapped.resolver import (
     wrapped_p2_clips,
 )
 from portal.plugins.TapelessIngest.wrapped.templates import (
+    is_proxy_copy,
     load_templates,
     signature,
     strip_for_template,
@@ -337,7 +338,8 @@ class Command(BaseCommand):
         min_refs = options["min_refs"] or _MIN_REFS
         min_share = options["min_share"] or _MIN_SHARE
         # Genuine wrapped shapes only: a template-planned row carries a
-        # proxy copy, which is exactly what a template must never learn.
+        # proxy copy, which is exactly what a template must never learn;
+        # nor does a row frozen mid-apply (its shape may be half-replaced).
         by_key = defaultdict(Counter)
         references = {}
         unkeyed = 0
@@ -345,14 +347,17 @@ class Command(BaseCommand):
             plan = row.plan
             if plan.get("technical_source", "wrapped") != "wrapped":
                 continue
-            if "wrapped_shape" not in plan:
+            if row.phase or "wrapped_shape" not in plan:
+                continue
+            wrapped = parse_shape(plan["wrapped_shape"])
+            if is_proxy_copy(wrapped):
                 continue
             clip = Clip.objects.filter(umid=row.clip_umid).first()
             key = template_key(_clip_metadata(clip)) if clip else None
             if key is None:
                 unkeyed += 1
                 continue
-            found = signature(parse_shape(plan["wrapped_shape"]))
+            found = signature(wrapped)
             by_key[key][found] += 1
             references.setdefault((key, found), (row.item_id, plan["wrapped_shape"]))
         summary = self.stdout if options["out"] else self.stderr

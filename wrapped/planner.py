@@ -18,7 +18,7 @@ from typing import Any, Dict, Mapping, Optional, Sequence
 
 from portal.plugins.TapelessIngest.wrapped import fields, verdicts
 from portal.plugins.TapelessIngest.wrapped.archive import CachedArchive
-from portal.plugins.TapelessIngest.wrapped.gateway import Gateway, Shape
+from portal.plugins.TapelessIngest.wrapped.gateway import Gateway, Shape, parse_shape
 from portal.plugins.TapelessIngest.wrapped.paths import OriginalFile, to_absolute
 from portal.plugins.TapelessIngest.wrapped.shape import mismatch
 from portal.plugins.TapelessIngest.wrapped.templates import (
@@ -107,13 +107,16 @@ def _technical_source(
         return {"problem": PROXY_COPY_INCOMPLETE}
     if key not in templates:
         return {"problem": f"{PROXY_COPY}; no template for {key}"}
+    template = templates[key]["template"]
+    if is_proxy_copy(parse_shape(template)):
+        return {"problem": f"{PROXY_COPY}; template {key} is itself a proxy copy"}
     try:
         clip_timing = timing(clip_metadata)
     except ValueError as error:
         return {"problem": f"{PROXY_COPY_INCOMPLETE}: {error}"}
     return {
         "technical_source": f"template:{key}",
-        "template": copy.deepcopy(templates[key]["template"]),
+        "template": copy.deepcopy(template),
         "timing": asdict(clip_timing),
     }
 
