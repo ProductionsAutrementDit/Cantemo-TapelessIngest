@@ -306,6 +306,12 @@ class StorageAPIFake:
         return {"hits": 0, "file": []}
 
 
+# Sentinel for StorageHelperFake.notifyStorageOfFile's default: distinct
+# from any real state value (including None), so "the caller passed
+# nothing" can be told apart from "the caller passed state=None".
+_UNSET = object()
+
+
 class StorageHelperFake:
     """Configurable counting stand-in for portal.vidispine.istorage.StorageHelper
     (QueryElasticFake tradition, story 2.1).
@@ -454,15 +460,22 @@ class StorageHelperFake:
             source["state"] = cls.file_states[file_id]
         return VSFile(source)
 
-    def notifyStorageOfFile(self, storage_id, filepath, state=None):
-        # state=None records "not passed": Portal's own default is not
-        # measured, so a caller that relies on it is visible in the calls.
+    def notifyStorageOfFile(self, storage_id, filepath, state=_UNSET):
+        # Portal's measured default (2026-09-28, inspect.signature on prod
+        # 6.2.1): notifyStorageOfFile(self, storage_id, filepath,
+        # state='CLOSED'). state_passed records whether THIS call named
+        # its own state, so a caller relying on the default stays visible
+        # in the calls rather than being indistinguishable from one that
+        # passed "CLOSED" explicitly.
+        state_passed = state is not _UNSET
+        state = "CLOSED" if state is _UNSET else state
         file_id = type(self)._mint(storage_id, filepath)
         VidispineFake.record(
             "notifyStorageOfFile",
             storage_id=storage_id,
             path=filepath,
             state=state,
+            state_passed=state_passed,
             file_id=file_id,
         )
         return file_id
