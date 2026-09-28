@@ -1,11 +1,13 @@
 """The one module of ``wrapped`` that talks to Portal and Vidispine.
 
 Reads go through raw REST (JSON in, values out); writes use the Portal
-helpers the 2023 script proved on prod (``createFileEntity``,
-``notifyStorageOfFile``, ``setComponentMetadata``,
-``update_or_create_item_metadata``, ``removeFileFromStorage``) and the
-plugin's own ``createShapeFromDocument``, which carries the
-``updateItemMetadata=true`` that ``ItemAPI.createItemShape`` drops.
+helpers the 2023 script proved on prod (``notifyStorageOfFile``, always
+with an explicit ``state=``, ``setComponentMetadata``,
+``update_or_create_item_metadata``, ``removeFileFromStorage``), the
+``createFileEntity`` that ``providers/panasonicP2.py`` uses for ARCHIVED
+entities (NOT something the 2023 script proved), and the plugin's own
+``createShapeFromDocument``, which carries the ``updateItemMetadata=true``
+that ``ItemAPI.createItemShape`` drops.
 """
 
 from typing import Any, Dict, List, Mapping, Optional, Sequence
@@ -119,7 +121,7 @@ class VidispineGateway:
                 return_format="json",
             )
             return created["id"]
-        return self._storage.notifyStorageOfFile(storage_id, relative)
+        return self._storage.notifyStorageOfFile(storage_id, relative, state="CLOSED")
 
     def post_shape(self, item_id: str, document: Mapping[str, Any]) -> str:
         created = self._ingest.itemapi.createShapeFromDocument(

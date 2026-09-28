@@ -454,7 +454,9 @@ class StorageHelperFake:
             source["state"] = cls.file_states[file_id]
         return VSFile(source)
 
-    def notifyStorageOfFile(self, storage_id, filepath, state="CLOSED"):
+    def notifyStorageOfFile(self, storage_id, filepath, state=None):
+        # state=None records "not passed": Portal's own default is not
+        # measured, so a caller that relies on it is visible in the calls.
         file_id = type(self)._mint(storage_id, filepath)
         VidispineFake.record(
             "notifyStorageOfFile",

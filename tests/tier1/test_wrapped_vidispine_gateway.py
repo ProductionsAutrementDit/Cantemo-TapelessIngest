@@ -87,7 +87,7 @@ def test_register_file_archived_creates_an_archived_entity():
 def test_register_file_on_disk_notifies_the_storage():
     VidispineGateway().register_file("VX-41", "2016/X/V.MXF", archived=False)
     (notified,) = _calls("notifyStorageOfFile")
-    assert notified["path"] == "2016/X/V.MXF"
+    assert (notified["path"], notified["state"]) == ("2016/X/V.MXF", "CLOSED")
 
 
 def test_post_shape_uses_shape_create_with_updateItemMetadata():
