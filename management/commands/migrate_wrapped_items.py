@@ -26,6 +26,12 @@ from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
 
 from portal.plugins.TapelessIngest.models.clip import Clip, ClipMetadata
+
+# Registers `Folder`, which `Clip.folders` references lazily. Portal's plugin
+# loading does not import it (plugin.py never reaches views), so without this
+# import Django's system checks fail with fields.E307 before `handle` runs —
+# measured on prod 2026-09-28. The scan commands import it the same way.
+from portal.plugins.TapelessIngest.models.folder import Folder  # noqa: F401
 from portal.plugins.TapelessIngest.models.wrapped_migration import WrappedMigration
 from portal.plugins.TapelessIngest.wrapped import verdicts
 from portal.plugins.TapelessIngest.wrapped.archive import (
