@@ -20,7 +20,9 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from portal.plugins.TapelessIngest.wrapped.gateway import Component, Shape
 from portal.plugins.TapelessIngest.wrapped.templates import Timing
 
-_DROPPED = ("id", "file", "metadata")
+# `mediaInfo` is MediaInfo's analysis of the wrapped, multiplexed file (VX-35313:
+# "Count of stream of this kind = 8", "Muxing mode = DV"), not of the originals.
+_DROPPED = ("id", "file", "metadata", "mediaInfo")
 
 
 class ShapeMismatch(Exception):

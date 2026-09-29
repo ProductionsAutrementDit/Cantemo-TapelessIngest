@@ -53,6 +53,22 @@ def test_wrapped_identity_is_never_copied():
         assert "id" not in body and "metadata" not in body
 
 
+def test_the_wrapped_files_mediainfo_is_never_copied():
+    """`mediaInfo` is MediaInfo's analysis of the wrapped, multiplexed MXF
+    (e.g. "Count of stream of this kind = 8", "Muxing mode = DV"), not of
+    the separate originals — measured on VX-35313, 2026-09-29."""
+    wrapped = wrapped_p2_document()
+    info = {"property": [{"key": "Muxing mode", "value": "DV"}]}
+    wrapped["containerComponent"]["mediaInfo"] = info
+    wrapped["videoComponent"][0]["mediaInfo"] = info
+    for audio in wrapped["audioComponent"]:
+        audio["mediaInfo"] = info
+    document = _build(wrapped)
+    bodies = [document["containerComponent"], *document["videoComponent"]]
+    for body in bodies + document["audioComponent"]:
+        assert "mediaInfo" not in body
+
+
 def test_every_original_is_a_single_stream_file():
     document = _build()
     streams = [c["essenceStreamId"] for c in document["audioComponent"]]
