@@ -49,6 +49,19 @@ ROLLBACK_ITEM_FIELDS = (
     fields.TAPE_LABELS_FIELD,
     fields.TAPE_NAMES_FIELD,
     fields.CPAA_MIGRATION_FIELD,
+    # Measured on prod (M10), 2026-09-29: also rewritten by
+    # shape/create?updateItemMetadata=true, so a manual undo can restore them.
+    fields.ITEM_ORIGINAL_FILENAME_FIELD,
+    fields.ITEM_ORIGINAL_FORMAT_FIELD,
+    fields.ITEM_ORIGINAL_VIDEO_CODEC_FIELD,
+    fields.ITEM_ORIGINAL_AUDIO_CODEC_FIELD,
+    fields.ITEM_ORIGINAL_WIDTH_FIELD,
+    fields.ITEM_ORIGINAL_HEIGHT_FIELD,
+    fields.ITEM_MIME_TYPE_FIELD,
+    fields.ITEM_MEDIA_TYPE_FIELD,
+    fields.ITEM_DURATION_TIMECODE_FIELD,
+    fields.ITEM_START_TIMECODE_FIELD,
+    fields.ITEM_START_SECONDS_FIELD,
 )
 
 

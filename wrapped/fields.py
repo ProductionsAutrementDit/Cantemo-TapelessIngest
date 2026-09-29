@@ -27,6 +27,22 @@ DURATION_FIELD = "durationSeconds"
 CPAA_MIGRATION_FIELD = "portal_p5_migration_done"
 CPAA_MIGRATION_DONE = "true"
 
+# Measured on prod (M10), 2026-09-29: posting the new original shape with
+# shape/create?updateItemMetadata=true rewrites these item fields besides
+# durationSeconds. originalHeight was not itself observed changing on the
+# sampled item (paired with originalWidth, same technical description).
+ITEM_ORIGINAL_FILENAME_FIELD = "originalFilename"
+ITEM_ORIGINAL_FORMAT_FIELD = "originalFormat"
+ITEM_ORIGINAL_VIDEO_CODEC_FIELD = "originalVideoCodec"
+ITEM_ORIGINAL_AUDIO_CODEC_FIELD = "originalAudioCodec"
+ITEM_ORIGINAL_WIDTH_FIELD = "originalWidth"
+ITEM_ORIGINAL_HEIGHT_FIELD = "originalHeight"
+ITEM_MIME_TYPE_FIELD = "mimeType"
+ITEM_MEDIA_TYPE_FIELD = "mediaType"
+ITEM_DURATION_TIMECODE_FIELD = "durationTimeCode"
+ITEM_START_TIMECODE_FIELD = "startTimeCode"
+ITEM_START_SECONDS_FIELD = "startSeconds"
+
 ARCHIWARE_PLUGIN_GUID = "c4c1d403-801b-4b1a-95a1-6a692f64c262"
 # P5 archive plan "Airbus Helicopters", whose index is AirbusHelicopters.
 AIRBUS_POLICY_UUID = "aw-10007"

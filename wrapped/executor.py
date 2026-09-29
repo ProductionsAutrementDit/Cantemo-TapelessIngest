@@ -11,8 +11,13 @@ Manual undo (no code performs this): ``PUT
 ``original`` tag this executor removed from the wrapped shape; remove the
 ``original`` tag from the newly posted shape (``row.plan["new_shape_id"]``);
 then restore the Clip row from ``rollback["clip"]`` (``output_file``,
-``file_id``, ``status``, ``job_id``) and the item's fields from
-``rollback["item_fields"]``.
+``file_id``, ``status``, ``job_id``) and restore EVERY value in
+``rollback["item_fields"]`` onto the item. This now includes the technical
+fields ``shape/create?updateItemMetadata=true`` also rewrites (measured on
+prod, M10, 2026-09-29): originalFilename, originalFormat,
+originalVideoCodec, originalAudioCodec, originalWidth, originalHeight,
+mimeType, mediaType, durationTimeCode, startTimeCode and startSeconds,
+alongside durationSeconds.
 """
 
 import copy

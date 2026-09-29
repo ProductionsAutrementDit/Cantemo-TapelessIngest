@@ -2,7 +2,7 @@
 
 import pytest
 
-from portal.plugins.TapelessIngest.wrapped import verdicts
+from portal.plugins.TapelessIngest.wrapped import fields, verdicts
 from portal.plugins.TapelessIngest.wrapped.archive import CachedArchive
 from portal.plugins.TapelessIngest.wrapped.paths import to_absolute
 from portal.plugins.TapelessIngest.wrapped.planner import plan_item
@@ -119,6 +119,42 @@ def test_rollback_keeps_the_wrapped_handle_lowres_and_duration():
     }
     assert result.rollback["lowres_shape_ids"] == ["VX-LOW"]
     assert result.rollback["item_fields"]["durationSeconds"] == ["8.72"]
+
+
+def test_rollback_records_the_technical_fields_shape_create_rewrites():
+    # Measured on prod (M10), 2026-09-29: shape/create?updateItemMetadata=true
+    # rewrites these on the item besides durationSeconds.
+    gateway, fake, disk, originals = _world()
+    gateway.items[ITEM].update(
+        {
+            fields.ITEM_ORIGINAL_FILENAME_FIELD: ["060A2B34.MXF"],
+            fields.ITEM_ORIGINAL_FORMAT_FIELD: ["mxf"],
+            fields.ITEM_ORIGINAL_VIDEO_CODEC_FIELD: ["dvvideo"],
+            fields.ITEM_ORIGINAL_AUDIO_CODEC_FIELD: ["pcm_s16le"],
+            fields.ITEM_ORIGINAL_WIDTH_FIELD: ["1440"],
+            fields.ITEM_ORIGINAL_HEIGHT_FIELD: ["1080"],
+            fields.ITEM_MIME_TYPE_FIELD: ["application/mxf"],
+            fields.ITEM_MEDIA_TYPE_FIELD: ["video"],
+            fields.ITEM_DURATION_TIMECODE_FIELD: ["00:00:08:18"],
+            fields.ITEM_START_TIMECODE_FIELD: ["00:00:00:00"],
+            fields.ITEM_START_SECONDS_FIELD: ["0"],
+        }
+    )
+    result = _plan(gateway, fake, disk, originals)
+    assert result.rollback["item_fields"] == {
+        fields.DURATION_FIELD: ["8.72"],
+        fields.ITEM_ORIGINAL_FILENAME_FIELD: ["060A2B34.MXF"],
+        fields.ITEM_ORIGINAL_FORMAT_FIELD: ["mxf"],
+        fields.ITEM_ORIGINAL_VIDEO_CODEC_FIELD: ["dvvideo"],
+        fields.ITEM_ORIGINAL_AUDIO_CODEC_FIELD: ["pcm_s16le"],
+        fields.ITEM_ORIGINAL_WIDTH_FIELD: ["1440"],
+        fields.ITEM_ORIGINAL_HEIGHT_FIELD: ["1080"],
+        fields.ITEM_MIME_TYPE_FIELD: ["application/mxf"],
+        fields.ITEM_MEDIA_TYPE_FIELD: ["video"],
+        fields.ITEM_DURATION_TIMECODE_FIELD: ["00:00:08:18"],
+        fields.ITEM_START_TIMECODE_FIELD: ["00:00:00:00"],
+        fields.ITEM_START_SECONDS_FIELD: ["0"],
+    }
 
 
 def test_originals_on_disk_but_not_archived_are_ready():
