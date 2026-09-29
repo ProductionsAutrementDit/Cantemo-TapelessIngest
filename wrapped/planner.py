@@ -28,7 +28,7 @@ from portal.plugins.TapelessIngest.wrapped.shape import (
 )
 from portal.plugins.TapelessIngest.wrapped.templates import (
     is_proxy_copy,
-    template_key,
+    template_key_with_source,
     timing,
 )
 
@@ -142,7 +142,7 @@ def _technical_source(
             "problem": f"{PROXY_COPY} without the CPAA marker "
             f"({fields.CPAA_MIGRATION_FIELD})"
         }
-    key = template_key(clip_metadata)
+    key, inferred = template_key_with_source(clip_metadata)
     if key is None:
         return {"problem": PROXY_COPY_INCOMPLETE}
     if key not in templates:
@@ -166,11 +166,14 @@ def _technical_source(
             "problem": f"{PROXY_COPY}; template {key} cannot state this item: "
             f"{error}"
         }
-    return {
+    result = {
         "technical_source": f"template:{key}",
         "template": copy.deepcopy(template),
         "timing": asdict(clip_timing),
     }
+    if inferred:
+        result["audio_bits_inferred"] = True
+    return result
 
 
 def _locate(

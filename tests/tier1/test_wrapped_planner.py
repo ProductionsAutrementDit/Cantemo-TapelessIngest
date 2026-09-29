@@ -515,6 +515,38 @@ def test_a_template_audio_without_a_time_base_is_refused_at_plan_time():
     )
 
 
+# inferring 16-bit audio when the P2 XML is missing
+
+INFERRED_KEY = "AVC-I_1080/50i|50i|AVC-I100|A16"
+INFERRED_TEMPLATES = {
+    INFERRED_KEY: {
+        "template": p2_template(audio_codec="pcm_s16le"),
+        "reference_item": "VX-REF",
+        "references": 499,
+        "share": 0.998,
+    }
+}
+
+
+def test_a_missing_audio_depth_is_inferred_for_avc_i100_1080_50i():
+    result = _proxy_plan(templates=INFERRED_TEMPLATES, audio_bits_per_sample=None)
+    assert result.verdict == verdicts.READY, result.reason
+    assert result.plan["technical_source"] == f"template:{INFERRED_KEY}"
+    assert result.plan["audio_bits_inferred"] is True
+
+
+def test_an_explicit_audio_depth_is_not_recorded_as_inferred():
+    result = _proxy_plan()
+    assert result.verdict == verdicts.READY, result.reason
+    assert "audio_bits_inferred" not in result.plan
+
+
+def test_a_genuine_wrapped_shape_never_records_inference():
+    result = _plan(*_world(), clip_metadata=p2_clip_metadata(), templates=TEMPLATES)
+    assert result.verdict == verdicts.READY
+    assert "audio_bits_inferred" not in result.plan
+
+
 def test_a_template_that_cannot_state_this_items_duration_is_refused():
     template = p2_template()
     template["audioComponent"][0]["timeBase"] = {"numerator": 1, "denominator": 44101}

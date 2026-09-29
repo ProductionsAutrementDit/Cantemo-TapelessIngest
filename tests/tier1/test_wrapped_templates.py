@@ -15,6 +15,7 @@ from portal.plugins.TapelessIngest.wrapped.templates import (
     signature,
     strip_for_template,
     template_key,
+    template_key_with_source,
     timing,
 )
 from tests.wrapped_fakes import (
@@ -351,3 +352,44 @@ def test_the_audio_depth_separates_the_template_keys():
     )
     dv = p2_clip_metadata(video_codec="DV100_1080/50i", audio_bits_per_sample="16")
     assert template_key(dv) == "DV100_1080/50i|50i|A16"
+
+
+# template_key_with_source (inferring 16-bit audio when the P2 XML is missing)
+
+
+def test_dv100_50i_without_depth_infers_16_bit():
+    metadata = p2_clip_metadata(
+        video_codec="DV100_1080/50i", audio_bits_per_sample=None
+    )
+    assert template_key_with_source(metadata) == ("DV100_1080/50i|50i|A16", True)
+
+
+def test_avc_i100_1080_50i_without_depth_infers_16_bit():
+    metadata = p2_clip_metadata(audio_bits_per_sample=None)
+    assert template_key_with_source(metadata) == (
+        "AVC-I_1080/50i|50i|AVC-I100|A16",
+        True,
+    )
+
+
+def test_avc_i_1080_25p_without_depth_has_no_inference():
+    # two genuine variants exist for this format, so it is not inferred
+    metadata = p2_clip_metadata(
+        video_codec="AVC-I_1080/25p", framerate="25p", audio_bits_per_sample=None
+    )
+    assert template_key_with_source(metadata) == (None, False)
+
+
+def test_an_explicit_depth_wins_over_inference():
+    metadata = p2_clip_metadata(audio_bits_per_sample="24")
+    assert template_key_with_source(metadata) == (
+        "AVC-I_1080/50i|50i|AVC-I100|A24",
+        False,
+    )
+
+
+def test_template_key_never_infers():
+    metadata = p2_clip_metadata(
+        video_codec="DV100_1080/50i", audio_bits_per_sample=None
+    )
+    assert template_key(metadata) is None

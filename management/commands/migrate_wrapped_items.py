@@ -350,6 +350,14 @@ class Command(BaseCommand):
         )
         for source, count in sorted(sources.items()):
             self.stdout.write(f"technical source {source}: {count}")
+        inferred = sum(
+            1
+            for plan in rows.filter(verdict=verdicts.READY).values_list(
+                "plan", flat=True
+            )
+            if plan.get("audio_bits_inferred")
+        )
+        self.stdout.write(f"audio bits inferred: {inferred}")
         for row in rows.exclude(error="")[:50]:
             self.stdout.write(f"ERROR {row.item_id}: {row.error}")
 

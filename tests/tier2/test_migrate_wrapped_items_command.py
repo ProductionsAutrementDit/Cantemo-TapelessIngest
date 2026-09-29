@@ -515,6 +515,14 @@ def test_report_counts_ready_rows_per_technical_source(migrated_db):
     assert not any("existing" in line for line in lines)
 
 
+def test_report_counts_ready_rows_with_inferred_audio_bits(migrated_db):
+    _row("VX-1", "ready", plan={"audio_bits_inferred": True})
+    _row("VX-2", "ready", plan={"technical_source": "wrapped"})
+    _row("VX-3", "already-migrated", plan={"audio_bits_inferred": True})
+    lines = _run(_world(()), "report").splitlines()
+    assert "audio bits inferred: 1" in lines
+
+
 def test_templates_never_learns_from_a_proxy_copy_or_a_frozen_row(migrated_db):
     for n in range(1, 3):
         _ready_clip(n, genuine_p2_document())
@@ -601,7 +609,13 @@ def test_plan_reads_the_audio_depth_from_the_clip_xml(migrated_db):
         documents={i: proxy_copy_document() for i in ("VX-1", "VX-2")},
         metadata={
             "VX-1": p2_clip_metadata(),
-            "VX-2": p2_clip_metadata(audio_bits_per_sample=None),
+            # AVC-I_1080/25p has two genuine variants (see AUDIO_BITS_INFERRED),
+            # so without XML depth it stays keyless, unlike AVC-I100 1080/50i.
+            "VX-2": p2_clip_metadata(
+                video_codec="AVC-I_1080/25p",
+                framerate="25p",
+                audio_bits_per_sample=None,
+            ),
         },
         duration="19.88",
         cpaa_marker="true",
@@ -637,6 +651,18 @@ def _s32():
     for body in document["audioComponent"]:
         body.update(codec="pcm_s24le", sampleFormat="AV_SAMPLE_FMT_S32")
     return document
+
+
+def test_templates_never_infers_the_audio_depth(migrated_db):
+    # explicit 24-bit depth from the XML: keyed as usual
+    _ready_clip(1, genuine_p2_document())
+    # no XML depth at all: stays keyless, even though this exact format
+    # (AVC-I100 1080/50i) is one the planner infers 16-bit audio for
+    _ready_clip(2, genuine_p2_document(), audio_bits_per_sample=None)
+    out, err = _templates("--min-refs", "1", "--min-share", "1")
+    written = json.loads(out)
+    assert written[KEY]["references"] == 1
+    assert "no template key: 1" in err
 
 
 def test_templates_separates_the_audio_depth_variants(migrated_db):

@@ -17,7 +17,7 @@ import os
 import re
 import xml.etree.ElementTree as ElementTree
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 from portal.plugins.TapelessIngest.wrapped.gateway import Component, Shape, parse_shape
 
@@ -26,6 +26,20 @@ DEFAULT_PATH = os.path.join(os.path.dirname(__file__), "p2_templates.json")
 # video_codec does not tell AVC-Intra 50 from 100: the bitrate does.
 AVC_I_PREFIX = "AVC-I"
 AVC_I_100_MIN_BPS = 80_000_000
+
+# Measured on prod 2026-09-29: 604 proxy-copied items are otherwise
+# `unexpected` ("P2 metadata incomplete for a template") only because
+# Clip.clip_xml is empty, so <BitsPerSample> is unknown (495 AVC-I_1080/50i,
+# 109 DV100_1080/50i; the XML is not on disk either). Every genuine
+# reference of these two formats is 16-bit audio: DV100_1080/50i 2,641/2,641
+# (DVCPRO HD records 16-bit audio only), AVC-I_1080/50i AVC-I100 4,942/4,942
+# (0 at 24-bit). Keyed by the template key prefix (everything before the
+# trailing "|A<bits>"). AVC-I_1080/25p has two genuine variants and is
+# deliberately absent here.
+AUDIO_BITS_INFERRED = {
+    "DV100_1080/50i|50i": "16",
+    "AVC-I_1080/50i|50i|AVC-I100": "16",
+}
 
 _STRIPPED = (
     "id",
@@ -89,7 +103,14 @@ def audio_bits_per_sample(clip_xml: Optional[str]) -> Optional[str]:
     return None
 
 
-def template_key(clip_metadata: Mapping[str, Any]) -> Optional[str]:
+class TemplateKey(NamedTuple):
+    key: Optional[str]
+    inferred: bool
+
+
+def _key_prefix(clip_metadata: Mapping[str, Any]) -> Optional[str]:
+    """The template key without its trailing ``|A<bits>`` audio-depth
+    suffix, or None when the format cannot be told from ClipMetadata."""
     codec = _value(clip_metadata, "video_codec")
     framerate = _value(clip_metadata, "framerate")
     if not codec or not framerate:
@@ -98,9 +119,6 @@ def template_key(clip_metadata: Mapping[str, Any]) -> Optional[str]:
         frames = _frames(clip_metadata)
         num, den = _edit_unit(clip_metadata)
     except ValueError:
-        return None
-    bits = _value(clip_metadata, "audio_bits_per_sample")
-    if not bits:
         return None
     key = f"{codec}|{framerate}"
     if codec.startswith(AVC_I_PREFIX):
@@ -111,7 +129,34 @@ def template_key(clip_metadata: Mapping[str, Any]) -> Optional[str]:
         # bitrate = data_size * 8 / (frames * num / den), in integers
         at_least_100 = data_size * 8 * den >= AVC_I_100_MIN_BPS * frames * num
         key = f"{key}|AVC-I{'100' if at_least_100 else '50'}"
-    return f"{key}|A{bits}"
+    return key
+
+
+def template_key(clip_metadata: Mapping[str, Any]) -> Optional[str]:
+    prefix = _key_prefix(clip_metadata)
+    if prefix is None:
+        return None
+    bits = _value(clip_metadata, "audio_bits_per_sample")
+    if not bits:
+        return None
+    return f"{prefix}|A{bits}"
+
+
+def template_key_with_source(clip_metadata: Mapping[str, Any]) -> TemplateKey:
+    """As ``template_key``, but when the audio depth is absent from
+    ClipMetadata AND the format is one ``AUDIO_BITS_INFERRED`` covers, a
+    depth is inferred and ``inferred`` is True. An explicit depth from the
+    XML always wins over inference."""
+    prefix = _key_prefix(clip_metadata)
+    if prefix is None:
+        return TemplateKey(None, False)
+    bits = _value(clip_metadata, "audio_bits_per_sample")
+    if bits:
+        return TemplateKey(f"{prefix}|A{bits}", False)
+    inferred_bits = AUDIO_BITS_INFERRED.get(prefix)
+    if inferred_bits is None:
+        return TemplateKey(None, False)
+    return TemplateKey(f"{prefix}|A{inferred_bits}", True)
 
 
 def timing(clip_metadata: Mapping[str, Any]) -> Timing:
