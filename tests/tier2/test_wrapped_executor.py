@@ -118,7 +118,9 @@ def test_a_tape_only_item_is_migrated_end_to_end(migrated_db):
     assert [w[3] for w in gateway.writes if w[0] == "register_file"] == [True] * 5
     (new,) = gateway.original_shapes(ITEM)
     assert new.shape_id == row.plan["new_shape_id"]
-    assert gateway.shape_ids(ITEM, "legacy-wrapped") == ["VX-SW"]
+    assert "VX-SW" not in [s.shape_id for s in gateway.original_shapes(ITEM)]
+    (wrapped_doc,) = [d for d in gateway.shapes[ITEM] if d["id"] == "VX-SW"]
+    assert "original" not in wrapped_doc["tag"]
     assert gateway.shape_ids(ITEM, "lowres") == ["VX-LOW"]
     handles = sorted(
         gateway.component_metadata(ITEM, new.shape_id, c.component_id)[
@@ -143,7 +145,7 @@ def test_the_new_shape_is_posted_before_the_wrapped_one_is_detached(migrated_db)
     row, disk = _setup(gateway)
     Executor(gateway, disk).run(row)
     names = gateway.write_names()
-    assert names.index("post_shape") < names.index("retag_shape")
+    assert names.index("post_shape") < names.index("untag_shape")
 
 
 def test_crash_after_post_shape_does_not_post_twice(migrated_db):
@@ -163,7 +165,7 @@ def test_crash_after_post_shape_does_not_post_twice(migrated_db):
 
 @pytest.mark.parametrize(
     "crash_after",
-    ["register_file", "set_component_metadata", "set_item_metadata", "retag_shape"],
+    ["register_file", "set_component_metadata", "set_item_metadata", "untag_shape"],
 )
 def test_every_crash_point_resumes_to_the_same_end_state(migrated_db, crash_after):
     gateway = CrashingGateway(crash_after=crash_after)
@@ -411,7 +413,7 @@ def test_dry_run_writes_nothing_and_lists_every_write(migrated_db):
     names = [w[0] for w in recording.writes]
     assert names.count("register_file") == 5
     assert names.count("post_shape") == 1
-    assert "retag_shape" in names
+    assert "untag_shape" in names
     assert WrappedMigration.objects.get(item_id=ITEM).phase == ""
     assert Clip.objects.get(umid="U1").output_file == OUTPUT
     # the caller's row object is untouched

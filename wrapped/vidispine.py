@@ -142,9 +142,8 @@ class VidispineGateway:
         for key, value in values.items():
             update_or_create_item_metadata(item_id, key, value)
 
-    def retag_shape(self, item_id: str, shape_id: str, add: str, remove: str) -> None:
-        self._request("PUT", f"item/{item_id}/shape/{shape_id}/tag/{add}")
-        self._request("DELETE", f"item/{item_id}/shape/{shape_id}/tag/{remove}")
+    def untag_shape(self, item_id: str, shape_id: str, tag: str) -> None:
+        self._request("DELETE", f"item/{item_id}/shape/{shape_id}/tag/{tag}")
 
     def delete_file(self, storage_id: str, file_id: str) -> None:
         try:

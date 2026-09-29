@@ -127,9 +127,7 @@ class Gateway(Protocol):
 
     def set_item_metadata(self, item_id: str, fields: Mapping[str, str]) -> None: ...
 
-    def retag_shape(
-        self, item_id: str, shape_id: str, add: str, remove: str
-    ) -> None: ...
+    def untag_shape(self, item_id: str, shape_id: str, tag: str) -> None: ...
 
     def file_state(self, storage_id: str, file_id: str) -> Optional[str]:
         """The file's live state; None when it is gone (a 404, never an error)."""

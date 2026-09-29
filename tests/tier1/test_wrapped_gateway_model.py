@@ -34,7 +34,7 @@ def test_a_file_reference_without_details_parses():
     assert (file.file_id, file.storage_id, file.path, file.state) == ("F", "", "", "")
 
 
-def test_the_fake_gateway_posts_and_retags_like_vidispine():
+def test_the_fake_gateway_posts_and_untags_like_vidispine():
     gateway = InMemoryGateway()
     seed_item(gateway, "VX-1", wrapped_p2_document())
     gateway.files[("VX-41", "2016/X/V.MXF")] = "VX-F9"
@@ -42,9 +42,11 @@ def test_the_fake_gateway_posts_and_retags_like_vidispine():
         "VX-1", {"containerComponent": {"file": [{"id": "VX-F9"}]}}
     )
     assert [s.shape_id for s in gateway.original_shapes("VX-1")] == ["VX-SW", new_id]
-    gateway.retag_shape("VX-1", "VX-SW", add="legacy-wrapped", remove="original")
+    gateway.untag_shape("VX-1", "VX-SW", "original")
     assert [s.shape_id for s in gateway.original_shapes("VX-1")] == [new_id]
-    assert gateway.shape_ids("VX-1", "legacy-wrapped") == ["VX-SW"]
+    # the shape stays on the item, just without the "original" tag
+    (untagged,) = [d for d in gateway.shapes["VX-1"] if d["id"] == "VX-SW"]
+    assert "original" not in untagged["tag"]
     (posted,) = gateway.original_shapes("VX-1")
     (file,) = posted.files().values()
     assert (file.file_id, file.path) == ("VX-F9", "2016/X/V.MXF")

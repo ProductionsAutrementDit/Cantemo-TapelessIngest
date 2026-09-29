@@ -5,6 +5,14 @@ one, so a killed run resumes at the next phase. Every phase re-checks
 Vidispine before writing: ``shape/create`` ADDS shapes (measured,
 VX-216897), so the shape phase first looks for an original shape that
 already names these files.
+
+Manual undo (no code performs this): ``PUT
+/API/item/{item_id}/shape/{wrapped_shape_id}/tag/original`` restores the
+``original`` tag this executor removed from the wrapped shape; remove the
+``original`` tag from the newly posted shape (``row.plan["new_shape_id"]``);
+then restore the Clip row from ``rollback["clip"]`` (``output_file``,
+``file_id``, ``status``, ``job_id``) and the item's fields from
+``rollback["item_fields"]``.
 """
 
 import copy
@@ -224,12 +232,7 @@ class Executor:
         if any(
             s.shape_id == wrapped_id for s in self.gateway.original_shapes(row.item_id)
         ):
-            self.gateway.retag_shape(
-                row.item_id,
-                wrapped_id,
-                add=fields.LEGACY_WRAPPED_TAG,
-                remove=fields.ORIGINAL_TAG,
-            )
+            self.gateway.untag_shape(row.item_id, wrapped_id, fields.ORIGINAL_TAG)
 
     def _update_clip(self, row) -> None:
         video_file_id = self._file_ids(row, "video")[0]

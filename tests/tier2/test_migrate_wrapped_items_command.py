@@ -163,7 +163,7 @@ def test_apply_dryrun_prints_writes_and_changes_nothing(migrated_db):
     world = _world()
     _run(world, "plan")
     out = _run(world, "apply", "--all", "--dryrun")
-    assert "post_shape" in out and "retag_shape" in out
+    assert "post_shape" in out and "untag_shape" in out
     assert world[0].writes == []
     assert WrappedMigration.objects.get(item_id="VX-1").phase == ""
 

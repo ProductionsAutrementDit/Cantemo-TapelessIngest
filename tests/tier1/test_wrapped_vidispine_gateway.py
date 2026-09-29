@@ -113,16 +113,12 @@ def test_metadata_writes_go_one_key_at_a_time():
     assert (item["field_name"], item["value"]) == ("af_p5_barcodes", "AH012AL7")
 
 
-def test_retag_adds_the_legacy_tag_before_removing_original():
-    RestTransportFake.route(
-        "PUT", r".*/item/VX-1/shape/S/tag/legacy-wrapped", lambda m, q: None
-    )
+def test_untag_shape_is_a_single_delete_and_no_put():
     RestTransportFake.route(
         "DELETE", r".*/item/VX-1/shape/S/tag/original", lambda m, q: None
     )
-    VidispineGateway().retag_shape("VX-1", "S", add="legacy-wrapped", remove="original")
+    VidispineGateway().untag_shape("VX-1", "S", "original")
     assert [(c["method"], c["path"].rsplit("/", 1)[-1]) for c in _calls("rest")] == [
-        ("PUT", "legacy-wrapped"),
         ("DELETE", "original"),
     ]
 

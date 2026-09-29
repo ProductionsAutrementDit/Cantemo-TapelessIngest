@@ -162,12 +162,11 @@ class InMemoryGateway:
         self.items.setdefault(item_id, {}).update({k: [v] for k, v in fields.items()})
         self.writes.append(("set_item_metadata", item_id, dict(fields)))
 
-    def retag_shape(self, item_id, shape_id, add, remove):
+    def untag_shape(self, item_id, shape_id, tag):
         for document in self.shapes.get(item_id, []):
             if document["id"] == shape_id:
-                tags = [t for t in document.get("tag", []) if t != remove]
-                document["tag"] = tags + ([add] if add not in tags else [])
-        self.writes.append(("retag_shape", item_id, shape_id, add, remove))
+                document["tag"] = [t for t in document.get("tag", []) if t != tag]
+        self.writes.append(("untag_shape", item_id, shape_id, tag))
 
     def delete_file(self, storage_id, file_id):
         self.file_states[(storage_id, file_id)] = None

@@ -84,9 +84,9 @@ class RecordingGateway:
     def set_item_metadata(self, item_id, fields_):
         self.writes.append(("set_item_metadata", item_id, dict(fields_)))
 
-    def retag_shape(self, item_id, shape_id, add, remove):
+    def untag_shape(self, item_id, shape_id, tag):
         self._retagged.add((item_id, shape_id))
-        self.writes.append(("retag_shape", item_id, shape_id, add, remove))
+        self.writes.append(("untag_shape", item_id, shape_id, tag))
 
     def delete_file(self, storage_id, file_id):
         self._deleted_files.add((storage_id, file_id))

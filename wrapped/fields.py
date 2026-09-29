@@ -48,5 +48,3 @@ ONLINE_LEGACY_STORAGES = ("VX-26", "VX-11")
 ONLINE_STATES = ("IMPORTED", "NOT_IMPORTED", "CLOSED")
 ORIGINAL_TAG = "original"
 LOWRES_TAG = "lowres"
-# The wrapped shape is re-tagged, never deleted: reversible, touches no file.
-LEGACY_WRAPPED_TAG = "legacy-wrapped"
