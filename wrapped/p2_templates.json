@@ -1,7 +1,7 @@
 {
   "AVC-I_1080/25p|25p|AVC-I100|A16": {
     "reference_item": "VX-39331",
-    "references": 601,
+    "references": 2003,
     "share": 1.0,
     "template": {
       "audioComponent": [
@@ -161,7 +161,7 @@
   },
   "AVC-I_1080/50i|50i|AVC-I100|A16": {
     "reference_item": "VX-10037",
-    "references": 4942,
+    "references": 5024,
     "share": 1.0,
     "template": {
       "audioComponent": [
@@ -239,10 +239,90 @@
       ]
     }
   },
+  "AVC-I_1080/50i|50i|AVC-I50|A16": {
+    "reference_item": "VX-13021",
+    "references": 19,
+    "share": 1.0,
+    "template": {
+      "audioComponent": [
+        {
+          "bitrate": 768000,
+          "channelCount": 1,
+          "channelLayout": 0,
+          "codec": "pcm_s16le",
+          "frameSize": 1,
+          "sampleFormat": "AV_SAMPLE_FMT_S16",
+          "timeBase": {
+            "denominator": 48000,
+            "numerator": 1
+          }
+        }
+      ],
+      "containerComponent": {
+        "dropFrame": false,
+        "format": "mxf",
+        "roundedTimeBase": 25
+      },
+      "mimeType": [
+        "video/x-mxf-h264-pcm_s16le"
+      ],
+      "videoComponent": [
+        {
+          "averageFrameRate": {
+            "denominator": 1,
+            "numerator": 25
+          },
+          "bitDepth": 10,
+          "bitsPerPixel": 15,
+          "codec": "h264",
+          "codecTimeBase": {
+            "denominator": 50,
+            "numerator": 1
+          },
+          "containerSAR": {
+            "horizontal": 1,
+            "vertical": 1
+          },
+          "displayHeight": {
+            "denominator": 1,
+            "numerator": 1080
+          },
+          "displayWidth": {
+            "denominator": 1,
+            "numerator": 1920
+          },
+          "extradata": "00000001091000000001676E1028A6D42032330C7118886210191986388C44302102564E6E61873E734D980C03069C0B73E6C0B518630D39E05B02D4C6191A798C323424F0168113F7FF8001800271808080A000000300200000065080000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000168EE31121100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+          "fieldOrder": "F2",
+          "level": 40,
+          "maxBFrames": 0,
+          "max_packet_size": 296548,
+          "pixelAspectRatio": {
+            "horizontal": 4,
+            "vertical": 3
+          },
+          "pixelFormat": "yuv420p10le",
+          "profile": 2158,
+          "realBaseFrameRate": {
+            "denominator": 1,
+            "numerator": 25
+          },
+          "resolution": {
+            "height": 1080,
+            "width": 1440
+          },
+          "ticks_per_frame": 2,
+          "timeBase": {
+            "denominator": 25,
+            "numerator": 1
+          }
+        }
+      ]
+    }
+  },
   "DV100_1080/50i|50i|A16": {
     "reference_item": "VX-20035",
-    "references": 2573,
-    "share": 0.9743,
+    "references": 2593,
+    "share": 0.9744,
     "template": {
       "audioComponent": [
         {
