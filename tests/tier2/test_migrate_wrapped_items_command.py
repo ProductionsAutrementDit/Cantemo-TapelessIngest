@@ -36,6 +36,7 @@ def _world(
     metadata=None,
     duration="8.72",
     cpaa_marker=None,
+    folders=None,
 ):
     gateway, archive = InMemoryGateway(), FakeArchive()
     for n, item_id in enumerate(items):
@@ -56,7 +57,8 @@ def _world(
             status=Clip.STATUS_IMPORTED,
         )
         _store_metadata(clip, (metadata or {}).get(item_id) or {})
-        for original in p2_originals(clip_dir=f"2016/AH_{n}/CONTENTS"):
+        folder = (folders or {}).get(item_id, f"2016/AH_{n}")
+        for original in p2_originals(clip_dir=f"{folder}/CONTENTS"):
             ClipFile.objects.create(
                 clip=clip, path=LEGACY + original.relative, filetype=original.kind
             )
@@ -682,11 +684,14 @@ def test_templates_separates_the_audio_depth_variants(migrated_db):
 # relocate: align migrated items on the folder names P5 knows
 
 OLD, NEW = "2016/AH_0/", "2016/AH_140710_RENAMED/"
+# A sibling shoot whose folder name starts with OLD's, as 2014/140710_...
+# does for unrelated shoots on prod: it must never be touched.
+SIBLING = "2016/AH_0 bis"
 
 
 def _migrated():
-    """VX-1 under OLD and VX-2 elsewhere, both applied to phase done."""
-    world = _world(("VX-1", "VX-2"))
+    """VX-1 under OLD, VX-2 elsewhere and VX-3 in the sibling, all done."""
+    world = _world(("VX-1", "VX-2", "VX-3"), folders={"VX-3": SIBLING})
     _run(world, "plan")
     _run(world, "apply", "--all")
     assert set(WrappedMigration.objects.values_list("phase", flat=True)) == {"done"}
@@ -722,7 +727,7 @@ def test_relocate_moves_a_done_row_onto_the_new_folder(migrated_db, tmp_path):
     before = _originals("VX-1")
     assert len(before) == 5
     gateway.items["VX-1"]["originalFilename"] = [_video(before)["relative"]]
-    untouched = _originals("VX-2")
+    untouched = {i: _originals(i) for i in ("VX-2", "VX-3")}
     out = _relocate(world, tmp_path)
     after = _originals("VX-1")
     assert [o["relative"] for o in after] == [
@@ -742,7 +747,9 @@ def test_relocate_moves_a_done_row_onto_the_new_folder(migrated_db, tmp_path):
     assert "VX-1: relocated 5 files" in out
     assert "relocated: 1" in out and "failed: 0" in out
     assert "VX-1: ok" in _run(world, "verify")
-    assert _originals("VX-2") == untouched
+    assert {i: _originals(i) for i in ("VX-2", "VX-3")} == untouched
+    relocated_ids = {w[2] for w in gateway.writes if w[0] == "relocate_file"}
+    assert relocated_ids == {o["file_id"] for o in before}
 
 
 def test_relocate_leaves_an_originalfilename_that_is_not_the_old_path(
@@ -751,7 +758,8 @@ def test_relocate_leaves_an_originalfilename_that_is_not_the_old_path(
     world = _migrated()
     world[0].items["VX-1"]["originalFilename"] = ["00924E.MXF"]
     applied = len(world[0].writes)
-    _relocate(world, tmp_path)
+    out = _relocate(world, tmp_path)
+    assert "VX-1: originalFilename left as ['00924E.MXF']" in out
     assert world[0].items["VX-1"]["originalFilename"] == ["00924E.MXF"]
     assert "set_item_metadata" not in world[0].write_names()[applied:]
 
@@ -761,6 +769,8 @@ def test_relocate_finishes_after_a_crash_between_relocate_and_state(
 ):
     world = _migrated()
     gateway = world[0]
+    video_before = _video(_originals("VX-1"))["relative"]
+    gateway.items["VX-1"]["originalFilename"] = [video_before]
     real_relocate = gateway.relocate_file
     crashed = []
 
@@ -795,6 +805,10 @@ def test_relocate_finishes_after_a_crash_between_relocate_and_state(
     assert all(gateway.file_state("VX-41", o["file_id"]) == "ARCHIVED" for o in after)
     assert gateway.write_names().count("relocate_file") == 5
     assert WrappedMigration.objects.get(item_id="VX-1").error == ""
+    # the crashed file was the video: its resume still moved originalFilename
+    assert crashed[0][2] == NEW + video_before[len(OLD) :]
+    assert gateway.items["VX-1"]["originalFilename"] == [_video(after)["relative"]]
+    assert Clip.objects.get(item_id="VX-1").file_id == _video(after)["file_id"]
     assert "VX-1: ok" in _run(world, "verify")
 
 
@@ -848,7 +862,7 @@ def test_relocate_backs_up_then_rewrites_the_clipfiles(migrated_db, tmp_path):
         .values_list("pk", "path")
     )
     kept = list(
-        ClipFile.objects.filter(clip__item_id="VX-2")
+        ClipFile.objects.filter(clip__item_id__in=("VX-2", "VX-3"))
         .order_by("pk")
         .values_list("pk", "path")
     )
@@ -865,12 +879,13 @@ def test_relocate_backs_up_then_rewrites_the_clipfiles(migrated_db, tmp_path):
     ]
     assert (
         list(
-            ClipFile.objects.filter(clip__item_id="VX-2")
+            ClipFile.objects.filter(clip__item_id__in=("VX-2", "VX-3"))
             .order_by("pk")
             .values_list("pk", "path")
         )
         == kept
     )
+    assert sum(SIBLING + "/" in path for _, path in kept) == 5
     assert "clipfiles rewritten: 5" in out
 
 
@@ -895,6 +910,8 @@ def test_relocate_dryrun_prints_every_write_and_changes_nothing(migrated_db, tmp
     assert out.count("VX-1: set_file_state") == 5
     assert "VX-1: set_item_metadata" in out and "VX-1: clip_update" in out
     assert out.count("clipfile ") == 5
+    assert SIBLING not in out
+    assert "VX-3" not in out
     assert len(gateway.writes) == writes
     assert WrappedMigration.objects.get(item_id="VX-1").plan == plan
     assert Clip.objects.get(item_id="VX-1").file_id == clip_file_id
@@ -922,3 +939,199 @@ def test_relocate_dryrun_prints_every_write_and_changes_nothing(migrated_db, tmp
 def test_relocate_arguments_are_validated(migrated_db, args, message):
     with pytest.raises(CommandError, match=message):
         _run(_world(), *args)
+
+
+def _again(world, tmp_path, name, *extra):
+    return _run(
+        world,
+        "relocate",
+        "--from",
+        OLD,
+        "--to",
+        NEW,
+        "--backup",
+        str(tmp_path / name),
+        *extra,
+    )
+
+
+def _new_path(relative):
+    return NEW + relative[len(OLD) :]
+
+
+def test_relocate_refuses_an_entity_already_at_the_new_path(migrated_db, tmp_path):
+    # I-1: an AH_ entity from a storage scan must never be adopted. The
+    # conflict is on the LAST original: the row is still left untouched.
+    world = _migrated()
+    gateway = world[0]
+    last = _originals("VX-1")[-1]
+    gateway.files[("VX-41", _new_path(last["relative"]))] = "VX-ORPHAN"
+    plan = WrappedMigration.objects.get(item_id="VX-1").plan
+    clip_file_id = Clip.objects.get(item_id="VX-1").file_id
+    writes = len(gateway.writes)
+    dry = _run(world, "relocate", "--from", OLD, "--to", NEW, "--dryrun")
+    assert "VX-1: FAILED" in dry and "conflict: entity already at new path" in dry
+    out = _relocate(world, tmp_path)
+    assert "VX-1: FAILED" in out and "conflict: entity already at new path" in out
+    assert "VX-ORPHAN" in out
+    assert len(gateway.writes) == writes
+    row = WrappedMigration.objects.get(item_id="VX-1")
+    assert row.plan == plan and "conflict" in row.error
+    assert Clip.objects.get(item_id="VX-1").file_id == clip_file_id
+
+
+def test_relocate_refuses_a_new_entity_the_shape_does_not_reference(
+    migrated_db, tmp_path
+):
+    # I-1: a relocation that leaves the shape on another entity stops
+    # before the state, Clip, originalFilename and plan writes.
+    world = _migrated()
+    gateway = world[0]
+    video = _video(_originals("VX-1"))
+    gateway.items["VX-1"]["originalFilename"] = [video["relative"]]
+
+    def unreferenced(storage_id, file_id, new_relative):
+        (key,) = [k for k, v in gateway.files.items() if v == file_id]
+        del gateway.files[key]
+        gateway.files[(storage_id, new_relative)] = "VX-STRAY"
+        gateway.file_states[(storage_id, "VX-STRAY")] = "OPEN"
+        gateway.writes.append(("relocate_file", storage_id, file_id, new_relative))
+
+    gateway.relocate_file = unreferenced
+    clip_file_id = Clip.objects.get(item_id="VX-1").file_id
+    out = _relocate(world, tmp_path)
+    assert "VX-1: FAILED" in out and "VX-STRAY" in out
+    assert "set_file_state" not in gateway.write_names()
+    assert gateway.items["VX-1"]["originalFilename"] == [video["relative"]]
+    assert Clip.objects.get(item_id="VX-1").file_id == clip_file_id
+    assert _video(_originals("VX-1")) == video
+
+
+def test_relocate_refuses_an_old_entity_that_is_not_the_planned_one(
+    migrated_db, tmp_path
+):
+    world = _migrated()
+    gateway = world[0]
+    first = _originals("VX-1")[0]
+    gateway.files[("VX-41", first["relative"])] = "VX-OTHER"
+    writes = len(gateway.writes)
+    out = _relocate(world, tmp_path)
+    assert "VX-1: FAILED" in out and "VX-OTHER" in out
+    assert len(gateway.writes) == writes
+
+
+def test_relocate_refuses_an_original_with_no_entity_at_either_path(
+    migrated_db, tmp_path
+):
+    world = _migrated()
+    gateway = world[0]
+    last = _originals("VX-1")[-1]
+    del gateway.files[("VX-41", last["relative"])]
+    writes = len(gateway.writes)
+    out = _relocate(world, tmp_path)
+    assert "VX-1: FAILED" in out and "no VX-41 entity" in out
+    assert len(gateway.writes) == writes
+
+
+def test_relocate_skips_a_row_that_already_fails_verify(migrated_db, tmp_path):
+    # I-2: a failure that predates the relocation is reported as such,
+    # and nothing is written for that row.
+    world = _migrated()
+    gateway = world[0]
+    gateway.shapes["VX-1"].append({"id": "VX-EXTRA-LOW", "tag": ["lowres"]})
+    plan = WrappedMigration.objects.get(item_id="VX-1").plan
+    writes = len(gateway.writes)
+    out = _relocate(world, tmp_path)
+    assert "VX-1: pre-existing verify failure: lowres shapes" in out
+    assert "pre-existing verify failure: 1" in out
+    assert len(gateway.writes) == writes
+    row = WrappedMigration.objects.get(item_id="VX-1")
+    assert (row.plan, row.error) == (plan, "")
+
+
+def test_relocate_rechecks_a_moved_row_until_it_verifies(migrated_db, tmp_path):
+    # I-2: every file moved, then verify failed: the row stays selected
+    # on the next runs, and its error is cleared once verify passes.
+    world = _migrated()
+    gateway = world[0]
+    real_relocate = gateway.relocate_file
+
+    def relocate_and_break_lowres(*args):
+        real_relocate(*args)
+        if not any(d["id"] == "VX-NEW-LOW" for d in gateway.shapes["VX-1"]):
+            gateway.shapes["VX-1"].append({"id": "VX-NEW-LOW", "tag": ["lowres"]})
+
+    gateway.relocate_file = relocate_and_break_lowres
+    out = _relocate(world, tmp_path)
+    assert "VX-1: FAILED" in out and "lowres" in out
+    assert all(o["relative"].startswith(NEW) for o in _originals("VX-1"))
+    out = _again(world, tmp_path, "second.json")
+    assert "VX-1: FAILED" in out and "lowres" in out
+    assert "failed: 1" in out
+    gateway.shapes["VX-1"] = [
+        d for d in gateway.shapes["VX-1"] if d["id"] != "VX-NEW-LOW"
+    ]
+    # a file left OPEN (say, reset by hand) is set back to ARCHIVED
+    video = _video(_originals("VX-1"))
+    gateway.file_states[("VX-41", video["file_id"])] = "OPEN"
+    out = _again(world, tmp_path, "third.json")
+    assert "VX-1: rechecked 5 relocated files" in out
+    assert gateway.file_state("VX-41", video["file_id"]) == "ARCHIVED"
+    assert "relocate_file" not in [
+        w[0] for w in gateway.writes[-2:]
+    ]  # the recheck never relocates
+    assert WrappedMigration.objects.get(item_id="VX-1").error == ""
+
+
+def test_relocate_never_rechecks_a_row_planned_under_the_new_folder(
+    migrated_db, tmp_path
+):
+    # A row re-planned from the rewritten ClipFiles lives under NEW from the
+    # start: its on-disk originals are CLOSED and must stay so.
+    world = _world(("VX-1",), folders={"VX-1": NEW.rstrip("/")})
+    world[1].entries.clear()
+    world[2].contents.update(
+        {o.relative: b"x" for o in p2_originals(clip_dir=NEW + "CONTENTS")}
+    )
+    _run(world, "plan")
+    _run(world, "apply", "--all")
+    assert WrappedMigration.objects.get(item_id="VX-1").phase == "done"
+    writes = len(world[0].writes)
+    out = _relocate(world, tmp_path)
+    assert "VX-1" not in out
+    assert len(world[0].writes) == writes
+
+
+def test_relocate_moves_only_the_originals_under_the_old_folder(migrated_db, tmp_path):
+    world = _migrated()
+    row = WrappedMigration.objects.get(item_id="VX-1")
+    elsewhere = "2016/ELSEWHERE/CONTENTS/AUDIO/00924E03.MXF"
+    row.plan["originals"][-1]["relative"] = elsewhere
+    row.save()
+    out = _relocate(world, tmp_path)
+    assert "VX-1: relocated 4 files" in out
+    after = _originals("VX-1")
+    assert after[-1]["relative"] == elsewhere
+    assert all(o["relative"].startswith(NEW) for o in after[:-1])
+
+
+def test_relocate_limit_counts_the_rows_it_moves(migrated_db, tmp_path):
+    world = _world(("VX-1", "VX-2"), folders={"VX-2": OLD + "SUB"})
+    _run(world, "plan")
+    _run(world, "apply", "--all")
+    out = _relocate(world, tmp_path, "--limit", "1")
+    assert "relocated: 1" in out
+    assert all(o["relative"].startswith(NEW) for o in _originals("VX-1"))
+    assert all(o["relative"].startswith(OLD) for o in _originals("VX-2"))
+
+
+def test_relocate_never_overwrites_a_clip_moved_off_the_old_video(
+    migrated_db, tmp_path
+):
+    # M-3: a Clip re-pointed by hand since apply is a failure, not a target.
+    world = _migrated()
+    Clip.objects.filter(item_id="VX-1").update(file_id="VX-HAND")
+    out = _relocate(world, tmp_path)
+    assert "VX-1: FAILED" in out and "clip update matched 0 row(s)" in out
+    assert Clip.objects.get(item_id="VX-1").file_id == "VX-HAND"
+    assert _video(_originals("VX-1"))["relative"].startswith(OLD)

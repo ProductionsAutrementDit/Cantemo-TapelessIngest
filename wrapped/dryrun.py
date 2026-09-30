@@ -12,6 +12,13 @@ import copy
 from portal.plugins.TapelessIngest.wrapped import fields
 from portal.plugins.TapelessIngest.wrapped.gateway import FileEntity, parse_shape
 
+_COMPONENT_KEYS = (
+    "containerComponent",
+    "videoComponent",
+    "audioComponent",
+    "binaryComponent",
+)
+
 
 class RecordingGateway:
     def __init__(self, inner):
@@ -22,6 +29,7 @@ class RecordingGateway:
         self._retagged = set()
         self._deleted_files = set()
         self._states = {}  # (storage_id, file_id) -> state this run set
+        self._relocated = {}  # old file_id -> (new file_id, new relative)
         self._minted = 0
 
     def _mint(self, prefix):
@@ -30,12 +38,27 @@ class RecordingGateway:
 
     # reads
     def original_shapes(self, item_id):
-        shapes = [
-            s
+        documents = [
+            s.to_document()
             for s in self._inner.original_shapes(item_id)
             if (item_id, s.shape_id) not in self._retagged
         ]
-        return shapes + [parse_shape(d) for d in self._posted.get(item_id, [])]
+        documents += copy.deepcopy(self._posted.get(item_id, []))
+        return [parse_shape(self._repoint(d)) for d in documents]
+
+    def _repoint(self, document):
+        """As Vidispine does on relocate: components name the new entity."""
+        if not self._relocated:
+            return document
+        document = copy.deepcopy(document)
+        for key in _COMPONENT_KEYS:
+            raw = document.get(key)
+            for body in raw if isinstance(raw, list) else [raw] if raw else []:
+                for file in body.get("file", []):
+                    if file.get("id") in self._relocated:
+                        new_id, new_relative = self._relocated[file["id"]]
+                        file.update(id=new_id, path=new_relative, state="OPEN")
+        return document
 
     def find_file(self, storage_id, relative):
         if (storage_id, relative) in self._files:
@@ -102,6 +125,7 @@ class RecordingGateway:
         self._deleted_files.add((storage_id, file_id))
         self._files[(storage_id, new_relative)] = (new_id, "OPEN")
         self._states[(storage_id, new_id)] = "OPEN"
+        self._relocated[file_id] = (new_id, new_relative)
         self.writes.append(("relocate_file", storage_id, file_id, new_relative))
 
     def set_file_state(self, storage_id, file_id, state):

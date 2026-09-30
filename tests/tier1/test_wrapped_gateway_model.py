@@ -1,5 +1,7 @@
 """Tier 1: Vidispine shape JSON <-> the migration's value objects."""
 
+import pytest
+
 from portal.plugins.TapelessIngest.wrapped.dryrun import RecordingGateway
 from portal.plugins.TapelessIngest.wrapped.gateway import Gateway, parse_shape
 from tests.wrapped_fakes import InMemoryGateway, seed_item, wrapped_p2_document
@@ -116,3 +118,33 @@ def test_the_recording_gateway_records_a_relocation_and_reads_coherently():
     # nothing reached the real gateway
     assert inner.writes == []
     assert inner.find_file("VX-41", "2014/OLD/V.MXF").file_id == "VX-OLD1"
+
+
+def test_the_fake_gateway_refuses_to_relocate_onto_a_taken_path():
+    gateway = InMemoryGateway()
+    _relocatable(gateway)
+    gateway.files[("VX-41", "2014/AH_NEW/V.MXF")] = "VX-TAKEN"
+    with pytest.raises(ValueError, match="VX-TAKEN"):
+        gateway.relocate_file("VX-41", "VX-OLD1", "2014/AH_NEW/V.MXF")
+    assert gateway.find_file("VX-41", "2014/OLD/V.MXF").file_id == "VX-OLD1"
+
+
+def test_the_recording_gateway_repoints_the_shapes_it_relocated():
+    inner = InMemoryGateway()
+    _relocatable(inner)
+    recording = RecordingGateway(inner)
+    recording.relocate_file("VX-41", "VX-OLD1", "2014/AH_NEW/V.MXF")
+    moved = recording.find_file("VX-41", "2014/AH_NEW/V.MXF")
+    (shape,) = recording.original_shapes("VX-1")
+    assert shape.file_ids() == frozenset({moved.file_id})
+    (inner_shape,) = inner.original_shapes("VX-1")
+    assert inner_shape.file_ids() == frozenset({"VX-OLD1"})
+
+
+def test_the_recording_gateway_forgets_a_file_it_deleted():
+    inner = InMemoryGateway()
+    _relocatable(inner)
+    recording = RecordingGateway(inner)
+    recording.delete_file("VX-41", "VX-OLD1")
+    assert recording.find_file("VX-41", "2014/OLD/V.MXF") is None
+    assert recording.file_state("VX-41", "VX-OLD1") is None

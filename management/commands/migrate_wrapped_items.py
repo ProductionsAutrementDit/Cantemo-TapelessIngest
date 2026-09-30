@@ -50,7 +50,12 @@ from portal.plugins.TapelessIngest.wrapped.dryrun import RecordingGateway
 from portal.plugins.TapelessIngest.wrapped.executor import Executor
 from portal.plugins.TapelessIngest.wrapped.gateway import parse_shape
 from portal.plugins.TapelessIngest.wrapped.planner import PlanResult, plan_item
-from portal.plugins.TapelessIngest.wrapped.relocate import Relocator, under
+from portal.plugins.TapelessIngest.wrapped.relocate import (
+    PreexistingVerifyFailure,
+    Relocator,
+    relocated,
+    under,
+)
 from portal.plugins.TapelessIngest.wrapped.resolver import (
     ResolveError,
     resolve_p2,
@@ -174,7 +179,8 @@ class Command(BaseCommand):
         parser.add_argument(
             "--backup",
             help="relocate: new JSON file for the [pk, old path] of every "
-            "rewritten ClipFile (required unless --dryrun)",
+            "rewritten ClipFile (required unless --dryrun). The ClipFile step "
+            "is folder-wide: --item, --collection and --limit do not scope it",
         )
 
     def handle(self, *args, **options):
@@ -363,6 +369,9 @@ class Command(BaseCommand):
         to_relocate = []
         for row in self._rows(options):
             if not under(row.plan, old):
+                # Moved by an earlier run: rechecked until it verifies.
+                if row.phase == "done" and relocated(row.plan, old, new):
+                    to_relocate.append(row)
                 continue
             if not row.phase:
                 counts["to re-plan"] += 1
@@ -379,6 +388,13 @@ class Command(BaseCommand):
             relocator = Relocator(used, old, new, persist=not dry)
             try:
                 moved = relocator.run(row)
+            except PreexistingVerifyFailure as error:
+                # Not ours: nothing was written, row.error included.
+                counts["pre-existing verify failure"] += 1
+                self.stdout.write(
+                    f"{row.item_id}: pre-existing verify failure: {error}"
+                )
+                continue
             except Exception as error:  # noqa: BLE001 - isolate the item
                 counts["failed"] += 1
                 row.error = f"relocate: {type(error).__name__}: {error}"
@@ -386,9 +402,17 @@ class Command(BaseCommand):
                     row.save(update_fields=["error", "updated_on"])
                 self.stdout.write(f"{row.item_id}: FAILED {row.error}")
                 continue
-            counts["relocated"] += 1
-            counts["files"] += moved
-            self.stdout.write(f"{row.item_id}: relocated {moved} files")
+            for note in relocator.notes:
+                self.stdout.write(f"{row.item_id}: {note}")
+            if moved:
+                counts["relocated"] += 1
+                counts["files"] += moved
+                self.stdout.write(f"{row.item_id}: relocated {moved} files")
+            else:
+                counts["rechecked"] += 1
+                self.stdout.write(
+                    f"{row.item_id}: rechecked {relocator.rechecked} relocated files"
+                )
             if dry:
                 for write in used.writes:
                     self.stdout.write(f"{row.item_id}: {write[0]} {write[1:]}")
@@ -403,7 +427,9 @@ class Command(BaseCommand):
                 for name in (
                     "relocated",
                     "files",
+                    "rechecked",
                     "failed",
+                    "pre-existing verify failure",
                     "to re-plan",
                     "in progress",
                 )

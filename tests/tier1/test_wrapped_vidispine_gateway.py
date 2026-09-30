@@ -1,5 +1,7 @@
 """Tier 1: VidispineGateway against the Portal stub — URLs and calls."""
 
+import pytest
+
 from tests.portal_stub import RestTransportFake, StorageHelperFake, VidispineFake
 
 from portal.plugins.TapelessIngest.wrapped.vidispine import VidispineGateway
@@ -138,10 +140,21 @@ def test_file_state_is_none_for_a_file_that_is_gone():
     assert VidispineGateway().file_state("VX-26", "VX-UNKNOWN") is None
 
 
-def test_relocate_file_posts_the_new_path_as_an_encoded_query():
+@pytest.mark.parametrize(
+    "new, encoded",
+    [
+        (
+            "2014/AH_140710_EC225_Shaft_New Shaft retrofit MRO/C/VIDEO/0001AB.MXF",
+            ("%20",),
+        ),
+        ("2014/AH_A&B+C #1 50%/C/VIDEO/0001AB.MXF", ("%26", "%2B", "%23", "%25")),
+        ("2014/AH_\u00c9quipe/C/VIDEO/0001AB.MXF", ("%C3%89",)),
+    ],
+)
+def test_relocate_file_posts_the_new_path_as_an_encoded_query(new, encoded):
     # Portal's RestURL joins query values raw, so the gateway encodes the
-    # path itself: shoot folders carry spaces.
-    new = "2014/AH_140710_EC225_Shaft_New Shaft retrofit MRO/C/VIDEO/0001AB.MXF"
+    # path itself: shoot folders carry spaces, and a raw + would decode as
+    # a space.
     RestTransportFake.route(
         "POST", r".*/storage/VX-41/file/VX-F1/path", lambda m, q: {"id": "VX-F2"}
     )
@@ -150,6 +163,8 @@ def test_relocate_file_posts_the_new_path_as_an_encoded_query():
     assert (call["method"], call["query"]) == ("POST", {"path": [new]})
     (url,) = RestTransportFake.calls
     assert " " not in url
+    for escape in encoded:
+        assert escape in url
 
 
 def test_set_file_state_is_a_single_put():

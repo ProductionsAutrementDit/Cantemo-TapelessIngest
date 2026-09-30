@@ -181,6 +181,11 @@ class InMemoryGateway:
             for key, known in self.files.items()
             if key[0] == storage_id and known == file_id
         ]
+        if (storage_id, new_relative) in self.files:
+            # What Vidispine does then is unmeasured: refuse, loudly.
+            raise ValueError(
+                f"{new_relative} is already {self.files[(storage_id, new_relative)]}"
+            )
         new_id = self._mint("VX-F")
         del self.files[old_key]
         self.files[(storage_id, new_relative)] = new_id
