@@ -15,17 +15,24 @@ Spec: _bmad-output/implementation-artifacts/spec-wrapped-items-migration-p2.md
           technical template per format from the genuine ready rows and
           writes it as JSON to --out (default: stdout, the per-format
           summary then going to stderr)
+  relocate
+          --from OLD/ --to NEW/: aligns rows on a shoot folder renamed after
+          P5 archived it. Rewrites the ClipFile paths (backed up first to
+          --backup, required unless --dryrun), relocates the VX-41
+          entities of "done" rows and sets them back to ARCHIVED; rows
+          never applied are only listed, to be re-planned
 
 Never interactive. A row whose phase is non-empty is frozen against plan.
 """
 
 import json
+import os
 from collections import Counter, defaultdict
 
 from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
 
-from portal.plugins.TapelessIngest.models.clip import Clip, ClipMetadata
+from portal.plugins.TapelessIngest.models.clip import Clip, ClipFile, ClipMetadata
 
 # Registers `Folder`, which `Clip.folders` references lazily. Portal's plugin
 # loading does not import it (plugin.py never reaches views), so without this
@@ -43,6 +50,7 @@ from portal.plugins.TapelessIngest.wrapped.dryrun import RecordingGateway
 from portal.plugins.TapelessIngest.wrapped.executor import Executor
 from portal.plugins.TapelessIngest.wrapped.gateway import parse_shape
 from portal.plugins.TapelessIngest.wrapped.planner import PlanResult, plan_item
+from portal.plugins.TapelessIngest.wrapped.relocate import Relocator, under
 from portal.plugins.TapelessIngest.wrapped.resolver import (
     ResolveError,
     resolve_p2,
@@ -69,6 +77,10 @@ _TEMPLATE_OPTIONS = (("out", "--out"), ("min_refs", "--min-refs"))
 _TEMPLATE_OPTIONS += (("min_share", "--min-share"),)
 _SHOWN_DISAGREEMENTS = 5
 AUDIO_BITS = "audio_bits_per_sample"
+_RELOCATE_OPTIONS = (("from_prefix", "--from"), ("to_prefix", "--to"))
+_RELOCATE_OPTIONS += (("backup", "--backup"),)
+# ClipFile.path keeps the legacy mount points; this is what they share.
+_RUSHES_MARKER = "RUSHES TAPELESS/"
 
 
 def _vidispine_gateway():
@@ -99,7 +111,8 @@ class Command(BaseCommand):
 
     def add_arguments(self, parser):
         parser.add_argument(
-            "action", choices=("plan", "apply", "verify", "report", "templates")
+            "action",
+            choices=("plan", "apply", "verify", "report", "templates", "relocate"),
         )
         parser.add_argument("--item", dest="item_id")
         parser.add_argument("--collection", dest="collection_id")
@@ -148,12 +161,27 @@ class Command(BaseCommand):
             help=f"templates: ... and at least this share of the format's "
             f"references (default {_MIN_SHARE})",
         )
+        parser.add_argument(
+            "--from",
+            dest="from_prefix",
+            help="relocate: the old folder, relative to VX-41, ending with '/'",
+        )
+        parser.add_argument(
+            "--to",
+            dest="to_prefix",
+            help="relocate: the folder P5 knows, relative to VX-41, ending with '/'",
+        )
+        parser.add_argument(
+            "--backup",
+            help="relocate: new JSON file for the [pk, old path] of every "
+            "rewritten ClipFile (required unless --dryrun)",
+        )
 
     def handle(self, *args, **options):
         if options["limit"] is not None and options["limit"] < 1:
             raise CommandError("--limit must be a positive integer")
-        if options["dryrun"] and options["action"] != "apply":
-            raise CommandError("--dryrun only applies to 'apply'")
+        if options["dryrun"] and options["action"] not in ("apply", "relocate"):
+            raise CommandError("--dryrun only applies to 'apply' and 'relocate'")
         if options["delete_online_wrapped"] and options["action"] != "apply":
             raise CommandError("--delete-online-wrapped only applies to 'apply'")
         if options["max_failures"] < 1:
@@ -178,7 +206,33 @@ class Command(BaseCommand):
             raise CommandError("--min-refs must be a positive integer")
         if options["min_share"] is not None and not 0 < options["min_share"] <= 1:
             raise CommandError("--min-share must be in (0, 1]")
+        for name, flag in _RELOCATE_OPTIONS:
+            if options[name] is not None and options["action"] != "relocate":
+                raise CommandError(f"{flag} only applies to 'relocate'")
+        if options["action"] == "relocate":
+            self._check_relocate(options)
         getattr(self, f"_{options['action']}")(options)
+
+    @staticmethod
+    def _check_relocate(options):
+        old, new = options["from_prefix"], options["to_prefix"]
+        for value, flag in ((old, "--from"), (new, "--to")):
+            if not value:
+                raise CommandError(f"relocate needs {flag}")
+            if not value.endswith("/"):
+                raise CommandError(f"{flag} must end with '/': {value!r}")
+        if old == new:
+            raise CommandError("--from and --to must differ")
+        if new.startswith(old):
+            # A relocated path would match --from again on the next run.
+            raise CommandError("--to must not be inside --from")
+        if not options["dryrun"]:
+            if not options["backup"]:
+                raise CommandError("relocate needs --backup (or --dryrun)")
+            if os.path.exists(options["backup"]):
+                raise CommandError(
+                    f"--backup {options['backup']} already exists; never overwritten"
+                )
 
     def _rows(self, options):
         rows = WrappedMigration.objects.all()
@@ -299,6 +353,85 @@ class Command(BaseCommand):
                 row.error = ""
                 row.save(update_fields=["error", "updated_on"])
         self.stdout.write(f"applied: {done}, failed: {failed}")
+
+    def _relocate(self, options):
+        old, new = options["from_prefix"], options["to_prefix"]
+        dry = options["dryrun"]
+        self._relocate_clipfiles(old, new, options["backup"], dry)
+        gateway = self.gateway_factory()
+        counts = Counter()
+        to_relocate = []
+        for row in self._rows(options):
+            if not under(row.plan, old):
+                continue
+            if not row.phase:
+                counts["to re-plan"] += 1
+                self.stdout.write(f"{row.item_id}: to re-plan (never applied)")
+            elif row.phase != "done":
+                counts["in progress"] += 1
+                self.stdout.write(f"{row.item_id}: skipped, in progress ({row.phase})")
+            else:
+                to_relocate.append(row)
+        if options["limit"]:
+            to_relocate = to_relocate[: options["limit"]]
+        for row in to_relocate:
+            used = RecordingGateway(gateway) if dry else gateway
+            relocator = Relocator(used, old, new, persist=not dry)
+            try:
+                moved = relocator.run(row)
+            except Exception as error:  # noqa: BLE001 - isolate the item
+                counts["failed"] += 1
+                row.error = f"relocate: {type(error).__name__}: {error}"
+                if not dry:
+                    row.save(update_fields=["error", "updated_on"])
+                self.stdout.write(f"{row.item_id}: FAILED {row.error}")
+                continue
+            counts["relocated"] += 1
+            counts["files"] += moved
+            self.stdout.write(f"{row.item_id}: relocated {moved} files")
+            if dry:
+                for write in used.writes:
+                    self.stdout.write(f"{row.item_id}: {write[0]} {write[1:]}")
+                for update in relocator.planned_clip_updates:
+                    self.stdout.write(f"{row.item_id}: clip_update {update}")
+            elif row.error:
+                row.error = ""
+                row.save(update_fields=["error", "updated_on"])
+        self.stdout.write(
+            ", ".join(
+                f"{name}: {counts[name]}"
+                for name in (
+                    "relocated",
+                    "files",
+                    "failed",
+                    "to re-plan",
+                    "in progress",
+                )
+            )
+        )
+
+    def _relocate_clipfiles(self, old, new, backup, dry):
+        """Rewrite the ClipFile paths ``plan`` resolves originals from, so
+        a re-plan finds the folder P5 knows. Backed up before any write."""
+        before, after = _RUSHES_MARKER + old, _RUSHES_MARKER + new
+        rows = list(
+            ClipFile.objects.filter(path__contains=before)
+            .order_by("pk")
+            .values_list("pk", "path")
+        )
+        rewritten = [(pk, path, path.replace(before, after, 1)) for pk, path in rows]
+        if dry:
+            for pk, path, target in rewritten:
+                self.stdout.write(f"clipfile {pk}: {path} -> {target}")
+        else:
+            with open(backup, "x", encoding="utf-8") as handle:
+                json.dump([[pk, path] for pk, path in rows], handle, indent=1)
+                handle.write("\n")
+            with transaction.atomic():
+                for pk, _, target in rewritten:
+                    ClipFile.objects.filter(pk=pk).update(path=target)
+        verb = "to rewrite" if dry else "rewritten"
+        self.stdout.write(f"clipfiles {verb}: {len(rewritten)}")
 
     def _verify(self, options):
         gateway = self.gateway_factory()

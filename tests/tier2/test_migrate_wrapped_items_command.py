@@ -677,3 +677,248 @@ def test_templates_separates_the_audio_depth_variants(migrated_db):
     assert written[s16]["references"] == 3 and written[s24]["references"] == 2
     assert written[s16]["template"]["audioComponent"][0]["codec"] == "pcm_s16le"
     assert written[s24]["template"]["audioComponent"][0]["codec"] == "pcm_s24le"
+
+
+# relocate: align migrated items on the folder names P5 knows
+
+OLD, NEW = "2016/AH_0/", "2016/AH_140710_RENAMED/"
+
+
+def _migrated():
+    """VX-1 under OLD and VX-2 elsewhere, both applied to phase done."""
+    world = _world(("VX-1", "VX-2"))
+    _run(world, "plan")
+    _run(world, "apply", "--all")
+    assert set(WrappedMigration.objects.values_list("phase", flat=True)) == {"done"}
+    return world
+
+
+def _relocate(world, tmp_path, *extra):
+    return _run(
+        world,
+        "relocate",
+        "--from",
+        OLD,
+        "--to",
+        NEW,
+        "--backup",
+        str(tmp_path / "clipfiles.json"),
+        *extra,
+    )
+
+
+def _originals(item_id):
+    return WrappedMigration.objects.get(item_id=item_id).plan["originals"]
+
+
+def _video(originals):
+    (video,) = [o for o in originals if o["kind"] == "video"]
+    return video
+
+
+def test_relocate_moves_a_done_row_onto_the_new_folder(migrated_db, tmp_path):
+    world = _migrated()
+    gateway = world[0]
+    before = _originals("VX-1")
+    assert len(before) == 5
+    gateway.items["VX-1"]["originalFilename"] = [_video(before)["relative"]]
+    untouched = _originals("VX-2")
+    out = _relocate(world, tmp_path)
+    after = _originals("VX-1")
+    assert [o["relative"] for o in after] == [
+        NEW + o["relative"][len(OLD) :] for o in before
+    ]
+    assert not {o["file_id"] for o in after} & {o["file_id"] for o in before}
+    for original in after:
+        found = gateway.find_file("VX-41", original["relative"])
+        assert found.file_id == original["file_id"]
+        assert gateway.file_state("VX-41", original["file_id"]) == "ARCHIVED"
+    for original in before:
+        assert gateway.find_file("VX-41", original["relative"]) is None
+    assert Clip.objects.get(item_id="VX-1").file_id == _video(after)["file_id"]
+    assert gateway.items["VX-1"]["originalFilename"] == [_video(after)["relative"]]
+    row = WrappedMigration.objects.get(item_id="VX-1")
+    assert (row.phase, row.error) == ("done", "")
+    assert "VX-1: relocated 5 files" in out
+    assert "relocated: 1" in out and "failed: 0" in out
+    assert "VX-1: ok" in _run(world, "verify")
+    assert _originals("VX-2") == untouched
+
+
+def test_relocate_leaves_an_originalfilename_that_is_not_the_old_path(
+    migrated_db, tmp_path
+):
+    world = _migrated()
+    world[0].items["VX-1"]["originalFilename"] = ["00924E.MXF"]
+    applied = len(world[0].writes)
+    _relocate(world, tmp_path)
+    assert world[0].items["VX-1"]["originalFilename"] == ["00924E.MXF"]
+    assert "set_item_metadata" not in world[0].write_names()[applied:]
+
+
+def test_relocate_finishes_after_a_crash_between_relocate_and_state(
+    migrated_db, tmp_path
+):
+    world = _migrated()
+    gateway = world[0]
+    real_relocate = gateway.relocate_file
+    crashed = []
+
+    def killed_after_first_relocate(*args):
+        real_relocate(*args)
+        if not crashed:
+            crashed.append(args)
+            raise RuntimeError("killed")
+
+    gateway.relocate_file = killed_after_first_relocate
+    out = _relocate(world, tmp_path)
+    assert "VX-1: FAILED" in out and "killed" in out
+    row = WrappedMigration.objects.get(item_id="VX-1")
+    assert "killed" in row.error
+    # the first file moved (OPEN, new id) but the plan still names the old one
+    first = _originals("VX-1")[0]
+    assert first["relative"].startswith(OLD)
+    assert gateway.find_file("VX-41", first["relative"]) is None
+    out = _run(
+        world,
+        "relocate",
+        "--from",
+        OLD,
+        "--to",
+        NEW,
+        "--backup",
+        str(tmp_path / "second.json"),
+    )
+    assert "VX-1: relocated 5 files" in out
+    after = _originals("VX-1")
+    assert all(o["relative"].startswith(NEW) for o in after)
+    assert all(gateway.file_state("VX-41", o["file_id"]) == "ARCHIVED" for o in after)
+    assert gateway.write_names().count("relocate_file") == 5
+    assert WrappedMigration.objects.get(item_id="VX-1").error == ""
+    assert "VX-1: ok" in _run(world, "verify")
+
+
+def test_relocate_is_a_no_op_once_done(migrated_db, tmp_path):
+    world = _migrated()
+    _relocate(world, tmp_path)
+    writes = len(world[0].writes)
+    out = _run(
+        world,
+        "relocate",
+        "--from",
+        OLD,
+        "--to",
+        NEW,
+        "--backup",
+        str(tmp_path / "again.json"),
+    )
+    assert len(world[0].writes) == writes
+    assert "relocated: 0" in out
+
+
+def test_relocate_only_reports_a_row_that_was_never_applied(migrated_db, tmp_path):
+    world = _world(("VX-1", "VX-2"))
+    _run(world, "plan")
+    _run(world, "apply", "--item", "VX-2")
+    plan = WrappedMigration.objects.get(item_id="VX-1").plan
+    writes = len(world[0].writes)
+    out = _relocate(world, tmp_path)
+    assert "VX-1: to re-plan" in out and "to re-plan: 1" in out
+    assert len(world[0].writes) == writes
+    assert WrappedMigration.objects.get(item_id="VX-1").plan == plan
+
+
+def test_relocate_skips_a_row_in_progress(migrated_db, tmp_path):
+    world = _world()
+    _run(world, "plan")
+    _run(world, "apply", "--all")
+    WrappedMigration.objects.filter(item_id="VX-1").update(phase="shape_posted")
+    writes = len(world[0].writes)
+    out = _relocate(world, tmp_path)
+    assert "VX-1: skipped, in progress (shape_posted)" in out
+    assert "in progress: 1" in out
+    assert len(world[0].writes) == writes
+
+
+def test_relocate_backs_up_then_rewrites_the_clipfiles(migrated_db, tmp_path):
+    world = _migrated()
+    moved = list(
+        ClipFile.objects.filter(clip__item_id="VX-1")
+        .order_by("pk")
+        .values_list("pk", "path")
+    )
+    kept = list(
+        ClipFile.objects.filter(clip__item_id="VX-2")
+        .order_by("pk")
+        .values_list("pk", "path")
+    )
+    out = _relocate(world, tmp_path)
+    backup = json.loads((tmp_path / "clipfiles.json").read_text())
+    assert backup == [[pk, path] for pk, path in moved]
+    assert list(
+        ClipFile.objects.filter(clip__item_id="VX-1")
+        .order_by("pk")
+        .values_list("pk", "path")
+    ) == [
+        (pk, path.replace("RUSHES TAPELESS/" + OLD, "RUSHES TAPELESS/" + NEW))
+        for pk, path in moved
+    ]
+    assert (
+        list(
+            ClipFile.objects.filter(clip__item_id="VX-2")
+            .order_by("pk")
+            .values_list("pk", "path")
+        )
+        == kept
+    )
+    assert "clipfiles rewritten: 5" in out
+
+
+def test_relocate_refuses_to_overwrite_a_backup(migrated_db, tmp_path):
+    world = _migrated()
+    (tmp_path / "clipfiles.json").write_text("[]")
+    with pytest.raises(CommandError, match="--backup"):
+        _relocate(world, tmp_path)
+    assert all(o["relative"].startswith(OLD) for o in _originals("VX-1"))
+
+
+def test_relocate_dryrun_prints_every_write_and_changes_nothing(migrated_db, tmp_path):
+    world = _migrated()
+    gateway = world[0]
+    gateway.items["VX-1"]["originalFilename"] = [_video(_originals("VX-1"))["relative"]]
+    writes = len(gateway.writes)
+    plan = WrappedMigration.objects.get(item_id="VX-1").plan
+    clip_file_id = Clip.objects.get(item_id="VX-1").file_id
+    paths = list(ClipFile.objects.order_by("pk").values_list("path", flat=True))
+    out = _run(world, "relocate", "--from", OLD, "--to", NEW, "--dryrun")
+    assert out.count("VX-1: relocate_file") == 5
+    assert out.count("VX-1: set_file_state") == 5
+    assert "VX-1: set_item_metadata" in out and "VX-1: clip_update" in out
+    assert out.count("clipfile ") == 5
+    assert len(gateway.writes) == writes
+    assert WrappedMigration.objects.get(item_id="VX-1").plan == plan
+    assert Clip.objects.get(item_id="VX-1").file_id == clip_file_id
+    assert list(ClipFile.objects.order_by("pk").values_list("path", flat=True)) == (
+        paths
+    )
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize(
+    "args, message",
+    [
+        (["relocate", "--to", NEW, "--dryrun"], "--from"),
+        (["relocate", "--from", OLD, "--dryrun"], "--to"),
+        (["relocate", "--from", "2016/AH_0", "--to", NEW, "--dryrun"], "end with"),
+        (["relocate", "--from", OLD, "--to", "2016/AH_X", "--dryrun"], "end with"),
+        (["relocate", "--from", OLD, "--to", OLD, "--dryrun"], "differ"),
+        (["relocate", "--from", OLD, "--to", OLD + "SUB/", "--dryrun"], "inside"),
+        (["relocate", "--from", OLD, "--to", NEW], "--backup"),
+        (["plan", "--from", OLD], "--from"),
+        (["plan", "--to", NEW], "--to"),
+        (["apply", "--all", "--backup", "b.json"], "--backup"),
+    ],
+)
+def test_relocate_arguments_are_validated(migrated_db, args, message):
+    with pytest.raises(CommandError, match=message):
+        _run(_world(), *args)

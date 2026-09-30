@@ -11,6 +11,7 @@ that ``ItemAPI.createItemShape`` drops.
 """
 
 from typing import Any, Dict, List, Mapping, Optional, Sequence
+from urllib.parse import quote
 
 import simplejson as json
 from RestAPIBase.resturl import RestURL
@@ -144,6 +145,18 @@ class VidispineGateway:
 
     def untag_shape(self, item_id: str, shape_id: str, tag: str) -> None:
         self._request("DELETE", f"item/{item_id}/shape/{shape_id}/tag/{tag}")
+
+    def relocate_file(self, storage_id: str, file_id: str, new_relative: str) -> None:
+        # Encoded here, not through addQuery: Portal's RestURL joins query
+        # values raw, and shoot folders carry spaces.
+        self._request(
+            "POST",
+            f"storage/{storage_id}/file/{file_id}/path"
+            f"?path={quote(new_relative, safe='/')}",
+        )
+
+    def set_file_state(self, storage_id: str, file_id: str, state: str) -> None:
+        self._request("PUT", f"storage/{storage_id}/file/{file_id}/state/{state}")
 
     def delete_file(self, storage_id: str, file_id: str) -> None:
         try:

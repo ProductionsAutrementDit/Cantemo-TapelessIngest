@@ -21,6 +21,7 @@ class RecordingGateway:
         self._posted = {}
         self._retagged = set()
         self._deleted_files = set()
+        self._states = {}  # (storage_id, file_id) -> state this run set
         self._minted = 0
 
     def _mint(self, prefix):
@@ -38,12 +39,19 @@ class RecordingGateway:
 
     def find_file(self, storage_id, relative):
         if (storage_id, relative) in self._files:
-            return FileEntity(*self._files[(storage_id, relative)])
-        return self._inner.find_file(storage_id, relative)
+            file_id, state = self._files[(storage_id, relative)]
+            return FileEntity(file_id, self._states.get((storage_id, file_id), state))
+        found = self._inner.find_file(storage_id, relative)
+        if found is None or (storage_id, found.file_id) in self._deleted_files:
+            return None
+        state = self._states.get((storage_id, found.file_id), found.state)
+        return FileEntity(found.file_id, state)
 
     def file_state(self, storage_id, file_id):
         if (storage_id, file_id) in self._deleted_files:
             return None
+        if (storage_id, file_id) in self._states:
+            return self._states[(storage_id, file_id)]
         return self._inner.file_state(storage_id, file_id)
 
     def shape_ids(self, item_id, tag):
@@ -87,6 +95,18 @@ class RecordingGateway:
     def untag_shape(self, item_id, shape_id, tag):
         self._retagged.add((item_id, shape_id))
         self.writes.append(("untag_shape", item_id, shape_id, tag))
+
+    def relocate_file(self, storage_id, file_id, new_relative):
+        # As Vidispine does it: the old entity goes, a new OPEN one appears.
+        new_id = self._mint("FILE")
+        self._deleted_files.add((storage_id, file_id))
+        self._files[(storage_id, new_relative)] = (new_id, "OPEN")
+        self._states[(storage_id, new_id)] = "OPEN"
+        self.writes.append(("relocate_file", storage_id, file_id, new_relative))
+
+    def set_file_state(self, storage_id, file_id, state):
+        self._states[(storage_id, file_id)] = state
+        self.writes.append(("set_file_state", storage_id, file_id, state))
 
     def delete_file(self, storage_id, file_id):
         self._deleted_files.add((storage_id, file_id))

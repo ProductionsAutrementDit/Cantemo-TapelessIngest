@@ -134,3 +134,13 @@ class Gateway(Protocol):
         ...
 
     def delete_file(self, storage_id: str, file_id: str) -> None: ...
+
+    def relocate_file(self, storage_id: str, file_id: str, new_relative: str) -> None:
+        """Point the entity at another path. Measured on VX-10456: NOT a
+        rename in place. Vidispine drops ``file_id``, creates a NEW entity
+        at ``new_relative`` in state OPEN and swaps it into every shape
+        component that named the old one (component metadata stays). Find
+        the new id with ``find_file``."""
+        ...
+
+    def set_file_state(self, storage_id: str, file_id: str, state: str) -> None: ...

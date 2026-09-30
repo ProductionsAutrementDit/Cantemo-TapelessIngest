@@ -172,6 +172,46 @@ class InMemoryGateway:
         self.file_states[(storage_id, file_id)] = None
         self.writes.append(("delete_file", storage_id, file_id))
 
+    def relocate_file(self, storage_id, file_id, new_relative):
+        # Measured on VX-10456: the old entity is deleted, a NEW one is
+        # created at the new path in state OPEN and swapped into every
+        # component that named the old one; component metadata stays.
+        (old_key,) = [
+            key
+            for key, known in self.files.items()
+            if key[0] == storage_id and known == file_id
+        ]
+        new_id = self._mint("VX-F")
+        del self.files[old_key]
+        self.files[(storage_id, new_relative)] = new_id
+        self.file_states[(storage_id, file_id)] = None
+        self.file_states[(storage_id, new_id)] = "OPEN"
+        for documents in self.shapes.values():
+            for document in documents:
+                for body in _component_bodies(document):
+                    body["file"] = [
+                        (
+                            dict(f, id=new_id, path=new_relative, state="OPEN")
+                            if f.get("id") == file_id
+                            else f
+                        )
+                        for f in body.get("file", [])
+                    ]
+        self.writes.append(("relocate_file", storage_id, file_id, new_relative))
+
+    def set_file_state(self, storage_id, file_id, state):
+        self.file_states[(storage_id, file_id)] = state
+        self.writes.append(("set_file_state", storage_id, file_id, state))
+
+
+def _component_bodies(document):
+    bodies = []
+    for key in ("containerComponent", "videoComponent", "audioComponent"):
+        raw = document.get(key)
+        if raw is not None:
+            bodies.extend(raw if isinstance(raw, list) else [raw])
+    return bodies
+
 
 def wrapped_p2_document(
     shape_id="VX-SW",

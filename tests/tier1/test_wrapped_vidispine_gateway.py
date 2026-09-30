@@ -136,3 +136,27 @@ def test_file_state_reads_the_live_state():
 
 def test_file_state_is_none_for_a_file_that_is_gone():
     assert VidispineGateway().file_state("VX-26", "VX-UNKNOWN") is None
+
+
+def test_relocate_file_posts_the_new_path_as_an_encoded_query():
+    # Portal's RestURL joins query values raw, so the gateway encodes the
+    # path itself: shoot folders carry spaces.
+    new = "2014/AH_140710_EC225_Shaft_New Shaft retrofit MRO/C/VIDEO/0001AB.MXF"
+    RestTransportFake.route(
+        "POST", r".*/storage/VX-41/file/VX-F1/path", lambda m, q: {"id": "VX-F2"}
+    )
+    VidispineGateway().relocate_file("VX-41", "VX-F1", new)
+    (call,) = _calls("rest")
+    assert (call["method"], call["query"]) == ("POST", {"path": [new]})
+    (url,) = RestTransportFake.calls
+    assert " " not in url
+
+
+def test_set_file_state_is_a_single_put():
+    RestTransportFake.route(
+        "PUT", r".*/storage/VX-41/file/VX-F2/state/ARCHIVED", lambda m, q: None
+    )
+    VidispineGateway().set_file_state("VX-41", "VX-F2", "ARCHIVED")
+    assert [(c["method"], c["path"].rsplit("/", 1)[-1]) for c in _calls("rest")] == [
+        ("PUT", "ARCHIVED"),
+    ]
