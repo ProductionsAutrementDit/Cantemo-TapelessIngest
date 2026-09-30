@@ -28,11 +28,14 @@ from portal.plugins.TapelessIngest.wrapped.executor import StepError
 from portal.plugins.TapelessIngest.wrapped.verifier import verify_item
 
 ARCHIVED = "ARCHIVED"
+OPEN = "OPEN"
 RELOCATED_FROM = "relocated_from"
 
 
 class PreexistingVerifyFailure(StepError):
-    """The row failed ``verify_item`` before this command wrote anything."""
+    """The row fails ``verify_item`` and this command never wrote to it:
+    no original carries ``relocated_from`` and no killed run left an
+    entity at a new path."""
 
 
 def under(plan: Mapping, prefix: str) -> bool:
@@ -91,6 +94,7 @@ class Relocator:
         projected = copy.copy(row)
         projected.plan = copy.deepcopy(row.plan)
         by_relative = {o["relative"]: o for o in projected.plan["originals"]}
+        resumed: List[str] = []
         for original in pending:
             old_rel = original["relative"]
             new_rel = self._new_relative(old_rel)
@@ -113,9 +117,25 @@ class Relocator:
             else:
                 # A run killed after relocate_file: judge the row as it is.
                 by_relative[old_rel]["file_id"] = at_new.file_id
+                resumed.append(at_new.file_id)
         problems = verify_item(projected, self.gateway)
-        if problems:
+        if not problems:
+            return
+        touched = any(o.get(RELOCATED_FROM) for o in row.plan["originals"])
+        if not touched and not resumed:
             raise PreexistingVerifyFailure("; ".join(problems))
+        # This command already wrote to the row: its failure, not a
+        # pre-existing one. Never leave a killed run's entity OPEN.
+        if self.persist:
+            for file_id in resumed:
+                state = self.gateway.file_state(fields.RUSHES_STORAGE, file_id)
+                if state == OPEN:
+                    self.gateway.set_file_state(
+                        fields.RUSHES_STORAGE, file_id, ARCHIVED
+                    )
+        raise StepError(
+            "verify fails on a row this command already moved: " + "; ".join(problems)
+        )
 
     def _relocate(self, row, original) -> None:
         old_rel = original["relative"]
