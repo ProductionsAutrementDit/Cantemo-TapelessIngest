@@ -84,10 +84,10 @@ def resolve_span(clip: Clip, disk) -> List[Segment]:
     master = _segment(clip, metadata)
     ids = MasterIds(
         global_id=clip.umid,
-        top_id=metadata.get("Relation_Top_GlobalClipID") or None,
-        next_name=metadata.get("Relation_Next_ClipName") or None,
-        next_id=metadata.get("Relation_Next_GlobalClipID") or None,
-        previous_id=metadata.get("Relation_Previous_GlobalClipID") or None,
+        top_id=_relation(metadata, "Relation_Top_GlobalClipID"),
+        next_name=_relation(metadata, "Relation_Next_ClipName"),
+        next_id=_relation(metadata, "Relation_Next_GlobalClipID"),
+        previous_id=_relation(metadata, "Relation_Previous_GlobalClipID"),
     )
     rows = (
         SpannedClips.objects.filter(master_clip=clip)
@@ -116,9 +116,16 @@ def _metadata(clip: Clip) -> Dict[str, str]:
     return dict(ClipMetadata.objects.filter(clip=clip).values_list("name", "value"))
 
 
+def _relation(metadata: Dict[str, str], name: str) -> Optional[str]:
+    # panasonicP2 stores getValueFromPath's False for an absent element as
+    # the string "False": the plugin's own absent-value sentinel.
+    value = (metadata.get(name) or "").strip()
+    return None if value in ("", "False") else value
+
+
 def _row_ids(row: SpannedClips, segment: Segment, metadata: Dict[str, str]) -> RowIds:
     def value(name: str) -> Optional[str]:
-        return (metadata.get(name) or "").strip() or None
+        return _relation(metadata, name)
 
     return RowIds(
         order=row.order,

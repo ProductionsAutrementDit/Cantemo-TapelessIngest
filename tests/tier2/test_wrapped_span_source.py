@@ -256,3 +256,39 @@ def test_legacy_source_refuses_a_master_with_a_previous(migrated_db):
     SpannedClips.objects.create(master_clip=master, clip=second, order=2)
     with pytest.raises(SpanUnresolved, match="Previous SOMEONE"):
         resolve_span(master, _xml_disk())
+
+
+def test_xml_head_with_false_sentinels_resolves(migrated_db):
+    for top in ("False", TOP):
+        master = _master(
+            Relation_Previous_GlobalClipID="False", Relation_Top_GlobalClipID=top
+        )
+        assert [s.name for s in resolve_span(master, _xml_disk())] == [
+            "0037OO",
+            "003876",
+            "0039EX",
+        ]
+        master.delete()
+
+
+def test_master_with_false_next_is_unresolved_not_read(migrated_db):
+    master = _master(Relation_Next_ClipName="False", Relation_Next_GlobalClipID="False")
+    with pytest.raises(SpanUnresolved, match="master has no next segment"):
+        resolve_span(master, _xml_disk())
+
+
+def test_legacy_false_sentinels_are_absent(migrated_db):
+    master = _legacy(
+        master={"Relation_Previous_GlobalClipID": "False"},
+        second={"Relation_OffsetInShot": "False"},
+        third={
+            "Relation_OffsetInShot": "False",
+            "Relation_Next_GlobalClipID": "False",
+        },
+    )
+    assert len(resolve_span(master, _xml_disk())) == 3
+
+
+def test_a_real_previous_on_the_master_is_still_refused(migrated_db):
+    with pytest.raises(SpanUnresolved, match="Previous SOMEONE"):
+        resolve_span(_master(Relation_Previous_GlobalClipID="SOMEONE"), _xml_disk())
