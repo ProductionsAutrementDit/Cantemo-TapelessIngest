@@ -868,7 +868,7 @@ def test_relocate_backs_up_then_rewrites_the_clipfiles(migrated_db, tmp_path):
     )
     out = _relocate(world, tmp_path)
     backup = json.loads((tmp_path / "clipfiles.json").read_text())
-    assert backup == [[pk, path] for pk, path in moved]
+    assert backup == {"clipfile": [[pk, path] for pk, path in moved], "clip": []}
     assert list(
         ClipFile.objects.filter(clip__item_id="VX-1")
         .order_by("pk")
@@ -886,7 +886,7 @@ def test_relocate_backs_up_then_rewrites_the_clipfiles(migrated_db, tmp_path):
         == kept
     )
     assert sum(SIBLING + "/" in path for _, path in kept) == 5
-    assert "clipfiles rewritten: 5" in out
+    assert "clipfiles rewritten: 5" in out and "clips rewritten: 0" in out
 
 
 def test_relocate_refuses_to_overwrite_a_backup(migrated_db, tmp_path):
@@ -1216,3 +1216,181 @@ def test_relocate_leaves_a_video_moved_by_hand_alone(migrated_db, tmp_path):
     assert Clip.objects.get(item_id="VX-1").file_id == by_hand
     assert WrappedMigration.objects.get(item_id="VX-1").error == ""
     assert "VX-1: ok" in _run(world, "verify")
+
+
+# relocate: the Portal rows (ClipFile, Clip.path, Clip.folder_path) only
+
+STORAGE_ROOT = "/Volumes/PAD_Storage/AA - RUSHES TAPELESS/"
+OLD_DIR, NEW_DIR = OLD[:-1], NEW[:-1]
+
+
+def _portal_clips():
+    """Clips on OLD (path + folder_path), on NEW already, an empty
+    folder_path, and two neighbours that merely share OLD's start."""
+    rows = {
+        "OLDCLIP": (OLD_DIR, STORAGE_ROOT + OLD_DIR),
+        "OLDSUB": (OLD_DIR + "/sub", STORAGE_ROOT + OLD_DIR + "/sub"),
+        "NOFOLDER": (OLD_DIR, ""),
+        "ONNEW": (NEW_DIR, STORAGE_ROOT + NEW_DIR),
+        "BIS": (OLD_DIR + "_BIS", STORAGE_ROOT + OLD_DIR + "_BIS"),
+        "J2": (OLD_DIR + "2", STORAGE_ROOT + OLD_DIR + "2"),
+    }
+    for umid, (path, folder_path) in rows.items():
+        Clip.objects.create(
+            umid=umid, path=path, folder_path=folder_path, reference_file="F"
+        )
+    return rows
+
+
+def _clip_rows():
+    return {
+        c.umid: (c.path, c.folder_path)
+        for c in Clip.objects.filter(umid__in=list(_portal_clips_names()))
+    }
+
+
+def _portal_clips_names():
+    return ("OLDCLIP", "OLDSUB", "NOFOLDER", "ONNEW", "BIS", "J2")
+
+
+def _portal_only(world, tmp_path, *extra):
+    return _run(
+        world,
+        "relocate",
+        "--portal-only",
+        "--from",
+        OLD,
+        "--to",
+        NEW,
+        "--backup",
+        str(tmp_path / "portal.json"),
+        *extra,
+    )
+
+
+def _forbid_gateway(world):
+    def refuse():
+        raise AssertionError("--portal-only must not build the gateway")
+
+    command = _command(world)
+    command.gateway_factory = refuse
+    return command
+
+
+def test_portal_only_aligns_clipfiles_and_clips_without_vidispine(
+    migrated_db, tmp_path
+):
+    world = _migrated()
+    rows = _portal_clips()
+    moved = list(
+        ClipFile.objects.filter(clip__item_id="VX-1")
+        .order_by("pk")
+        .values_list("pk", "path")
+    )
+    plans = list(WrappedMigration.objects.order_by("pk").values_list("plan", "phase"))
+    writes = len(world[0].writes)
+    out = StringIO()
+    call_command(
+        _forbid_gateway(world),
+        "relocate",
+        "--portal-only",
+        "--from",
+        OLD,
+        "--to",
+        NEW,
+        "--backup",
+        str(tmp_path / "portal.json"),
+        stdout=out,
+    )
+    assert "clipfiles rewritten: 5" in out.getvalue()
+    assert "clips rewritten: 3" in out.getvalue()
+    assert "re-plan" in out.getvalue()
+    assert _clip_rows() == {
+        "OLDCLIP": (NEW_DIR, STORAGE_ROOT + NEW_DIR),
+        "OLDSUB": (NEW_DIR + "/sub", STORAGE_ROOT + NEW_DIR + "/sub"),
+        "NOFOLDER": (NEW_DIR, ""),
+        "ONNEW": rows["ONNEW"],
+        "BIS": rows["BIS"],
+        "J2": rows["J2"],
+    }
+    assert [
+        path
+        for _, path in ClipFile.objects.filter(clip__item_id="VX-1")
+        .order_by("pk")
+        .values_list("pk", "path")
+    ] == [
+        path.replace("RUSHES TAPELESS/" + OLD, "RUSHES TAPELESS/" + NEW)
+        for _, path in moved
+    ]
+    assert json.loads((tmp_path / "portal.json").read_text()) == {
+        "clipfile": [[pk, path] for pk, path in moved],
+        "clip": [
+            ["NOFOLDER", OLD_DIR, ""],
+            ["OLDCLIP", OLD_DIR, STORAGE_ROOT + OLD_DIR],
+            ["OLDSUB", OLD_DIR + "/sub", STORAGE_ROOT + OLD_DIR + "/sub"],
+        ],
+    }
+    assert len(world[0].writes) == writes
+    assert plans == list(
+        WrappedMigration.objects.order_by("pk").values_list("plan", "phase")
+    )
+
+
+def test_portal_only_dryrun_prints_the_rewrites_and_changes_nothing(
+    migrated_db, tmp_path
+):
+    world = _migrated()
+    _portal_clips()
+    clip_rows = _clip_rows()
+    paths = list(ClipFile.objects.order_by("pk").values_list("path", flat=True))
+    out = StringIO()
+    call_command(
+        _forbid_gateway(world),
+        "relocate",
+        "--portal-only",
+        "--from",
+        OLD,
+        "--to",
+        NEW,
+        "--dryrun",
+        stdout=out,
+    )
+    text = out.getvalue()
+    assert text.count("clipfile ") == 5
+    assert f"clip OLDCLIP: path {OLD_DIR} -> {NEW_DIR}" in text
+    assert (
+        f"clip OLDCLIP: folder_path {STORAGE_ROOT + OLD_DIR} -> "
+        f"{STORAGE_ROOT + NEW_DIR}"
+    ) in text
+    assert f"clip NOFOLDER: path {OLD_DIR} -> {NEW_DIR}" in text
+    assert "NOFOLDER: folder_path" not in text
+    assert "ONNEW" not in text and "BIS" not in text and "J2" not in text
+    assert "clipfiles to rewrite: 5" in text and "clips to rewrite: 3" in text
+    assert _clip_rows() == clip_rows
+    assert list(ClipFile.objects.order_by("pk").values_list("path", flat=True)) == (
+        paths
+    )
+    assert not list(tmp_path.iterdir())
+
+
+def test_portal_only_only_applies_to_relocate(migrated_db):
+    with pytest.raises(CommandError, match="--portal-only"):
+        _run(_world(), "plan", "--portal-only")
+
+
+def test_portal_only_keeps_the_backup_rules(migrated_db, tmp_path):
+    world = _world()
+    with pytest.raises(CommandError, match="--backup"):
+        _run(world, "relocate", "--portal-only", "--from", OLD, "--to", NEW)
+    (tmp_path / "portal.json").write_text("{}")
+    with pytest.raises(CommandError, match="never overwritten"):
+        _portal_only(world, tmp_path)
+
+
+def test_relocate_leaves_a_clip_already_on_the_new_folder(migrated_db, tmp_path):
+    world = _migrated()
+    rows = _portal_clips()
+    _relocate(world, tmp_path)
+    assert _clip_rows()["ONNEW"] == rows["ONNEW"]
+    backup = json.loads((tmp_path / "clipfiles.json").read_text())
+    assert "ONNEW" not in [umid for umid, *_ in backup["clip"]]

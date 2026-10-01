@@ -17,10 +17,13 @@ Spec: _bmad-output/implementation-artifacts/spec-wrapped-items-migration-p2.md
           summary then going to stderr)
   relocate
           --from OLD/ --to NEW/: aligns rows on a shoot folder renamed after
-          P5 archived it. Rewrites the ClipFile paths (backed up first to
+          P5 archived it. Rewrites the ClipFile and Clip paths (backed up first to
           --backup, required unless --dryrun), relocates the VX-41
           entities of "done" rows and sets them back to ARCHIVED; rows
-          never applied are only listed, to be re-planned
+          never applied are only listed, to be re-planned.
+          --portal-only stops after the Portal rows (ClipFile, Clip.path,
+          Clip.folder_path), for items whose Vidispine side already names
+          the folder P5 knows
 
 Never interactive. A row whose phase is non-empty is frozen against plan.
 """
@@ -31,6 +34,7 @@ from collections import Counter, defaultdict
 
 from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
+from django.db.models import Q
 
 from portal.plugins.TapelessIngest.models.clip import Clip, ClipFile, ClipMetadata
 
@@ -178,9 +182,17 @@ class Command(BaseCommand):
         )
         parser.add_argument(
             "--backup",
-            help="relocate: new JSON file for the [pk, old path] of every "
-            "rewritten ClipFile (required unless --dryrun). The ClipFile step "
+            help="relocate: new JSON file for the old values of every rewritten "
+            "ClipFile and Clip (required unless --dryrun). The database step "
             "is folder-wide: --item, --collection and --limit do not scope it",
+        )
+        parser.add_argument(
+            "--portal-only",
+            dest="portal_only",
+            action="store_true",
+            help="relocate: only rewrite the ClipFile and Clip rows (backup "
+            "first); no Vidispine read or write and no WrappedMigration row "
+            "touched, the items are then re-planned",
         )
 
     def handle(self, *args, **options):
@@ -215,6 +227,8 @@ class Command(BaseCommand):
         for name, flag in _RELOCATE_OPTIONS:
             if options[name] is not None and options["action"] != "relocate":
                 raise CommandError(f"{flag} only applies to 'relocate'")
+        if options["portal_only"] and options["action"] != "relocate":
+            raise CommandError("--portal-only only applies to 'relocate'")
         if options["action"] == "relocate":
             self._check_relocate(options)
         getattr(self, f"_{options['action']}")(options)
@@ -363,7 +377,12 @@ class Command(BaseCommand):
     def _relocate(self, options):
         old, new = options["from_prefix"], options["to_prefix"]
         dry = options["dryrun"]
-        self._relocate_clipfiles(old, new, options["backup"], dry)
+        self._relocate_rows(old, new, options["backup"], dry)
+        if options["portal_only"]:
+            self.stdout.write(
+                "portal rows aligned: re-plan the items (no Vidispine read or write)"
+            )
+            return
         gateway = self.gateway_factory()
         counts = Counter()
         to_relocate = []
@@ -436,28 +455,67 @@ class Command(BaseCommand):
             )
         )
 
-    def _relocate_clipfiles(self, old, new, backup, dry):
-        """Rewrite the ClipFile paths ``plan`` resolves originals from, so
-        a re-plan finds the folder P5 knows. Backed up before any write."""
+    def _relocate_rows(self, old, new, backup, dry):
+        """Rewrite the Portal rows ``plan`` and the scan read the folder from
+        (ClipFile.path, Clip.path, Clip.folder_path), so a re-plan finds the
+        folder P5 knows. Backed up before any write, written in one
+        transaction."""
         before, after = _RUSHES_MARKER + old, _RUSHES_MARKER + new
-        rows = list(
-            ClipFile.objects.filter(path__contains=before)
+        clipfiles = [
+            (pk, path, path.replace(before, after, 1))
+            for pk, path in ClipFile.objects.filter(path__contains=before)
             .order_by("pk")
             .values_list("pk", "path")
+        ]
+        clips = []
+        coarse = (
+            Q(path__startswith=old)
+            | Q(path=old[:-1])
+            | Q(folder_path__contains=before)
+            | Q(folder_path__endswith=before[:-1])
         )
-        rewritten = [(pk, path, path.replace(before, after, 1)) for pk, path in rows]
+        for umid, path, folder_path in (
+            Clip.objects.filter(coarse)
+            .order_by("pk")
+            .values_list("pk", "path", "folder_path")
+        ):
+            # The "/" appended on both sides is what keeps `2012/X_2` out
+            # of `2012/X/` and leaves the stored form without a new slash.
+            target_path, target_folder = path, folder_path
+            if (path + "/").startswith(old):
+                target_path = (new + (path + "/")[len(old) :])[:-1]
+            if before in folder_path + "/":
+                target_folder = (folder_path + "/").replace(before, after, 1)[:-1]
+            if (target_path, target_folder) != (path, folder_path):
+                clips.append((umid, path, folder_path, target_path, target_folder))
         if dry:
-            for pk, path, target in rewritten:
+            for pk, path, target in clipfiles:
                 self.stdout.write(f"clipfile {pk}: {path} -> {target}")
+            for umid, path, folder_path, target_path, target_folder in clips:
+                if target_path != path:
+                    self.stdout.write(f"clip {umid}: path {path} -> {target_path}")
+                if target_folder != folder_path:
+                    self.stdout.write(
+                        f"clip {umid}: folder_path {folder_path} -> {target_folder}"
+                    )
         else:
+            saved = {
+                "clipfile": [[pk, path] for pk, path, _ in clipfiles],
+                "clip": [[umid, path, folder] for umid, path, folder, _, _ in clips],
+            }
             with open(backup, "x", encoding="utf-8") as handle:
-                json.dump([[pk, path] for pk, path in rows], handle, indent=1)
+                json.dump(saved, handle, indent=1)
                 handle.write("\n")
             with transaction.atomic():
-                for pk, _, target in rewritten:
+                for pk, _, target in clipfiles:
                     ClipFile.objects.filter(pk=pk).update(path=target)
+                for umid, _, _, target_path, target_folder in clips:
+                    Clip.objects.filter(pk=umid).update(
+                        path=target_path, folder_path=target_folder
+                    )
         verb = "to rewrite" if dry else "rewritten"
-        self.stdout.write(f"clipfiles {verb}: {len(rewritten)}")
+        self.stdout.write(f"clipfiles {verb}: {len(clipfiles)}")
+        self.stdout.write(f"clips {verb}: {len(clips)}")
 
     def _verify(self, options):
         gateway = self.gateway_factory()
