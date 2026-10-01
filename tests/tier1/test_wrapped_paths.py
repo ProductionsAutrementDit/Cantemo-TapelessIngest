@@ -65,3 +65,14 @@ def test_disk_probe_reads_the_real_filesystem(tmp_path):
     assert not disk.exists("2016/b.MXF")
     assert not disk.exists("2016")  # a directory is not a file
     assert disk.sha1("2016/a.MXF") == hashlib.sha1(b"essence").hexdigest()
+
+
+def test_disk_reads_text_of_a_real_file(tmp_path):
+    (tmp_path / "2016" / "CLIP").mkdir(parents=True)
+    (tmp_path / "2016" / "CLIP" / "a.XML").write_bytes(
+        b"\xef\xbb\xbf<P2Main>\xc3\xa9</P2Main>"
+    )
+    disk = Disk(str(tmp_path))
+    assert disk.read_text("2016/CLIP/a.XML") == "<P2Main>é</P2Main>"
+    assert disk.read_text("2016/CLIP/b.XML") is None
+    assert disk.read_text("2016/CLIP") is None  # a directory is not a file

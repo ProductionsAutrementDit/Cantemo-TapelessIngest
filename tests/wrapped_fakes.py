@@ -61,6 +61,10 @@ class FakeDisk:
     def sha1(self, relative):
         return hashlib.sha1(self.contents[relative]).hexdigest()
 
+    def read_text(self, relative):
+        data = self.contents.get(relative)
+        return None if data is None else data.decode("utf-8-sig")
+
 
 class InMemoryGateway:
     """A Vidispine that only knows what a test told it."""
@@ -462,4 +466,62 @@ def p2_clip_xml(bits_per_sample="24", namespace=True):
         f"<Audio><SamplingRate>48000</SamplingRate>{depth}</Audio>"
         f"<Audio><SamplingRate>48000</SamplingRate>{depth}</Audio>"
         "</EssenceList></ClipContent></P2Main>"
+    )
+
+
+P2_V31 = "urn:schemas-Professional-Plug-in:P2:ClipMetadata:v3.1"
+
+
+def p2_segment_xml(
+    name,
+    global_id,
+    frames=7482,
+    edit_unit="1/25",
+    offset=None,
+    top="060A2B340101010501010D4313000000AAAA",
+    previous=None,
+    next_name=None,
+    next_id=None,
+    audio_count=2,
+    namespace=P2_V31,
+    drop=(),
+):
+    """A P2 CLIP XML reduced to what the chain reads, laid out as the
+    measured 2015/AH_150108_EC225_SAR_COROGNE documents are."""
+
+    def element(tag, value):
+        return "" if value is None or tag in drop else f"<{tag}>{value}</{tag}>"
+
+    connection = (
+        "<Connection>"
+        f"<Top>{element('GlobalClipID', top)}</Top>"
+        + (
+            f"<Previous>{element('GlobalClipID', previous)}</Previous>"
+            if previous
+            else ""
+        )
+        + (
+            f"<Next>{element('ClipName', next_name)}"
+            f"{element('GlobalClipID', next_id)}</Next>"
+            if next_name or next_id
+            else ""
+        )
+        + "</Connection>"
+    )
+    audios = "".join(
+        "<Audio><AudioFormat>MXF</AudioFormat></Audio>" for _ in range(audio_count)
+    )
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="no" ?>'
+        f'<P2Main xmlns="{namespace}"><ClipContent>'
+        + element("ClipName", name)
+        + element("GlobalClipID", global_id)
+        + element("Duration", frames)
+        + element("EditUnit", edit_unit)
+        + "<EssenceList><Video><VideoFormat>MXF</VideoFormat></Video>"
+        + audios
+        + "</EssenceList><Relation>"
+        + element("OffsetInShot", offset)
+        + connection
+        + "</Relation></ClipContent></P2Main>"
     )

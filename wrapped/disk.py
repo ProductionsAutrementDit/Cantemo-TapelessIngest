@@ -6,6 +6,7 @@ entries for shoots deleted from disk.
 
 import hashlib
 import os
+from typing import Optional
 
 from portal.plugins.TapelessIngest.wrapped.paths import RUSHES_ROOT
 
@@ -25,3 +26,11 @@ class Disk:
             for chunk in iter(lambda: handle.read(_CHUNK), b""):
                 digest.update(chunk)
         return digest.hexdigest()
+
+    def read_text(self, relative: str) -> Optional[str]:
+        """A small text file (a P2 CLIP XML), or None when it is not a file."""
+        path = os.path.join(self.root, relative)
+        if not os.path.isfile(path):
+            return None
+        with open(path, "rb") as handle:
+            return handle.read().decode("utf-8-sig")
