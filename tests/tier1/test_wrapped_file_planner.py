@@ -94,7 +94,7 @@ def test_a_genuine_copy_on_tape_is_ready_from_its_own_description():
     assert original["entry"]["handle"] == "AirbusHelicopters#1"
     assert plan["size_proof"] == {
         "exact": {"ffprobe": SIZE, "wrapped VX-W1": SIZE},
-        "p5": None,
+        "p5": SIZE + 178,
     }
     assert result.rollback["wrapped_shape_id"] == "VX-SW"
     assert result.rollback["lowres_shape_ids"] == ["VX-LOW"]
@@ -130,16 +130,24 @@ def test_one_exact_size_and_the_p5_overhead_is_a_proof():
     }
 
 
-def test_one_exact_size_and_a_p5_size_too_far_is_no_proof():
-    result = _plan(_world(wrapped_size=None, p5_size=SIZE + 600))
+@pytest.mark.parametrize("wrapped_size", [None, SIZE])
+@pytest.mark.parametrize("delta", [600, 512, -1])
+def test_a_p5_size_outside_the_overhead_is_refused(wrapped_size, delta):
+    # Checked whenever P5 knows the original, even with two exact sources.
+    result = _plan(_world(wrapped_size=wrapped_size, p5_size=SIZE + delta))
     assert result.verdict == verdicts.UNEXPECTED
-    assert result.reason.startswith("no size proof (file)")
+    assert result.reason == (
+        f"P5 size {SIZE + delta} is not the copy's (file): {delta:+d} bytes "
+        f"from {'ffprobe' if wrapped_size is None else 'ffprobe, wrapped VX-W1'} "
+        f"{SIZE}, outside [0, 512)"
+    )
 
 
-def test_one_exact_size_and_a_p5_size_below_it_is_no_proof():
-    result = _plan(_world(wrapped_size=None, p5_size=SIZE - 1))
-    assert result.verdict == verdicts.UNEXPECTED
-    assert result.reason.startswith("no size proof (file)")
+@pytest.mark.parametrize("delta", [0, 178, 511])
+def test_two_exact_sources_and_a_p5_size_within_the_overhead_are_ready(delta):
+    result = _plan(_world(p5_size=SIZE + delta))
+    assert result.verdict == verdicts.READY, result.reason
+    assert result.plan["size_proof"]["p5"] == SIZE + delta
 
 
 def test_no_exact_size_at_all_is_no_proof():
@@ -285,3 +293,36 @@ def test_an_audio_only_wav_is_ready():
     (original,) = result.plan["originals"]
     assert original["kind"] == "audio"
     assert result.plan["wrapped_file"]["storage_id"] == "VX-26"
+
+
+def test_a_resolution_disagreeing_with_ffprobe_is_refused():
+    result = _plan(_world(), ffprobe=("prores", (3840, 2160), MOV[2]))
+    assert result.verdict == verdicts.UNEXPECTED
+    assert result.reason == (
+        "original shape disagrees with ffprobe (file): "
+        "video resolution 1920x1080, ffprobe 3840x2160"
+    )
+
+
+def test_an_audio_count_disagreeing_with_ffprobe_is_refused():
+    result = _plan(_world(), ffprobe=("prores", (1920, 1080), ("pcm_s24le",) * 4))
+    assert result.verdict == verdicts.UNEXPECTED
+    assert result.reason == (
+        "original shape disagrees with ffprobe (file): " "2 audio stream(s), ffprobe 4"
+    )
+
+
+def test_codec_names_differing_from_ffprobe_alone_stay_genuine():
+    result = _plan(_world(), ffprobe=("unknown", (1920, 1080), ("aac", "aac")))
+    assert result.verdict == verdicts.READY, result.reason
+
+
+def test_without_ffprobe_a_shape_unlike_the_lowres_stays_genuine():
+    result = _plan(_world(), ffprobe=None)
+    assert result.verdict == verdicts.READY, result.reason
+
+
+def test_the_p5_entry_is_looked_up_once():
+    world = _world()
+    _plan(world)
+    assert world[1].lookup_calls == [to_absolute(FILE_ORIGINAL)]

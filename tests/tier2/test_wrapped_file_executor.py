@@ -9,6 +9,7 @@ from portal.plugins.TapelessIngest.wrapped.archive import CachedArchive
 from portal.plugins.TapelessIngest.wrapped.executor import Executor
 from portal.plugins.TapelessIngest.wrapped.paths import OriginalFile, to_absolute
 from portal.plugins.TapelessIngest.wrapped.planner import plan_file_item
+from portal.plugins.TapelessIngest.wrapped.relocate import Relocator
 from portal.plugins.TapelessIngest.wrapped.verifier import verify_item
 from tests.wrapped_fakes import (
     FILE_ORIGINAL,
@@ -136,3 +137,27 @@ def test_an_audio_only_wav_points_its_clip_at_the_wav(migrated_db):
     # The online wrapped WAV (VX-26) is kept by default, and flagged.
     assert row.plan["wrapped_kept"] is True
     assert verify_item(row, gateway) == []
+
+
+def test_relocating_an_audio_only_row_repoints_its_clip_at_the_wav(migrated_db):
+    gateway = InMemoryGateway()
+    row, disk = _setup(
+        gateway,
+        file_wav_document(),
+        OriginalFile(WAV_ORIGINAL, "audio"),
+        WAV_OUTPUT,
+        (None, None, ("pcm_s24le",)),
+    )
+    Executor(gateway, disk).run(row)
+    row.refresh_from_db()
+    gateway.items[ITEM][fields.ITEM_ORIGINAL_FILENAME_FIELD] = [WAV_ORIGINAL]
+
+    old, new = "2019/AH_20190402_H175_TEST/", "2019/AH_RENAMED/"
+    assert Relocator(gateway, old, new).run(row) == 1
+
+    (original,) = row.plan["originals"]
+    assert original["relative"] == "2019/AH_RENAMED/SOUND/ZOOM0001.WAV"
+    assert Clip.objects.get(umid="U1").file_id == original["file_id"]
+    assert gateway.items[ITEM][fields.ITEM_ORIGINAL_FILENAME_FIELD] == [
+        original["relative"]
+    ]

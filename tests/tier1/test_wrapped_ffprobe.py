@@ -8,6 +8,7 @@ from portal.plugins.TapelessIngest.wrapped.ffprobe import (
     PROXY,
     classify_copy,
     parse_ffprobe,
+    probe_disagreement,
     shape_signature,
 )
 from portal.plugins.TapelessIngest.wrapped.gateway import parse_shape
@@ -101,3 +102,51 @@ def test_no_lowres_is_genuine():
 
 def test_a_lowres_without_any_description_is_no_evidence():
     assert classify_copy((None, None, ()), [(None, None, ())], None) == GENUINE
+
+
+def test_leading_whitespace_and_a_bom_are_stripped():
+    assert parse_ffprobe("\ufeff\n  " + ffprobe_xml()).signature == MOV
+    assert parse_ffprobe("\n\t" + ffprobe_xml()).signature == MOV
+
+
+def test_only_the_top_level_streams_are_counted():
+    # ffprobe lists a program's streams again under <programs>.
+    xml = ffprobe_xml().replace(
+        "<streams>",
+        "<programs><program><streams>"
+        '<stream index="9" codec_name="aac" codec_type="audio"/>'
+        '<stream index="8" codec_name="h264" codec_type="video" '
+        'width="1" height="1"/>'
+        "</streams></program></programs><streams>",
+    )
+    assert parse_ffprobe(xml).signature == MOV
+
+
+def test_a_video_stream_without_codec_name_is_still_a_video():
+    xml = ffprobe_xml().replace('codec_name="prores" ', "")
+    assert parse_ffprobe(xml).signature == ("", (1920, 1080), MOV[2])
+
+
+def test_ffprobe_agreeing_on_resolution_and_audio_count_is_no_disagreement():
+    assert probe_disagreement(MOV, MOV) is None
+
+
+def test_codec_names_are_never_compared():
+    # JPEG vs mjpeg, hevc vs 'unknown': naming, not content.
+    probe = ("unknown", (1920, 1080), ("aac", "unknown"))
+    assert probe_disagreement(MOV, probe) is None
+
+
+def test_a_resolution_mismatch_is_a_disagreement():
+    problem = probe_disagreement(MOV, ("prores", (3840, 2160), MOV[2]))
+    assert problem == "video resolution 1920x1080, ffprobe 3840x2160"
+
+
+def test_an_audio_count_mismatch_is_a_disagreement():
+    problem = probe_disagreement(MOV, ("prores", (1920, 1080), ("pcm_s24le",)))
+    assert problem == "2 audio stream(s), ffprobe 1"
+
+
+def test_resolution_is_only_compared_when_both_have_video():
+    assert probe_disagreement((None, None, ("pcm_s24le",)), MOV[:2] + (("a",),)) is None
+    assert probe_disagreement(MOV, (None, None, MOV[2])) is None

@@ -20,7 +20,8 @@ from typing import Any, Mapping, Optional, Sequence, Tuple
 
 from portal.plugins.TapelessIngest.wrapped.gateway import Component, Shape
 
-# (video codec, (width, height), audio codecs in stream order)
+# (video codec, (width, height), audio codecs in stream order); the codec is
+# None when there is no video, "" for a video whose codec is not named.
 Signature = Tuple[Optional[str], Optional[Tuple[int, int]], Tuple[str, ...]]
 
 GENUINE = "genuine"
@@ -53,28 +54,34 @@ def _resolution(width: Any, height: Any) -> Optional[Tuple[int, int]]:
 
 def parse_ffprobe(xml: Optional[str]) -> Optional[Probe]:
     """None when there is no ffprobe document (empty, unparsable, or
-    another provider's XML)."""
-    if not xml or not xml.strip():
+    another provider's XML). Only the top-level ``<streams>`` count:
+    ffprobe lists a program's streams again under ``<programs>``."""
+    text = (xml or "").strip().lstrip("\ufeff").strip()
+    if not text:
         return None
     try:
-        root = ElementTree.fromstring(xml.encode("utf-8"))
+        root = ElementTree.fromstring(text.encode("utf-8"))
     except ElementTree.ParseError:
         return None
     if _local(root.tag) != "ffprobe":
         return None
     video_codec, resolution, audios = None, None, []
     size = None
-    for element in root.iter():
-        name = _local(element.tag)
-        if name == "stream":
-            kind = element.get("codec_type")
+    for child in root:
+        name = _local(child.tag)
+        if name == "format":
+            size = _int(child.get("size"))
+        if name != "streams":
+            continue
+        for stream in child:
+            if _local(stream.tag) != "stream":
+                continue
+            kind = stream.get("codec_type")
             if kind == "video" and video_codec is None:
-                video_codec = element.get("codec_name")
-                resolution = _resolution(element.get("width"), element.get("height"))
+                video_codec = stream.get("codec_name") or ""
+                resolution = _resolution(stream.get("width"), stream.get("height"))
             elif kind == "audio":
-                audios.append(element.get("codec_name") or "")
-        elif name == "format":
-            size = _int(element.get("size"))
+                audios.append(stream.get("codec_name") or "")
     return Probe((video_codec, resolution, tuple(audios)), size)
 
 
@@ -94,7 +101,7 @@ def shape_signature(shape: Shape) -> Signature:
     )
     audios = sorted(shape.of_kind("audio"), key=_stream_order)
     return (
-        video.get("codec"),
+        str(video.get("codec") or "") if videos else None,
         resolution,
         tuple(str(a.body.get("codec") or "") for a in audios),
     )
@@ -111,3 +118,22 @@ def classify_copy(
     if probe is not None and probe != original:
         return PROXY
     return AMBIGUOUS
+
+
+def _size(resolution: Optional[Tuple[int, int]]) -> str:
+    return "unknown" if resolution is None else f"{resolution[0]}x{resolution[1]}"
+
+
+def probe_disagreement(original: Signature, probe: Signature) -> Optional[str]:
+    """What the shape's description says that ffprobe of the original
+    refutes: its video resolution (when both have a video) or its number
+    of audio streams. Codec NAMES are never compared: Vidispine and
+    ffprobe name the same essence differently (JPEG/mjpeg, hevc/unknown)."""
+    if original[0] is not None and probe[0] is not None:
+        if original[1] != probe[1]:
+            return (
+                f"video resolution {_size(original[1])}, " f"ffprobe {_size(probe[1])}"
+            )
+    if len(original[2]) != len(probe[2]):
+        return f"{len(original[2])} audio stream(s), ffprobe {len(probe[2])}"
+    return None

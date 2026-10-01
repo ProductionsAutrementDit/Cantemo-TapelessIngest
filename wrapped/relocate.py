@@ -155,7 +155,10 @@ class Relocator:
                 f"original shape of {row.item_id}"
             )
         self._ensure_archived(moved.file_id)
-        if original["kind"] == "video":
+        # The clip and originalFilename follow the FIRST original, as apply's
+        # _update_clip: a P2 take's video, or a ``file`` item's one original,
+        # which may be an audio WAV.
+        if original is row.plan["originals"][0]:
             self._update_video(row, original, new_rel, moved.file_id)
         original["file_id"] = moved.file_id
         original["relative"] = new_rel

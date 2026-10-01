@@ -40,6 +40,7 @@ from portal.plugins.TapelessIngest.wrapped.ffprobe import (
     PROXY,
     Signature,
     classify_copy,
+    probe_disagreement,
     shape_signature,
 )
 from portal.plugins.TapelessIngest.wrapped.gateway import (
@@ -644,28 +645,32 @@ def size_problem(
 ) -> Optional[str]:
     """Byte identity of a wrapped ``file`` copy and its original, before
     any write. ``exact`` maps each source (``ffprobe``, ``wrapped <id>``,
-    ``disk``) to its exact size, None when unknown. Every known one must
-    agree; two sources (all wrapped copies count as one) are a proof;
-    with one, P5's size must exceed it by less than P5_OVERHEAD_MAX."""
+    ``disk``) to its exact size, None when unknown; ``p5`` is P5's size of
+    the original, None when unknown. Every known exact size must agree,
+    and P5's, whenever known, must exceed it by less than P5_OVERHEAD_MAX.
+    Two exact sources (all wrapped copies count as one), or one and P5's
+    size, are a proof."""
     known = {label: size for label, size in exact.items() if size is not None}
     if len(set(known.values())) > 1:
         return "copy and original differ in size: " + ", ".join(
             f"{label} {size}" for label, size in known.items()
         )
-    sources = {label.split(" ", 1)[0] for label in known}
-    if len(sources) >= 2:
-        return None
     if not known:
         return f"{NO_SIZE_PROOF}: no exact size known"
     size = next(iter(known.values()))
-    if p5 is None:
-        return f"{NO_SIZE_PROOF}: only {', '.join(known)} {size}, no P5 size"
-    if 0 <= p5 - size < P5_OVERHEAD_MAX:
+    if p5 is not None and not 0 <= p5 - size < P5_OVERHEAD_MAX:
+        return (
+            f"P5 size {p5} is not the copy's (file): {p5 - size:+d} bytes from "
+            f"{', '.join(known)} {size}, outside [0, {P5_OVERHEAD_MAX})"
+        )
+    if len({label.split(" ", 1)[0] for label in known}) >= 2 or p5 is not None:
         return None
-    return (
-        f"{NO_SIZE_PROOF}: P5 size {p5} is {p5 - size:+d} bytes from "
-        f"{', '.join(known)} {size}, outside [0, {P5_OVERHEAD_MAX})"
-    )
+    return f"{NO_SIZE_PROOF}: only {', '.join(known)} {size}, no P5 size"
+
+
+def _p5_size(entry: Optional[Mapping[str, Any]]) -> Optional[int]:
+    size = entry.get("size") if entry else None
+    return size if isinstance(size, int) and size >= 0 else None
 
 
 def _file_original(shape: Shape) -> Optional[OriginalFile]:
@@ -691,11 +696,17 @@ def _copy_problem(
     lowres = [
         shape_signature(s) for s in gateway.tagged_shapes(item_id, fields.LOWRES_TAG)
     ]
-    verdict = classify_copy(shape_signature(shape), lowres, ffprobe)
+    signature = shape_signature(shape)
+    verdict = classify_copy(signature, lowres, ffprobe)
     if verdict == PROXY:
         return f"{PROXY_COPY} (file); ffprobe route pending"
     if verdict == AMBIGUOUS:
         return "original shape equals the lowres (file); ambiguous"
+    # Unlike the lowres is not enough: when the original's ffprobe is known,
+    # the description must also agree with it.
+    disagreement = probe_disagreement(signature, ffprobe) if ffprobe else None
+    if disagreement:
+        return f"original shape disagrees with ffprobe (file): {disagreement}"
     return None
 
 
@@ -741,22 +752,20 @@ def plan_file_item(
     if problem:
         return PlanResult(verdicts.UNEXPECTED, problem)
 
+    item_values = gateway.item_fields(item_id, ROLLBACK_ITEM_FIELDS)
+    # Read-only, and the one P5 lookup: the size proof reuses its entry.
+    located = [_locate(original, gateway, archive, disk, None)]
+    (found,) = located
     exact: Dict[str, Optional[int]] = {"ffprobe": ffprobe_size}
     for wrapped in sorted(shape.files().values(), key=lambda f: f.storage_id):
         exact[f"wrapped {wrapped.file_id}"] = gateway.file_size(wrapped.file_id)
-    if disk.exists(original.relative):
+    if found["on_disk"]:
         exact["disk"] = disk.size(original.relative)
-    known = {label: size for label, size in exact.items() if size is not None}
-    p5 = None
-    if len({label.split(" ", 1)[0] for label in known}) < 2:
-        entry = archive.resolve(to_absolute(original.relative))
-        p5 = entry.size if entry else None
+    p5 = _p5_size(found["entry"])
     problem = size_problem(exact, p5)
     if problem:
         return PlanResult(verdicts.UNEXPECTED, problem)
-
-    item_values = gateway.item_fields(item_id, ROLLBACK_ITEM_FIELDS)
-    located = [_locate(original, gateway, archive, disk, None)]
+    known = {label: size for label, size in exact.items() if size is not None}
     refused = _located_problem(located)
     if refused:
         return refused
