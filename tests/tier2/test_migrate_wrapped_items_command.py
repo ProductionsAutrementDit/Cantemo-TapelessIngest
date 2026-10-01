@@ -1366,6 +1366,11 @@ def test_portal_only_dryrun_prints_the_rewrites_and_changes_nothing(
     assert "NOFOLDER: folder_path" not in text
     assert "ONNEW" not in text and "BIS" not in text and "J2" not in text
     assert "clipfiles to rewrite: 5" in text and "clips to rewrite: 3" in text
+    assert (
+        "dry run: nothing written; after the real run, re-plan the items "
+        "(no Vidispine read or write)"
+    ) in text
+    assert "portal rows aligned" not in text
     assert _clip_rows() == clip_rows
     assert list(ClipFile.objects.order_by("pk").values_list("path", flat=True)) == (
         paths

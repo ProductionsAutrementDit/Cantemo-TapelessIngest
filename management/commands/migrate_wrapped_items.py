@@ -380,7 +380,12 @@ class Command(BaseCommand):
         self._relocate_rows(old, new, options["backup"], dry)
         if options["portal_only"]:
             self.stdout.write(
-                "portal rows aligned: re-plan the items (no Vidispine read or write)"
+                (
+                    "dry run: nothing written; after the real run, re-plan the items"
+                    if dry
+                    else "portal rows aligned: re-plan the items"
+                )
+                + " (no Vidispine read or write)"
             )
             return
         gateway = self.gateway_factory()

@@ -683,6 +683,28 @@ def test_a_double_attachment_reuses_a_not_imported_entity_of_on_disk_originals()
     assert result.plan["originals"][0]["on_disk"] is True
 
 
+def _assert_originals_missing(result, missing):
+    assert result.verdict == verdicts.ORIGINALS_MISSING
+    assert result.reason == "neither on disk nor in P5: " + ", ".join(missing)
+    assert "wrapped_files" not in result.plan
+    assert "wrapped_file" not in result.plan
+
+
+def test_a_double_attachment_without_any_original_is_originals_missing():
+    # 36 such items on prod: their wrapped copies are the only essence.
+    gateway, fake, disk, originals = _world(doubly_attached_document(), archived=False)
+    result = _plan(gateway, fake, disk, originals)
+    _assert_originals_missing(result, [o.relative for o in originals])
+
+
+def test_a_double_attachment_with_only_the_video_on_disk_is_originals_missing():
+    gateway, fake, disk, originals = _world(
+        doubly_attached_document(), archived=False, on_disk=[p2_originals()[0].relative]
+    )
+    result = _plan(gateway, fake, disk, originals)
+    _assert_originals_missing(result, [o.relative for o in originals[1:]])
+
+
 def test_a_single_wrapped_file_keeps_the_single_file_plan():
     result = _plan(*_world())
     assert "wrapped_files" not in result.plan
