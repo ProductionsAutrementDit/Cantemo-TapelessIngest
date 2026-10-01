@@ -195,6 +195,39 @@ def test_duplicate_clip_metadata_cannot_exist(migrated_db):
         )
 
 
+def test_a_self_row_alone_is_not_a_chain(migrated_db):
+    master = _master()
+    SpannedClips.objects.create(master_clip=master, clip=master, order=1)
+    assert len(resolve_span(master, _xml_disk())) == 3
+
+
+@pytest.mark.parametrize("duration", [None, "", "lots"])
+def test_master_without_a_usable_duration_is_unresolved(migrated_db, duration):
+    with pytest.raises(SpanUnresolved, match="duration"):
+        resolve_span(_master(duration=duration), _xml_disk())
+
+
+def test_master_without_next_is_unresolved(migrated_db):
+    master = _master(Relation_Next_ClipName=None, Relation_Next_GlobalClipID="")
+    with pytest.raises(SpanUnresolved, match="master has no next segment"):
+        resolve_span(master, _xml_disk())
+
+
+def test_resolve_error_becomes_span_unresolved(migrated_db):
+    master = _master()
+    ClipFile.objects.filter(clip=master, filetype="video").delete()
+    with pytest.raises(SpanUnresolved, match="video ClipFile"):
+        resolve_span(master, _xml_disk())
+
+
+def test_a_legacy_segment_without_metadata_is_unresolved(migrated_db):
+    master = _master()
+    second = _clip("ROW2", "00AAAA", clipname=None, duration=None, EditUnit=None)
+    SpannedClips.objects.create(master_clip=master, clip=second, order=2)
+    with pytest.raises(SpanUnresolved, match="ROW2"):
+        resolve_span(master, _xml_disk())
+
+
 def test_xml_source_refuses_a_middle_segment(migrated_db):
     middle = _clip(
         MID,
