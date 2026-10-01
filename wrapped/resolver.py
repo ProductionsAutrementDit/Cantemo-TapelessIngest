@@ -29,6 +29,7 @@ from portal.plugins.TapelessIngest.wrapped.span import (
     chain_from_xml,
     parse_edit_unit,
     parse_frames,
+    require_head,
 )
 
 P2_PROVIDER = "panasonicP2"
@@ -79,6 +80,13 @@ def resolve_span(clip: Clip, disk) -> List[Segment]:
     """
     metadata = _metadata(clip)
     master = _segment(clip, metadata)
+    ids = MasterIds(
+        global_id=clip.umid,
+        top_id=metadata.get("Relation_Top_GlobalClipID") or None,
+        next_name=metadata.get("Relation_Next_ClipName") or None,
+        next_id=metadata.get("Relation_Next_GlobalClipID") or None,
+        previous_id=metadata.get("Relation_Previous_GlobalClipID") or None,
+    )
     rows = (
         SpannedClips.objects.filter(master_clip=clip)
         .exclude(clip=clip)
@@ -86,16 +94,11 @@ def resolve_span(clip: Clip, disk) -> List[Segment]:
         .order_by("order")
     )
     if rows:
+        require_head(ids)
         return chain_from_rows(master, [_segment(row.clip) for row in rows])
     head, marker, _ = master.video.relative.rpartition("/VIDEO/")
     if not marker:
         raise SpanUnresolved(f"master video {master.video.relative} not in VIDEO/")
-    ids = MasterIds(
-        global_id=clip.umid,
-        top_id=metadata.get("Relation_Top_GlobalClipID") or None,
-        next_name=metadata.get("Relation_Next_ClipName") or None,
-        next_id=metadata.get("Relation_Next_GlobalClipID") or None,
-    )
     return chain_from_xml(master, ids, head, _xml_reader(disk))
 
 

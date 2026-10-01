@@ -236,12 +236,61 @@ def test_a_chain_longer_than_64_segments_is_refused():
     master = segment("0037OO", frames=10)
     ids = MasterIds(global_id=TOP, top_id=TOP, next_name="S0001", next_id="ID1")
     message = refusal(documents, master=master, ids=ids)
-    assert "64" in message and "S0064" in message
+    assert message == "segment S0064 (hop 64): more than 64 segments"
 
 
 def test_master_top_defaults_to_its_own_id():
     ids = MasterIds(global_id=TOP, top_id=None, next_name="003876", next_id=MID)
     assert len(walk(world(), ids=ids)) == 3
+
+
+def test_a_middle_segment_is_not_the_head_of_its_take():
+    ids = MasterIds(global_id=MID, top_id=TOP, next_name="0039EX", next_id=LAST)
+    message = refusal(world(), ids=ids)
+    assert "not the head of its take" in message
+    assert TOP in message and MID in message
+
+
+def test_a_master_with_a_previous_segment_is_not_the_head():
+    ids = MasterIds(
+        global_id=TOP, top_id=TOP, next_name="003876", next_id=MID, previous_id="P"
+    )
+    message = refusal(world(), ids=ids)
+    assert "not the head of its take" in message and "Previous P" in message
+
+
+def test_a_segment_xml_naming_another_clip_is_refused():
+    message = refusal(world(**{"003876": {"name": "00XXXX"}}))
+    assert message == "segment 003876 (hop 1): ClipName 00XXXX, not 003876"
+
+
+def test_a_segment_xml_without_previous_is_refused():
+    message = refusal(world(**{"0039EX": {"previous": None}}))
+    assert message == f"segment 0039EX (hop 2): Previous None, not {MID}"
+
+
+def test_a_segment_xml_without_top_is_refused():
+    message = refusal(world(**{"0039EX": {"top": None}}))
+    assert message == f"segment 0039EX (hop 2): Top None, not {TOP}"
+
+
+def test_a_half_present_next_inside_a_segment_xml_is_refused():
+    message = refusal(world(**{"0039EX": {"next_name": "0040AA"}}))
+    assert message == ("segment 0040AA (hop 3): next ClipName or GlobalClipID missing")
+
+
+@pytest.mark.parametrize("bad", ["../0039EX", "CLIP/0039EX", ".."])
+def test_a_next_name_that_is_not_a_plain_name_is_refused(bad):
+    asked = []
+
+    def read_xml(relative):
+        asked.append(relative)
+        return world().get(relative)
+
+    ids = MasterIds(global_id=TOP, top_id=TOP, next_name=bad, next_id=MID)
+    with pytest.raises(SpanUnresolved, match="not a plain clip name"):
+        chain_from_xml(MASTER, ids, CONTENTS, read_xml)
+    assert asked == []
 
 
 # chain_from_rows -----------------------------------------------------------

@@ -49,6 +49,7 @@ class MasterIds:
     top_id: Optional[str]
     next_name: Optional[str]
     next_id: Optional[str]
+    previous_id: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -146,6 +147,26 @@ def parse_clip_xml(text: str) -> ClipXml:
     )
 
 
+def require_head(master_ids: MasterIds) -> None:
+    """Refuse a clip that is not the first segment of its take: the P2
+    provider's own rule is master <=> Top == GlobalClipID, and a head has
+    no Previous."""
+    top, umid = master_ids.top_id, master_ids.global_id
+    if top and top != umid:
+        raise SpanUnresolved(
+            f"clip {umid} is not the head of its take: Top {top}, not {umid}"
+        )
+    if master_ids.previous_id:
+        raise SpanUnresolved(
+            f"clip {umid} is not the head of its take: "
+            f"Previous {master_ids.previous_id}"
+        )
+
+
+def _plain_name(name: str) -> bool:
+    return "/" not in name and "\\" not in name and ".." not in name
+
+
 def chain_from_xml(
     master: Segment,
     master_ids: MasterIds,
@@ -153,6 +174,7 @@ def chain_from_xml(
     read_xml: Callable[[str], Optional[str]],
 ) -> List[Segment]:
     """Master first, then each segment its predecessor's XML points to."""
+    require_head(master_ids)
     if not master_ids.next_name and not master_ids.next_id:
         raise SpanUnresolved("master has no next segment")
     top_id = master_ids.top_id or master_ids.global_id
@@ -164,6 +186,8 @@ def chain_from_xml(
         where = f"segment {next_name or '?'} (hop {hop})"
         if not next_name or not next_id:
             raise SpanUnresolved(f"{where}: next ClipName or GlobalClipID missing")
+        if not _plain_name(next_name):
+            raise SpanUnresolved(f"{where}: not a plain clip name")
         if next_name in seen:
             raise SpanUnresolved(f"{where}: segment name repeats")
         if len(chain) >= MAX_SEGMENTS:
@@ -176,6 +200,7 @@ def chain_from_xml(
         except SpanUnresolved as error:
             raise SpanUnresolved(f"{where}: {error}") from None
         checks = (
+            (clip.name == next_name, f"ClipName {clip.name}, not {next_name}"),
             (
                 clip.global_id == next_id,
                 f"GlobalClipID {clip.global_id}, not {next_id}",

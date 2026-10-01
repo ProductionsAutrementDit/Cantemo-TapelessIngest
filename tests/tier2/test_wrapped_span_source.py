@@ -126,3 +126,33 @@ def test_a_legacy_segment_without_metadata_is_unresolved(migrated_db):
     SpannedClips.objects.create(master_clip=master, clip=second, order=2)
     with pytest.raises(SpanUnresolved, match="ROW2"):
         resolve_span(master, _xml_disk())
+
+
+def test_xml_source_refuses_a_middle_segment(migrated_db):
+    middle = _clip(
+        MID,
+        "003876",
+        item_id="VX-2",
+        Relation_Top_GlobalClipID=TOP,
+        Relation_Previous_GlobalClipID=TOP,
+        Relation_Next_ClipName="0039EX",
+        Relation_Next_GlobalClipID=LAST,
+    )
+    with pytest.raises(SpanUnresolved, match="not the head of its take"):
+        resolve_span(middle, _xml_disk())
+
+
+def test_legacy_source_refuses_a_middle_segment(migrated_db):
+    middle = _clip(MID, "003876", item_id="VX-2", Relation_Top_GlobalClipID=TOP)
+    third = _clip("ROW3", "0039EX", duration="1200")
+    SpannedClips.objects.create(master_clip=middle, clip=third, order=2)
+    with pytest.raises(SpanUnresolved, match=f"not the head of its take.*{TOP}"):
+        resolve_span(middle, _xml_disk())
+
+
+def test_legacy_source_refuses_a_master_with_a_previous(migrated_db):
+    master = _master(Relation_Previous_GlobalClipID="SOMEONE")
+    second = _clip("ROW2", "003876")
+    SpannedClips.objects.create(master_clip=master, clip=second, order=2)
+    with pytest.raises(SpanUnresolved, match="Previous SOMEONE"):
+        resolve_span(master, _xml_disk())
