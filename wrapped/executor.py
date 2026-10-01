@@ -33,6 +33,7 @@ from portal.plugins.TapelessIngest.wrapped.metadata import (
 from portal.plugins.TapelessIngest.wrapped.shape import (
     build_document,
     build_document_from_template,
+    build_span_document,
 )
 from portal.plugins.TapelessIngest.wrapped.templates import Timing
 from portal.plugins.TapelessIngest.wrapped.verifier import verify_item
@@ -183,6 +184,10 @@ class Executor:
                 f"original shapes are {live_ids}, expected only the wrapped "
                 f"{row.plan['wrapped_shape_id']}"
             )
+        if "segments" in row.plan:
+            document = self._span_document(row.plan)
+            row.plan["new_shape_id"] = self.gateway.post_shape(row.item_id, document)
+            return
         video_id = self._file_ids(row, "video")[0]
         audio_ids = self._file_ids(row, "audio")
         # The planner stored the template and timing: apply never reads
@@ -200,6 +205,33 @@ class Executor:
                 parse_shape(row.plan["wrapped_shape"]), video_id, audio_ids
             )
         row.plan["new_shape_id"] = self.gateway.post_shape(row.item_id, document)
+
+    @staticmethod
+    def _span_document(plan) -> dict:
+        """A spanned take: one shape naming every segment's files, grouped
+        by the ``segment`` index the planner put on each original."""
+        count = len(plan["segments"])
+        videos: List[str] = [""] * count
+        audios: List[List[str]] = [[] for _ in range(count)]
+        for original in plan["originals"]:
+            if original["kind"] == "video":
+                videos[original["segment"]] = original["file_id"]
+            else:
+                audios[original["segment"]].append(original["file_id"])
+        if plan["technical_source"].startswith("template:"):
+            return build_span_document(
+                plan["segments"],
+                videos,
+                audios,
+                template=plan["template"],
+                timing=Timing(**plan["timing"]),
+            )
+        return build_span_document(
+            plan["segments"],
+            videos,
+            audios,
+            wrapped=parse_shape(plan["wrapped_shape"]),
+        )
 
     def _write_metadata(self, row) -> None:
         shape_id = row.plan["new_shape_id"]
@@ -229,6 +261,8 @@ class Executor:
                 component_fields(original, original.get("sha1")),
             )
         summary = item_fields(row.plan["originals"])
+        if "manifest" in row.plan:
+            summary[fields.PAD_ASSEMBLY_FIELD] = row.plan["manifest"]
         if summary:
             self.gateway.set_item_metadata(row.item_id, summary)
 

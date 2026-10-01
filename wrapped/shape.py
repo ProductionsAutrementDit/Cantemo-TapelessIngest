@@ -169,6 +169,155 @@ def build_document_from_template(
     return document
 
 
+def _time_base(body: Mapping[str, Any], name: str) -> Tuple[int, int]:
+    """(numerator, denominator) of a body's own ``timeBase``, else of the
+    time base its stated duration is counted in."""
+    if "timeBase" in body:
+        if name == "audio":
+            return audio_time_base(body)
+        time_base = body["timeBase"]
+    else:
+        time_base = (body.get("duration") or {}).get("timeBase")
+    try:
+        numerator = int(time_base["numerator"])
+        denominator = int(time_base["denominator"])
+    except (TypeError, KeyError, ValueError):
+        raise ShapeMismatch(f"{name}Component has no timeBase") from None
+    if numerator <= 0 or denominator <= 0:
+        raise ShapeMismatch(f"{name}Component timeBase {time_base} is not positive")
+    return numerator, denominator
+
+
+def _segment_duration(
+    segment: Mapping[str, Any], time_base: Tuple[int, int], unit: str
+) -> Dict[str, Any]:
+    """``segment``'s length counted exactly in ``time_base``, or refused."""
+    numerator, denominator = time_base
+    samples = _exact(
+        segment["frames"] * segment["num"] * denominator,
+        segment["den"] * numerator,
+        unit,
+    )
+    return {
+        "samples": samples,
+        "timeBase": {"numerator": numerator, "denominator": denominator},
+    }
+
+
+def _restate_span(
+    wrapped: Shape,
+    segments: Sequence[Mapping[str, Any]],
+    video_file_ids: Sequence[str],
+    audio_file_ids: Sequence[Sequence[str]],
+) -> Dict[str, Any]:
+    (container,) = wrapped.of_kind("container")
+    (video,) = wrapped.of_kind("video")
+    audios: List[Component] = sorted(wrapped.of_kind("audio"), key=_stream_order)
+    container_base = _time_base(container.body, "container")
+    video_base = _time_base(video.body, "video")
+    audio_bases = [_time_base(audio.body, "audio") for audio in audios]
+    videos, sounds = [], []
+    for index, segment in enumerate(segments):
+        try:
+            # Checked though the container states the whole take: every
+            # segment boundary is exact in every time base of the shape.
+            _segment_duration(segment, container_base, "container units")
+            body = _restate(video, video_file_ids[index], stream=True)
+            body["itemTrack"] = f"V{index + 1}"
+            body["duration"] = _segment_duration(segment, video_base, "video units")
+            videos.append(body)
+            for channel, (audio, base) in enumerate(zip(audios, audio_bases)):
+                body = _restate(audio, audio_file_ids[index][channel], stream=True)
+                body["itemTrack"] = f"A{len(audios) * index + channel + 1}"
+                body["duration"] = _segment_duration(segment, base, "audio samples")
+                sounds.append(body)
+        except ShapeMismatch as error:
+            raise ShapeMismatch(f"segment {segment['name']}: {error}") from None
+    document: Dict[str, Any] = {
+        "containerComponent": _restate(container, video_file_ids[0], stream=False),
+        "videoComponent": videos,
+        "audioComponent": sounds,
+    }
+    if wrapped.mime_types:
+        document["mimeType"] = list(wrapped.mime_types)
+    return document
+
+
+def _template_span(
+    template: Mapping[str, Any],
+    timing: Timing,
+    segments: Sequence[Mapping[str, Any]],
+    video_file_ids: Sequence[str],
+    audio_file_ids: Sequence[Sequence[str]],
+) -> Dict[str, Any]:
+    # No audio for the whole take: no component states its audio length.
+    whole = build_document_from_template(template, video_file_ids[0], [], timing)
+    videos, sounds = [], []
+    for index, segment in enumerate(segments):
+        own = Timing(
+            frames=segment["frames"],
+            num=segment["num"],
+            den=segment["den"],
+            start_tc_frames=timing.start_tc_frames,
+        )
+        try:
+            built = build_document_from_template(
+                template, video_file_ids[index], audio_file_ids[index], own
+            )
+        except ShapeMismatch as error:
+            raise ShapeMismatch(f"segment {segment['name']}: {error}") from None
+        (video,) = built["videoComponent"]
+        video["itemTrack"] = f"V{index + 1}"
+        videos.append(video)
+        count = len(built["audioComponent"])
+        for channel, audio in enumerate(built["audioComponent"]):
+            audio["itemTrack"] = f"A{count * index + channel + 1}"
+            sounds.append(audio)
+    document: Dict[str, Any] = {
+        "containerComponent": whole["containerComponent"],
+        "videoComponent": videos,
+        "audioComponent": sounds,
+    }
+    if "mimeType" in whole:
+        document["mimeType"] = whole["mimeType"]
+    return document
+
+
+def build_span_document(
+    segments: Sequence[Mapping[str, Any]],
+    video_file_ids: Sequence[str],
+    audio_file_ids: Sequence[Sequence[str]],
+    *,
+    wrapped: Optional[Shape] = None,
+    template: Optional[Mapping[str, Any]] = None,
+    timing: Optional[Timing] = None,
+) -> Dict[str, Any]:
+    """ONE original shape for a spanned take (measured accepted by
+    shape/create, 2026-10-01): one container naming segment 1's video and
+    stating the WHOLE take; per segment ``i``, one video component (``V<i+1>``)
+    and one audio component per channel ``k`` (``A<count*i+k+1>``), each
+    naming that segment's own file and stating that segment's own length.
+
+    Restated from the ``wrapped`` shape, or from a ``template`` whose
+    ``timing`` is the whole take; nothing else is stated."""
+    if len(video_file_ids) != len(segments) or len(audio_file_ids) != len(segments):
+        raise ShapeMismatch(
+            f"{len(video_file_ids)} video / {len(audio_file_ids)} audio file "
+            f"list(s) for {len(segments)} segment(s)"
+        )
+    if not segments:
+        raise ShapeMismatch("no segment")
+    if wrapped is not None:
+        for segment, audios in zip(segments, audio_file_ids):
+            problem = mismatch(wrapped, len(audios))
+            if problem:
+                raise ShapeMismatch(f"segment {segment['name']}: {problem}")
+        return _restate_span(wrapped, segments, video_file_ids, audio_file_ids)
+    if template is None or timing is None:
+        raise ShapeMismatch("neither a wrapped shape nor a template and its timing")
+    return _template_span(template, timing, segments, video_file_ids, audio_file_ids)
+
+
 _COMPARED = ("containerComponent", "videoComponent", "audioComponent")
 
 

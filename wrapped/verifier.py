@@ -40,4 +40,8 @@ def verify_item(row, gateway) -> List[str]:
         problems.append(
             f"durationSeconds {duration.get(fields.DURATION_FIELD)} != {before}"
         )
+    if "manifest" in plan:
+        written = gateway.item_fields(row.item_id, [fields.PAD_ASSEMBLY_FIELD])
+        if written.get(fields.PAD_ASSEMBLY_FIELD) != [plan["manifest"]]:
+            problems.append("pad-assembly manifest differs")
     return problems

@@ -14,13 +14,19 @@ Measured attachment shapes besides the usual one wrapped file: the
 wrapped MXF attached once per online legacy storage (``wrapped_files``
 in the plan), and a genuine shape naming no file at all (neither key;
 its container duration is cross-checked against durationSeconds instead).
+
+A spanned take (``span``, master first) is planned as ONE original shape
+naming every segment's files, plus the pad-assembly manifest pad_forge
+reads; the segments must sum exactly to the wrapped duration.
 """
 
 import copy
+import json
 import posixpath
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
+from fractions import Fraction
 from types import MappingProxyType
-from typing import Any, Dict, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from portal.plugins.TapelessIngest.wrapped import fields, verdicts
 from portal.plugins.TapelessIngest.wrapped.archive import CachedArchive
@@ -35,9 +41,11 @@ from portal.plugins.TapelessIngest.wrapped.shape import (
     ShapeMismatch,
     audio_time_base,
     build_document_from_template,
+    build_span_document,
     duration_seconds,
     mismatch,
 )
+from portal.plugins.TapelessIngest.wrapped.span import Segment
 from portal.plugins.TapelessIngest.wrapped.templates import (
     is_proxy_copy,
     template_key_with_source,
@@ -75,6 +83,8 @@ ROLLBACK_ITEM_FIELDS = (
     fields.ITEM_DURATION_TIMECODE_FIELD,
     fields.ITEM_START_TIMECODE_FIELD,
     fields.ITEM_START_SECONDS_FIELD,
+    # Written for spanned takes only; empty on every item before.
+    fields.PAD_ASSEMBLY_FIELD,
 )
 
 
@@ -179,9 +189,12 @@ def _from_template(
     clip_metadata: Mapping[str, Any],
     templates: Mapping[str, Any],
     item_values: Mapping[str, Any],
+    span: Optional[Sequence[Segment]] = None,
 ) -> Dict[str, Any]:
     """The template route, for a shape whose own technical description
-    cannot be restated; ``label`` says why and prefixes every problem."""
+    cannot be restated; ``label`` says why and prefixes every problem.
+    For a ``span``, the key and start timecode are the master's, the
+    timing is the whole take's."""
     marker = item_values.get(fields.CPAA_MIGRATION_FIELD) or [None]
     if marker[0] != fields.CPAA_MIGRATION_DONE:
         return {
@@ -204,18 +217,43 @@ def _from_template(
         clip_timing = timing(clip_metadata)
     except ValueError as error:
         return {"problem": f"{incomplete}: {error}"}
+    if span:
+        edit_unit = (clip_timing.num, clip_timing.den)
+        if edit_unit != span[0].edit_unit:
+            return {
+                "problem": f"{label}; P2 EditUnit {clip_timing.num}/"
+                f"{clip_timing.den} is not the take's "
+                f"{span[0].edit_unit[0]}/{span[0].edit_unit[1]}"
+            }
+        clip_timing = replace(clip_timing, frames=sum(s.frames for s in span))
     try:
         # A dry build: every duration this item needs is exact in the
         # template's time bases, so apply cannot fail on it after writes.
-        build_document_from_template(template, "V", ["A"] * audio_count, clip_timing)
+        if span:
+            build_span_document(
+                _segments(span),
+                ["V"] * len(span),
+                [["A"] * audio_count] * len(span),
+                template=template,
+                timing=clip_timing,
+            )
+        else:
+            build_document_from_template(
+                template, "V", ["A"] * audio_count, clip_timing
+            )
     except ShapeMismatch as error:
         return {"problem": f"{label}; template {key} cannot state this item: {error}"}
-    problem = _duration_problem(
-        label,
-        item_values,
-        "P2 duration",
-        clip_timing.frames * clip_timing.num / clip_timing.den,
-    )
+    if span:
+        problem = _span_duration_problem(
+            label, item_values, sum(s.seconds for s in span)
+        )
+    else:
+        problem = _duration_problem(
+            label,
+            item_values,
+            "P2 duration",
+            clip_timing.frames * clip_timing.num / clip_timing.den,
+        )
     if problem:
         return {"problem": problem}
     result = {
@@ -271,6 +309,118 @@ def _technical_source(
         problem = mismatch(shape, audio_count)
         return {"problem": problem} if problem else {"technical_source": "wrapped"}
     return _from_template(label, audio_count, clip_metadata, templates, item_values)
+
+
+def _segments(span: Sequence[Segment]) -> List[Dict[str, Any]]:
+    return [
+        {
+            "name": s.name,
+            "frames": s.frames,
+            "num": s.edit_unit[0],
+            "den": s.edit_unit[1],
+        }
+        for s in span
+    ]
+
+
+def _manifest(span: Sequence[Segment]) -> str:
+    """The pad-assembly/1 document pad_forge's ``manifest.from_document``
+    parses, serialised once here: apply writes this string verbatim and
+    verify compares it exactly."""
+    return json.dumps(
+        {
+            "schema": "pad-assembly/1",
+            "clips": [
+                {
+                    "video": to_absolute(s.video.relative),
+                    "audio": [to_absolute(a.relative) for a in s.audios],
+                }
+                for s in span
+            ],
+            "reel_audio": [],
+        },
+        sort_keys=False,
+    )
+
+
+def span_originals(span: Sequence[Segment]) -> List[OriginalFile]:
+    """Every file of the take, segment by segment: video, then audios."""
+    return [f for s in span for f in (s.video, *s.audios)]
+
+
+def _span_duration_problem(
+    label: str, item_values: Mapping[str, Any], total: Fraction
+) -> Optional[str]:
+    """A template-stated take: its segments must sum to the item's
+    durationSeconds (the proxy analysis of the whole take)."""
+    values = item_values.get(fields.DURATION_FIELD)
+    if not values:
+        return f"{label}; no durationSeconds to cross-check"
+    try:
+        current = float(values[0])
+    except ValueError:
+        return f"{label}; durationSeconds {values[0]!r} is not a number"
+    return _span_sum_problem(total, current)
+
+
+def _span_sum_problem(total: Fraction, wrapped: float) -> Optional[str]:
+    if abs(float(total) - wrapped) <= DURATION_TOLERANCE_S:
+        return None
+    return (
+        f"spanned take: segments sum to {float(total):.3f} s, "
+        f"wrapped is {wrapped:.3f} s"
+    )
+
+
+def _span_technical_source(
+    shape: Shape,
+    span: Sequence[Segment],
+    clip_metadata: Mapping[str, Any],
+    templates: Mapping[str, Any],
+    item_values: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """As ``_technical_source``, for a take stated as one multi-segment
+    shape. Unconditional for every take: the segments must sum to the
+    wrapped duration, which also catches a chain whose head no id proves."""
+    audio_count = len(span[0].audios)
+    for segment in span[1:]:
+        if len(segment.audios) != audio_count:
+            return {
+                "problem": f"spanned take: segment {segment.name} has "
+                f"{len(segment.audios)} audio file(s), the master {audio_count}"
+            }
+    if not shape.files():
+        problem = _fileless_problem(shape, audio_count, item_values)
+        if problem:
+            return {"problem": problem}
+    elif is_proxy_copy(shape):
+        return _from_template(
+            PROXY_COPY, audio_count, clip_metadata, templates, item_values, span
+        )
+    elif _is_binary_only(shape):
+        return _from_template(
+            BINARY_ONLY, audio_count, clip_metadata, templates, item_values, span
+        )
+    problem = mismatch(shape, audio_count)
+    if problem:
+        return {"problem": problem}
+    (container,) = shape.of_kind("container")
+    seconds = duration_seconds(container.body.get("duration"))
+    if seconds is None:
+        return {"problem": "spanned take: wrapped container has no duration"}
+    problem = _span_sum_problem(sum(s.seconds for s in span), float(seconds))
+    if problem:
+        return {"problem": problem}
+    try:
+        build_span_document(
+            _segments(span),
+            ["V"] * len(span),
+            [["A"] * audio_count] * len(span),
+            wrapped=shape,
+        )
+    except ShapeMismatch as error:
+        return {"problem": f"spanned take: {error}"}
+    return {"technical_source": "wrapped"}
 
 
 def _locate(
@@ -346,9 +496,15 @@ def plan_item(
     disk,
     clip_metadata: Mapping[str, Any] = _NO_METADATA,
     templates: Mapping[str, Any] = _NO_METADATA,
+    span: Optional[Sequence[Segment]] = None,
+    span_problem: Optional[str] = None,
 ) -> PlanResult:
-    if spanned:
-        return PlanResult(verdicts.SPANNED, "spanned P2 clip: a later slice")
+    if spanned and span is None:
+        return PlanResult(
+            verdicts.SPANNED, span_problem or "spanned P2 clip: a later slice"
+        )
+    if span is not None:
+        originals = span_originals(span)
     shapes = gateway.original_shapes(item_id)
     if len(shapes) != 1:
         return PlanResult(verdicts.UNEXPECTED, f"{len(shapes)} original shapes")
@@ -380,13 +536,24 @@ def plan_item(
     # durationSeconds the template and fileless routes are cross-checked
     # against.
     item_values = gateway.item_fields(item_id, ROLLBACK_ITEM_FIELDS)
-    technical = _technical_source(
-        shape, originals, clip_metadata, templates, item_values
-    )
+    if span is None:
+        technical = _technical_source(
+            shape, originals, clip_metadata, templates, item_values
+        )
+    else:
+        technical = _span_technical_source(
+            shape, span, clip_metadata, templates, item_values
+        )
     if "problem" in technical:
         return PlanResult(verdicts.UNEXPECTED, technical["problem"])
 
     located = [_locate(o, gateway, archive, disk, None) for o in originals]
+    layout: Dict[str, Any] = {}
+    if span is not None:
+        index = [n for n, s in enumerate(span) for _ in (s.video, *s.audios)]
+        for original, segment in zip(located, index):
+            original["segment"] = segment
+        layout = {"segments": _segments(span), "manifest": _manifest(span)}
     missing = [o["relative"] for o in located if not o["on_disk"] and not o["entry"]]
     if missing:
         return PlanResult(
@@ -412,6 +579,7 @@ def plan_item(
             **_wrapped_files(shape),
             "originals": located,
             **technical,
+            **layout,
         },
         rollback=_rollback(item_id, shape, gateway, item_values),
     )

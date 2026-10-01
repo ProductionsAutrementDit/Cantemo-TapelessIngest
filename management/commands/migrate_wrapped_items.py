@@ -53,7 +53,11 @@ from portal.plugins.TapelessIngest.wrapped.disk import Disk
 from portal.plugins.TapelessIngest.wrapped.dryrun import RecordingGateway
 from portal.plugins.TapelessIngest.wrapped.executor import Executor
 from portal.plugins.TapelessIngest.wrapped.gateway import parse_shape
-from portal.plugins.TapelessIngest.wrapped.planner import PlanResult, plan_item
+from portal.plugins.TapelessIngest.wrapped.planner import (
+    PlanResult,
+    plan_item,
+    span_originals,
+)
 from portal.plugins.TapelessIngest.wrapped.relocate import (
     PreexistingVerifyFailure,
     Relocator,
@@ -63,9 +67,11 @@ from portal.plugins.TapelessIngest.wrapped.relocate import (
 from portal.plugins.TapelessIngest.wrapped.resolver import (
     ResolveError,
     resolve_p2,
+    resolve_span,
     wrapped_p2_clips,
 )
 from portal.plugins.TapelessIngest.wrapped.shape import template_disagreements
+from portal.plugins.TapelessIngest.wrapped.span import SpanUnresolved
 from portal.plugins.TapelessIngest.wrapped.templates import (
     audio_bits_per_sample,
     common_template,
@@ -108,6 +114,21 @@ def _clip_metadata(clip):
     if bits:
         metadata[AUDIO_BITS] = bits
     return metadata
+
+
+def _originals(clip, disk):
+    """(originals, span, span_problem): a single clip's ClipFile rows; a
+    resolvable spanned master's whole take, segment by segment; nothing
+    but the reason it is deferred for any other spanned clip."""
+    if not clip.spanned:
+        return resolve_p2(clip), None, None
+    if not clip.master_clip:
+        return [], None, "spanned P2 clip: not the master of its take"
+    try:
+        span = resolve_span(clip, disk)
+    except SpanUnresolved as error:
+        return [], None, f"spanned P2 clip: {error}"
+    return span_originals(span), span, None
 
 
 class Command(BaseCommand):
@@ -279,9 +300,10 @@ class Command(BaseCommand):
                 counts["frozen"] += 1
                 continue
             try:
+                originals, span, span_problem = _originals(clip, disk)
                 result = plan_item(
                     item_id=clip.item_id,
-                    originals=resolve_p2(clip),
+                    originals=originals,
                     spanned=clip.spanned,
                     output_file=clip.output_file,
                     gateway=gateway,
@@ -289,6 +311,8 @@ class Command(BaseCommand):
                     disk=disk,
                     clip_metadata=_clip_metadata(clip),
                     templates=templates,
+                    span=span,
+                    span_problem=span_problem,
                 )
             except ResolveError as error:
                 result = PlanResult(verdicts.UNEXPECTED, str(error))

@@ -43,6 +43,11 @@ ITEM_DURATION_TIMECODE_FIELD = "durationTimeCode"
 ITEM_START_TIMECODE_FIELD = "startTimeCode"
 ITEM_START_SECONDS_FIELD = "startSeconds"
 
+# A spanned take's segment list, as pad_forge's ``manifest.from_document``
+# reads it (measured writable on prod, 2026-10-01, through
+# update_or_create_item_metadata).
+PAD_ASSEMBLY_FIELD = "portal_pad_assembly"
+
 ARCHIWARE_PLUGIN_GUID = "c4c1d403-801b-4b1a-95a1-6a692f64c262"
 # P5 archive plan "Airbus Helicopters", whose index is AirbusHelicopters.
 AIRBUS_POLICY_UUID = "aw-10007"

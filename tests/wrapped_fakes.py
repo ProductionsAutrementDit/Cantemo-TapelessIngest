@@ -16,6 +16,7 @@ from portal.plugins.TapelessIngest.wrapped.archive import (
 )
 from portal.plugins.TapelessIngest.wrapped.gateway import FileEntity, parse_shape
 from portal.plugins.TapelessIngest.wrapped.paths import OriginalFile
+from portal.plugins.TapelessIngest.wrapped.span import Segment, segment_files
 
 
 class FakeArchive:
@@ -525,3 +526,16 @@ def p2_segment_xml(
         + connection
         + "</Relation></ClipContent></P2Main>"
     )
+
+
+SPAN_CONTENTS = "2015/AH_150108_EC225_SAR_COROGNE/CONTENTS"
+# 100 + 100 + 50 frames at 1/25: a 10 s take.
+SPAN_TAKES = (("0037OO", 100), ("003876", 100), ("0039EX", 50))
+
+
+def p2_span(takes=SPAN_TAKES, contents=SPAN_CONTENTS, audio_count=4, edit_unit=(1, 25)):
+    """A resolved spanned take, master first, as ``resolve_span`` returns it."""
+    return [
+        Segment(name, *segment_files(contents, name, audio_count), frames, edit_unit)
+        for name, frames in takes
+    ]
