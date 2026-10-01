@@ -416,6 +416,17 @@ class Command(BaseCommand):
         counts = Counter()
         to_relocate = []
         for row in self._rows(options):
+            if "manifest" in row.plan and (
+                under(row.plan, old) or relocated(row.plan, old, new)
+            ):
+                # The manifest names every segment's absolute path, and
+                # nothing here rewrites it: refused before any read or write.
+                counts["spanned take"] += 1
+                self.stdout.write(
+                    f"{row.item_id}: spanned take: relocate does not rewrite "
+                    f"the pad-assembly manifest; not relocated"
+                )
+                continue
             if not under(row.plan, old):
                 # Moved by an earlier run: rechecked until it verifies.
                 if row.phase == "done" and relocated(row.plan, old, new):
@@ -480,6 +491,7 @@ class Command(BaseCommand):
                     "pre-existing verify failure",
                     "to re-plan",
                     "in progress",
+                    "spanned take",
                 )
             )
         )
@@ -621,6 +633,10 @@ class Command(BaseCommand):
             if plan.get("technical_source", "wrapped") != "wrapped":
                 continue
             if row.phase or "wrapped_shape" not in plan:
+                continue
+            # A spanned take's wrapped shape describes several clips: it is
+            # no reference for a single clip's format.
+            if "segments" in plan:
                 continue
             wrapped = parse_shape(plan["wrapped_shape"])
             if is_proxy_copy(wrapped):

@@ -66,6 +66,21 @@ class ClipXml:
     audio_count: int
 
 
+@dataclass(frozen=True)
+class RowIds:
+    """What one legacy ``SpannedClips`` row and its clip's ClipMetadata
+    say about that segment's place in the take."""
+
+    order: int
+    global_id: str  # Clip.umid
+    name: str
+    frames: int
+    top_id: Optional[str]
+    previous_id: Optional[str]
+    next_id: Optional[str]
+    offset: Optional[str]  # Relation_OffsetInShot as stored, if any
+
+
 def parse_frames(value) -> int:
     try:
         frames = int(str(value).strip())
@@ -229,6 +244,54 @@ def chain_from_xml(
         next_name, next_id = clip.next_name, clip.next_id
         hop += 1
     return chain
+
+
+def prove_rows(master_ids: MasterIds, master_frames: int, rows: List[RowIds]) -> None:
+    """As strict as the XML walk: the legacy rows (sorted by ``order``,
+    the master's self row excluded) must be numbered 2..N, and every link
+    their ClipMetadata states must hold, from the master's Next to the last
+    segment's empty Next."""
+    orders = [row.order for row in rows]
+    expected = list(range(2, len(rows) + 2))
+    if orders != expected:
+        raise SpanUnresolved(f"legacy table orders {orders}, expected {expected}")
+    top_id = master_ids.top_id or master_ids.global_id
+    previous_id, offset = master_ids.global_id, master_frames
+    next_id = master_ids.next_id
+    for row in rows:
+        where = f"segment {row.name} (row {row.order})"
+        if row.offset is None:
+            stated = None
+        else:
+            try:
+                stated = int(row.offset)
+            except ValueError:
+                raise SpanUnresolved(
+                    f"{where}: OffsetInShot {row.offset!r} is not a frame count"
+                ) from None
+        checks = (
+            (next_id == row.global_id, f"previous Next {next_id}, not {row.global_id}"),
+            (
+                row.previous_id == previous_id,
+                f"Previous {row.previous_id}, not {previous_id}",
+            ),
+            (row.top_id == top_id, f"Top {row.top_id}, not {top_id}"),
+            (
+                stated is None or stated == offset,
+                f"OffsetInShot {stated}, not {offset}",
+            ),
+        )
+        for holds, why in checks:
+            if not holds:
+                raise SpanUnresolved(f"{where}: {why}")
+        previous_id, offset = row.global_id, offset + row.frames
+        next_id = row.next_id
+    if rows and next_id:
+        last = rows[-1]
+        raise SpanUnresolved(
+            f"segment {last.name} (row {last.order}): Next {next_id}, "
+            f"but it is the last segment"
+        )
 
 
 def chain_from_rows(master: Segment, rows: Iterable[Segment]) -> List[Segment]:

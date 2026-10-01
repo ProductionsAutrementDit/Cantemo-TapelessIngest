@@ -332,3 +332,15 @@ def test_a_span_refuses_originals_passed_besides_it():
             disk=disk,
             span=span,
         )
+
+
+def test_the_manifest_is_ascii_and_restores_a_non_ascii_path():
+    contents = "2015/AH_150108_TOULOUSE_ÉTÉ/CONTENTS"
+    span = p2_span(contents=contents)
+    result = _plan(_world(span=span))
+    assert result.verdict == verdicts.READY, result.reason
+    manifest = result.plan["manifest"]
+    assert manifest.isascii()
+    assert "\\u00c9T\\u00c9" in manifest
+    clips = json.loads(manifest)["clips"]
+    assert clips[0]["video"] == to_absolute(f"{contents}/VIDEO/0037OO.MXF")

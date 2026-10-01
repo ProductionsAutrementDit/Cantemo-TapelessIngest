@@ -23,12 +23,14 @@ from portal.plugins.TapelessIngest.wrapped.paths import (
 )
 from portal.plugins.TapelessIngest.wrapped.span import (
     MasterIds,
+    RowIds,
     Segment,
     SpanUnresolved,
     chain_from_rows,
     chain_from_xml,
     parse_edit_unit,
     parse_frames,
+    prove_rows,
     require_head,
 )
 
@@ -95,7 +97,14 @@ def resolve_span(clip: Clip, disk) -> List[Segment]:
     )
     if rows:
         require_head(ids)
-        return chain_from_rows(master, [_segment(row.clip) for row in rows])
+        segments, proofs = [], []
+        for row in rows:
+            row_metadata = _metadata(row.clip)
+            segment = _segment(row.clip, row_metadata)
+            segments.append(segment)
+            proofs.append(_row_ids(row, segment, row_metadata))
+        prove_rows(ids, master.frames, proofs)
+        return chain_from_rows(master, segments)
     head, marker, _ = master.video.relative.rpartition("/VIDEO/")
     if not marker:
         raise SpanUnresolved(f"master video {master.video.relative} not in VIDEO/")
@@ -103,7 +112,24 @@ def resolve_span(clip: Clip, disk) -> List[Segment]:
 
 
 def _metadata(clip: Clip) -> Dict[str, str]:
+    # One value per name: (clip, name) is unique since migration 0001.
     return dict(ClipMetadata.objects.filter(clip=clip).values_list("name", "value"))
+
+
+def _row_ids(row: SpannedClips, segment: Segment, metadata: Dict[str, str]) -> RowIds:
+    def value(name: str) -> Optional[str]:
+        return (metadata.get(name) or "").strip() or None
+
+    return RowIds(
+        order=row.order,
+        global_id=row.clip.umid,
+        name=segment.name,
+        frames=segment.frames,
+        top_id=value("Relation_Top_GlobalClipID"),
+        previous_id=value("Relation_Previous_GlobalClipID"),
+        next_id=value("Relation_Next_GlobalClipID"),
+        offset=value("Relation_OffsetInShot"),
+    )
 
 
 def _segment(clip: Clip, metadata: Optional[Dict[str, str]] = None) -> Segment:
