@@ -54,6 +54,9 @@ _STRIPPED = (
     "pid",
     "mediaInfo",
 )
+# What describes one analysed FILE rather than its content: never kept in a
+# template, and never carried onto a spanned take's segment components.
+PER_FILE_KEYS = _STRIPPED
 _TIMECODE = re.compile(r"^(\d{2}):(\d{2}):(\d{2}):(\d{2})$")
 
 

@@ -244,8 +244,10 @@ def _from_template(
     except ShapeMismatch as error:
         return {"problem": f"{label}; template {key} cannot state this item: {error}"}
     if span:
+        # The item's durationSeconds is what stands for the wrapped
+        # duration when the wrapped shape's own is a proxy's.
         problem = _span_duration_problem(
-            label, item_values, sum(s.seconds for s in span)
+            item_values, sum(s.seconds for s in span), "wrapped"
         )
     else:
         problem = _duration_problem(
@@ -349,26 +351,28 @@ def span_originals(span: Sequence[Segment]) -> List[OriginalFile]:
 
 
 def _span_duration_problem(
-    label: str, item_values: Mapping[str, Any], total: Fraction
+    item_values: Mapping[str, Any], total: Fraction, name: str
 ) -> Optional[str]:
-    """A template-stated take: its segments must sum to the item's
-    durationSeconds (the proxy analysis of the whole take)."""
+    """Before any write, for every take: its segments must sum to the
+    item's durationSeconds (the proxy analysis of the whole take), which
+    apply leaves unchanged and verify re-checks. ``name`` is what that
+    value stands for in the refusal."""
     values = item_values.get(fields.DURATION_FIELD)
     if not values:
-        return f"{label}; no durationSeconds to cross-check"
+        return "spanned take: no durationSeconds to cross-check"
     try:
         current = float(values[0])
     except ValueError:
-        return f"{label}; durationSeconds {values[0]!r} is not a number"
-    return _span_sum_problem(total, current)
+        return f"spanned take: durationSeconds {values[0]!r} is not a number"
+    return _span_sum_problem(total, current, name)
 
 
-def _span_sum_problem(total: Fraction, wrapped: float) -> Optional[str]:
+def _span_sum_problem(total: Fraction, wrapped: float, name: str) -> Optional[str]:
     if abs(float(total) - wrapped) <= DURATION_TOLERANCE_S:
         return None
     return (
         f"spanned take: segments sum to {float(total):.3f} s, "
-        f"wrapped is {wrapped:.3f} s"
+        f"{name} is {wrapped:.3f} s"
     )
 
 
@@ -408,7 +412,10 @@ def _span_technical_source(
     seconds = duration_seconds(container.body.get("duration"))
     if seconds is None:
         return {"problem": "spanned take: wrapped container has no duration"}
-    problem = _span_sum_problem(sum(s.seconds for s in span), float(seconds))
+    total = sum(s.seconds for s in span)
+    problem = _span_sum_problem(
+        total, float(seconds), "wrapped"
+    ) or _span_duration_problem(item_values, total, "durationSeconds")
     if problem:
         return {"problem": problem}
     try:
@@ -504,6 +511,9 @@ def plan_item(
             verdicts.SPANNED, span_problem or "spanned P2 clip: a later slice"
         )
     if span is not None:
+        # One source of truth: the take's files come from the span alone.
+        if originals:
+            raise ValueError("originals are derived from span; pass none")
         originals = span_originals(span)
     shapes = gateway.original_shapes(item_id)
     if len(shapes) != 1:

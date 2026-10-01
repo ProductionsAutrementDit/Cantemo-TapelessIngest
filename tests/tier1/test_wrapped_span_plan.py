@@ -3,6 +3,8 @@ plus the pad-assembly manifest pad_forge reads."""
 
 import json
 
+import pytest
+
 from portal.plugins.TapelessIngest.wrapped import fields, verdicts
 from portal.plugins.TapelessIngest.wrapped.archive import CachedArchive
 from portal.plugins.TapelessIngest.wrapped.paths import to_absolute
@@ -56,7 +58,7 @@ def _plan(world, **extra):
     gateway, fake, disk, span = world
     return plan_item(
         item_id=ITEM,
-        originals=_files(span),
+        originals=[],
         spanned=True,
         output_file=OUTPUT,
         gateway=gateway,
@@ -258,7 +260,7 @@ def test_a_take_still_checks_the_attached_file_first():
     gateway, fake, disk, span = _world()
     result = plan_item(
         item_id=ITEM,
-        originals=_files(span),
+        originals=[],
         spanned=True,
         output_file="/x/OTHER.MXF",
         gateway=gateway,
@@ -283,3 +285,50 @@ def test_a_fileless_genuine_take_is_cross_checked_then_ready():
     refused = _plan(_world(document, duration="12"))
     assert refused.verdict == verdicts.UNEXPECTED
     assert refused.reason.startswith("fileless original shape; container duration")
+
+
+def test_a_genuine_take_whose_item_duration_differs_is_unexpected():
+    result = _plan(_world(duration="10.4"))
+    assert result.verdict == verdicts.UNEXPECTED
+    assert result.reason == (
+        "spanned take: segments sum to 10.000 s, durationSeconds is 10.400 s"
+    )
+    assert result.plan == {}
+
+
+def test_a_genuine_take_without_a_usable_item_duration_is_unexpected():
+    gateway, fake, disk, span = world = _world()
+    del gateway.items[ITEM]["durationSeconds"]
+    result = _plan(world)
+    assert result.verdict == verdicts.UNEXPECTED
+    assert result.reason == "spanned take: no durationSeconds to cross-check"
+    gateway.items[ITEM]["durationSeconds"] = ["ten"]
+    result = _plan(world)
+    assert result.reason == "spanned take: durationSeconds 'ten' is not a number"
+
+
+def test_a_template_take_without_a_usable_item_duration_says_spanned_take():
+    gateway, fake, disk, span = world = _world(
+        proxy_copy_document(), cpaa_marker="true"
+    )
+    del gateway.items[ITEM]["durationSeconds"]
+    result = _plan(
+        world, clip_metadata=p2_clip_metadata(duration="100"), templates=TEMPLATES
+    )
+    assert result.verdict == verdicts.UNEXPECTED
+    assert result.reason == "spanned take: no durationSeconds to cross-check"
+
+
+def test_a_span_refuses_originals_passed_besides_it():
+    gateway, fake, disk, span = _world()
+    with pytest.raises(ValueError, match="span"):
+        plan_item(
+            item_id=ITEM,
+            originals=_files(span),
+            spanned=True,
+            output_file=OUTPUT,
+            gateway=gateway,
+            archive=CachedArchive(fake),
+            disk=disk,
+            span=span,
+        )

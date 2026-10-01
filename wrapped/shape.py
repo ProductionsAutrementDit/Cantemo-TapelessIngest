@@ -18,7 +18,7 @@ from fractions import Fraction
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from portal.plugins.TapelessIngest.wrapped.gateway import Component, Shape
-from portal.plugins.TapelessIngest.wrapped.templates import Timing
+from portal.plugins.TapelessIngest.wrapped.templates import PER_FILE_KEYS, Timing
 
 # `mediaInfo` is MediaInfo's analysis of the wrapped, multiplexed file (VX-35313:
 # "Count of stream of this kind = 8", "Muxing mode = DV"), not of the originals.
@@ -204,6 +204,20 @@ def _segment_duration(
     }
 
 
+# A segment body is the wrapped body minus every whole-file value: the
+# wrapped MXF's start, stream pid and packet count describe the whole take
+# (the container keeps them; it starts at segment 1). duration,
+# essenceStreamId, itemTrack and file are restated per segment.
+_SEGMENT_DROPPED = frozenset(PER_FILE_KEYS) | {"numberOfPackets"}
+
+
+def _segment_body(component: Component, file_id: str) -> Dict[str, Any]:
+    body = _restate(component, file_id, stream=True)
+    for key in _SEGMENT_DROPPED - {"file", "essenceStreamId"}:
+        body.pop(key, None)
+    return body
+
+
 def _restate_span(
     wrapped: Shape,
     segments: Sequence[Mapping[str, Any]],
@@ -222,12 +236,12 @@ def _restate_span(
             # Checked though the container states the whole take: every
             # segment boundary is exact in every time base of the shape.
             _segment_duration(segment, container_base, "container units")
-            body = _restate(video, video_file_ids[index], stream=True)
+            body = _segment_body(video, video_file_ids[index])
             body["itemTrack"] = f"V{index + 1}"
             body["duration"] = _segment_duration(segment, video_base, "video units")
             videos.append(body)
             for channel, (audio, base) in enumerate(zip(audios, audio_bases)):
-                body = _restate(audio, audio_file_ids[index][channel], stream=True)
+                body = _segment_body(audio, audio_file_ids[index][channel])
                 body["itemTrack"] = f"A{len(audios) * index + channel + 1}"
                 body["duration"] = _segment_duration(segment, base, "audio samples")
                 sounds.append(body)

@@ -17,7 +17,8 @@ fields ``shape/create?updateItemMetadata=true`` also rewrites (measured on
 prod, M10, 2026-09-29): originalFilename, originalFormat,
 originalVideoCodec, originalAudioCodec, originalWidth, originalHeight,
 mimeType, mediaType, durationTimeCode, startTimeCode and startSeconds,
-alongside durationSeconds.
+alongside durationSeconds. For a spanned take (a plan with ``manifest``)
+that also clears ``portal_pad_assembly``, which was empty before.
 """
 
 import copy

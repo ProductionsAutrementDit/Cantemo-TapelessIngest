@@ -22,6 +22,25 @@ AUDIOS = [[f"VX-A{i}{k}" for k in range(4)] for i in range(3)]
 WHOLE = Timing(frames=250, num=1, den=25, start_tc_frames=1657612)
 
 
+PER_FILE = {
+    "startTimestamp": 1234,
+    "startTimecode": 1657612,
+    "firstSMPTETimecode": "18:25:04:12",
+    "pid": 7,
+    "numberOfPackets": 250,
+}
+
+
+def _per_file_document():
+    """A genuine wrapped shape whose every body carries the whole-file
+    values Vidispine measured on the wrapped MXF."""
+    document = genuine_p2_document(frames=250)
+    bodies = [document["containerComponent"]] + document["videoComponent"]
+    for body in bodies + document["audioComponent"]:
+        body.update(PER_FILE)
+    return document
+
+
 def _genuine(document=None, segments=SEGMENTS, audios=AUDIOS):
     wrapped = parse_shape(document or genuine_p2_document(frames=250))
     return build_span_document(
@@ -144,3 +163,13 @@ def test_template_refuses_an_inexact_segment_and_names_it():
             template=template,
             timing=Timing(200, 1, 25, 0),
         )
+
+
+def test_segment_components_drop_the_wrapped_files_whole_take_values():
+    document = _genuine(_per_file_document())
+    for body in document["videoComponent"] + document["audioComponent"]:
+        assert not set(PER_FILE) & set(body), body["itemTrack"]
+        assert {"duration", "essenceStreamId", "itemTrack", "file"} <= set(body)
+    assert document["videoComponent"][0]["codec"] == "dvvideo"
+    container = document["containerComponent"]
+    assert {k: container[k] for k in PER_FILE} == PER_FILE

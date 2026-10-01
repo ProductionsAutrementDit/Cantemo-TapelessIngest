@@ -56,7 +56,6 @@ from portal.plugins.TapelessIngest.wrapped.gateway import parse_shape
 from portal.plugins.TapelessIngest.wrapped.planner import (
     PlanResult,
     plan_item,
-    span_originals,
 )
 from portal.plugins.TapelessIngest.wrapped.relocate import (
     PreexistingVerifyFailure,
@@ -118,8 +117,9 @@ def _clip_metadata(clip):
 
 def _originals(clip, disk):
     """(originals, span, span_problem): a single clip's ClipFile rows; a
-    resolvable spanned master's whole take, segment by segment; nothing
-    but the reason it is deferred for any other spanned clip."""
+    resolvable spanned master's take (plan_item derives its originals
+    from it); nothing but the reason it is deferred for any other
+    spanned clip."""
     if not clip.spanned:
         return resolve_p2(clip), None, None
     if not clip.master_clip:
@@ -128,7 +128,7 @@ def _originals(clip, disk):
         span = resolve_span(clip, disk)
     except SpanUnresolved as error:
         return [], None, f"spanned P2 clip: {error}"
-    return span_originals(span), span, None
+    return [], span, None
 
 
 class Command(BaseCommand):

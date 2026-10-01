@@ -84,7 +84,7 @@ def _setup(gateway, document=None, span=True, duration="10", **extra):
     _clip()
     result = plan_item(
         item_id=ITEM,
-        originals=originals,
+        originals=[] if span else originals,
         spanned=span,
         output_file=OUTPUT,
         gateway=gateway,
