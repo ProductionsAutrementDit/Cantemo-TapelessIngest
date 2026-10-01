@@ -27,7 +27,8 @@ Signature = Tuple[Optional[str], Optional[Tuple[int, int]], Tuple[str, ...]]
 GENUINE = "genuine"
 PROXY = "proxy"
 AMBIGUOUS = "ambiguous"
-_EMPTY: Signature = (None, None, ())
+# No video, no audio: a shape that describes nothing to compare.
+NO_SIGNATURE: Signature = (None, None, ())
 
 
 @dataclass(frozen=True)
@@ -113,7 +114,7 @@ def classify_copy(
     """PROXY: equal to a lowres and refuted by ffprobe. AMBIGUOUS: equal to
     a lowres and ffprobe agrees or is absent. GENUINE otherwise. A lowres
     without any description is no evidence either way."""
-    if original not in [s for s in lowres if s != _EMPTY]:
+    if original not in [s for s in lowres if s != NO_SIGNATURE]:
         return GENUINE
     if probe is not None and probe != original:
         return PROXY
@@ -126,10 +127,15 @@ def _size(resolution: Optional[Tuple[int, int]]) -> str:
 
 def probe_disagreement(original: Signature, probe: Signature) -> Optional[str]:
     """What the shape's description says that ffprobe of the original
-    refutes: its video resolution (when both have a video) or its number
-    of audio streams. Codec NAMES are never compared: Vidispine and
-    ffprobe name the same essence differently (JPEG/mjpeg, hevc/unknown)."""
-    if original[0] is not None and probe[0] is not None:
+    refutes: a video on one side only (a still is a video on both), its
+    video resolution, or its number of audio streams. Codec NAMES are never
+    compared: Vidispine and ffprobe name the same essence differently
+    (JPEG/mjpeg, hevc/unknown)."""
+    if original[0] is not None and probe[0] is None:
+        return "a video stream, ffprobe has none"
+    if original[0] is None and probe[0] is not None:
+        return "no video stream, ffprobe has one"
+    if original[0] is not None:
         if original[1] != probe[1]:
             return (
                 f"video resolution {_size(original[1])}, " f"ffprobe {_size(probe[1])}"

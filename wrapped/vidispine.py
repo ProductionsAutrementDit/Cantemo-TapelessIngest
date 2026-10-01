@@ -90,6 +90,13 @@ class VidispineGateway:
             return None
         return None if size < 0 else size
 
+    def file_items(self, file_id: str) -> List[str]:
+        document = (
+            self._request("GET", f"storage/file/{file_id}", {"includeItem": "true"})
+            or {}
+        )
+        return [item["id"] for item in document.get("item", []) if item.get("id")]
+
     def component_metadata(
         self, item_id: str, shape_id: str, component_id: str
     ) -> Dict[str, str]:

@@ -87,6 +87,9 @@ class RecordingGateway:
     def file_size(self, file_id):
         return self._inner.file_size(file_id)
 
+    def file_items(self, file_id):
+        return self._inner.file_items(file_id)
+
     def component_metadata(self, item_id, shape_id, component_id):
         return self._inner.component_metadata(item_id, shape_id, component_id)
 

@@ -30,7 +30,9 @@ SIZE = 1000
 def _file_clip(gateway, archive, n, item_id, document, clipfiles, xml):
     seed_item(gateway, item_id, document)
     seed_lowres(gateway, item_id)
-    gateway.file_sizes["VX-W1"] = SIZE
+    for body in [document["containerComponent"], *document["videoComponent"]]:
+        for entity in body["file"]:
+            gateway.file_sizes[entity["id"]] = SIZE
     clip = Clip.objects.create(
         umid=f"F{n}",
         path="2019/AH_TEST",
@@ -57,7 +59,7 @@ def _world():
         archive,
         1,
         "VX-11",
-        file_mov_document(name="W1.mov"),
+        file_mov_document(file_id="VX-W1", name="W1.mov"),
         ["2019/AH_TEST/A001.MOV"],
         xml,
     )
@@ -68,6 +70,7 @@ def _world():
         2,
         "VX-12",
         file_mov_document(
+            file_id="VX-W2",
             name="W2.mov",
             video_codec="h264",
             resolution=(480, 272),
@@ -82,19 +85,29 @@ def _world():
         archive,
         3,
         "VX-13",
-        file_mov_document(storage="VX-41", state="CLOSED", name="2019/AH_TEST/A3.MOV"),
+        file_mov_document(
+            file_id="VX-W3", storage="VX-41", state="CLOSED", name="2019/AH_TEST/A3.MOV"
+        ),
         [],
         xml,
     )
     # unexpected: no ClipFile and the shape names the wrapped VX-2 copy
-    _file_clip(gateway, archive, 4, "VX-14", file_mov_document(name="W4.mov"), [], xml)
+    _file_clip(
+        gateway,
+        archive,
+        4,
+        "VX-14",
+        file_mov_document(file_id="VX-W4", name="W4.mov"),
+        [],
+        xml,
+    )
     # unexpected: two ClipFile rows
     _file_clip(
         gateway,
         archive,
         5,
         "VX-15",
-        file_mov_document(name="W5.mov"),
+        file_mov_document(file_id="VX-W5", name="W5.mov"),
         ["2019/AH_TEST/A005.MOV", "2019/AH_TEST/A005B.MOV"],
         xml,
     )
@@ -203,3 +216,35 @@ def test_an_unknown_provider_is_refused(migrated_db):
 
 def test_provider_p2_stays_accepted_for_every_action(migrated_db):
     _run(_world(), "report", "--provider", "panasonicP2")
+
+
+def test_plan_keeps_a_row_another_clip_of_the_item_owns(migrated_db):
+    world = _world()
+    _run(world, "plan")
+    p2_row = WrappedMigration.objects.get(item_id="VX-1")
+    gateway, archive, _ = world
+    # a file clip planned onto the same item as the P2 clip
+    _file_clip(
+        gateway,
+        archive,
+        9,
+        "VX-1",
+        file_mov_document(file_id="VX-W9", name="W9.mov"),
+        ["2019/AH_TEST/A009.MOV"],
+        ffprobe_xml(size=SIZE),
+    )
+    out = _run(world, "plan", "--provider", "file", "--item", "VX-1")
+    assert "VX-1: kept, row belongs to clip P1" in out
+    assert "other clip's row: 1" in out
+    row = WrappedMigration.objects.get(item_id="VX-1")
+    assert (row.clip_umid, row.plan, row.verdict) == (
+        "P1",
+        p2_row.plan,
+        p2_row.verdict,
+    )
+
+
+def test_plan_provider_file_prints_its_progress(migrated_db, monkeypatch):
+    monkeypatch.setattr(migrate_wrapped_items, "_PROGRESS_EVERY", 2)
+    out = _run(_world(), "plan", "--provider", "file")
+    assert out.splitlines()[:2] == ["planned 2 clips", "planned 4 clips"]

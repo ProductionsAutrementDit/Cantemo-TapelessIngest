@@ -147,6 +147,15 @@ def test_an_audio_count_mismatch_is_a_disagreement():
     assert problem == "2 audio stream(s), ffprobe 1"
 
 
-def test_resolution_is_only_compared_when_both_have_video():
-    assert probe_disagreement((None, None, ("pcm_s24le",)), MOV[:2] + (("a",),)) is None
-    assert probe_disagreement(MOV, (None, None, MOV[2])) is None
+def test_a_video_on_one_side_only_is_a_disagreement():
+    assert probe_disagreement((None, None, ("a",)), MOV[:2] + (("a",),)) == (
+        "no video stream, ffprobe has one"
+    )
+    assert probe_disagreement(MOV, (None, None, MOV[2])) == (
+        "a video stream, ffprobe has none"
+    )
+
+
+def test_a_still_is_video_on_both_sides():
+    still = ("mjpeg", (4000, 3000), ())
+    assert probe_disagreement(("jpeg", (4000, 3000), ()), still) is None

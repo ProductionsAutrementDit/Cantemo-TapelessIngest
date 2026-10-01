@@ -37,6 +37,7 @@ from portal.plugins.TapelessIngest.wrapped import fields, verdicts
 from portal.plugins.TapelessIngest.wrapped.archive import CachedArchive
 from portal.plugins.TapelessIngest.wrapped.ffprobe import (
     AMBIGUOUS,
+    NO_SIGNATURE,
     PROXY,
     Signature,
     classify_copy,
@@ -673,6 +674,23 @@ def _p5_size(entry: Optional[Mapping[str, Any]]) -> Optional[int]:
     return size if isinstance(size, int) and size >= 0 else None
 
 
+def _shared_entity(
+    item_id: str, located: Sequence[Mapping[str, Any]], gateway: Gateway
+) -> Optional[str]:
+    """A reused VX-41 entity must not already be another item's: two items
+    would then share one original's entity (file route only)."""
+    for original in located:
+        if not original["file_id"]:
+            continue
+        others = [i for i in gateway.file_items(original["file_id"]) if i != item_id]
+        if others:
+            return (
+                f"VX-41 entity {original['file_id']} already belongs to item "
+                f"{', '.join(others)} (file)"
+            )
+    return None
+
+
 def _file_original(shape: Shape) -> Optional[OriginalFile]:
     """No ClipFile: the original is the shape's one file when it is on
     VX-41 (measured: 1,788 items)."""
@@ -702,6 +720,9 @@ def _copy_problem(
         return f"{PROXY_COPY} (file); ffprobe route pending"
     if verdict == AMBIGUOUS:
         return "original shape equals the lowres (file); ambiguous"
+    if ffprobe is None and all(s == NO_SIGNATURE for s in lowres):
+        # Nothing could have refuted a proxy copy.
+        return "no ffprobe and no lowres to tell a proxy copy (file)"
     # Unlike the lowres is not enough: when the original's ffprobe is known,
     # the description must also agree with it.
     disagreement = probe_disagreement(signature, ffprobe) if ffprobe else None
@@ -740,7 +761,9 @@ def plan_file_item(
                 "no ClipFile and the original shape does not name one VX-41 file",
             )
     if _names_originals(shape, [original]):
-        return _complete(item_id, shape, [original], gateway, archive, disk, provider)
+        result = _complete(item_id, shape, [original], gateway, archive, disk, provider)
+        shared = _shared_entity(item_id, result.plan["originals"], gateway)
+        return PlanResult(verdicts.UNEXPECTED, shared) if shared else result
 
     if not shape.files():
         return PlanResult(
@@ -769,6 +792,9 @@ def plan_file_item(
     refused = _located_problem(located)
     if refused:
         return refused
+    shared = _shared_entity(item_id, located, gateway)
+    if shared:
+        return PlanResult(verdicts.UNEXPECTED, shared)
     return PlanResult(
         verdicts.READY,
         plan={

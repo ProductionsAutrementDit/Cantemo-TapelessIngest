@@ -206,3 +206,23 @@ def test_tagged_shapes_lists_by_tag_then_reads_each_shape():
     )
     (shape,) = VidispineGateway().tagged_shapes("VX-1", "lowres")
     assert shape.shape_id == "VX-LOW"
+
+
+def test_file_items_reads_the_items_of_the_storage_file_document():
+    RestTransportFake.route(
+        "GET",
+        r".*/storage/file/VX-F0",
+        lambda m, q: (
+            {"id": "VX-F0", "item": [{"id": "VX-1"}, {"id": "VX-2"}]}
+            if q.get("includeItem") == ["true"]
+            else {"id": "VX-F0"}
+        ),
+    )
+    assert VidispineGateway().file_items("VX-F0") == ["VX-1", "VX-2"]
+
+
+def test_file_items_of_a_file_in_no_item_is_empty():
+    RestTransportFake.route(
+        "GET", r".*/storage/file/VX-F0", lambda m, q: {"id": "VX-F0"}
+    )
+    assert VidispineGateway().file_items("VX-F0") == []

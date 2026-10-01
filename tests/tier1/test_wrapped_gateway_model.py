@@ -163,6 +163,7 @@ def test_the_recording_gateway_reads_sizes_and_tagged_shapes_through():
     recording = RecordingGateway(inner)
     assert recording.file_size("VX-W1") == 42
     assert recording.file_size("VX-NONE") is None
+    assert recording.file_items("VX-W1") == ["VX-1"]
     (lowres,) = recording.tagged_shapes("VX-1", "lowres")
     assert lowres.of_kind("video")[0].body["codec"] == "h264"
     assert recording.writes == []

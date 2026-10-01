@@ -120,6 +120,21 @@ class InMemoryGateway:
     def file_size(self, file_id):
         return self.file_sizes.get(file_id)
 
+    def file_items(self, file_id):
+        """As ``storage/file/{id}?includeItem=true``: every item one of
+        whose shapes (any tag) names the file."""
+        return sorted(
+            item_id
+            for item_id, documents in self.shapes.items()
+            if any(
+                f.get("id") == file_id
+                for document in documents
+                for body in _component_bodies(document)
+                + document.get("binaryComponent", [])
+                for f in body.get("file", [])
+            )
+        )
+
     def component_metadata(self, item_id, shape_id, component_id):
         return dict(self.component_md.get((item_id, shape_id, component_id), {}))
 

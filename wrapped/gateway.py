@@ -110,6 +110,10 @@ class Gateway(Protocol):
         (no ``size``, or -1)."""
         ...
 
+    def file_items(self, file_id: str) -> List[str]:
+        """The ids of every item a shape of which names the file."""
+        ...
+
     def component_metadata(
         self, item_id: str, shape_id: str, component_id: str
     ) -> Dict[str, str]: ...

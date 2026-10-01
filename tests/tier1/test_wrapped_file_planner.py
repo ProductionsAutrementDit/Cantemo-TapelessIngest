@@ -326,3 +326,82 @@ def test_the_p5_entry_is_looked_up_once():
     world = _world()
     _plan(world)
     assert world[1].lookup_calls == [to_absolute(FILE_ORIGINAL)]
+
+
+@pytest.mark.parametrize("lowres", ["none", "bare"])
+def test_no_ffprobe_and_no_lowres_to_compare_is_refused(lowres):
+    world = _world()
+    gateway = world[0]
+    gateway.shapes[ITEM] = [d for d in gateway.shapes[ITEM] if d["id"] != "VX-LOW"]
+    if lowres == "bare":
+        gateway.shapes[ITEM].append({"id": "VX-LOW", "tag": ["lowres"]})
+    result = _plan(world, ffprobe=None)
+    assert result.verdict == verdicts.UNEXPECTED
+    assert result.reason == "no ffprobe and no lowres to tell a proxy copy (file)"
+
+
+def test_ffprobe_without_lowres_is_still_a_genuine_copy():
+    world = _world()
+    gateway = world[0]
+    gateway.shapes[ITEM] = [d for d in gateway.shapes[ITEM] if d["id"] != "VX-LOW"]
+    assert _plan(world).verdict == verdicts.READY
+
+
+def _entity_on(gateway, item_id, file_id="VX-F0", path=FILE_ORIGINAL):
+    """Another item whose shape names the VX-41 entity at ``path``."""
+    gateway.files[("VX-41", path)] = file_id
+    gateway.shapes.setdefault(item_id, []).append(
+        {
+            "id": f"{item_id}-S",
+            "tag": ["original"],
+            "videoComponent": [
+                {"id": "V", "file": [{"id": file_id, "storage": "VX-41"}]}
+            ],
+        }
+    )
+
+
+def test_a_reused_entity_of_another_item_is_refused():
+    world = _world()
+    _entity_on(world[0], "VX-OTHER")
+    result = _plan(world)
+    assert result.verdict == verdicts.UNEXPECTED
+    assert result.reason == (
+        "VX-41 entity VX-F0 already belongs to item VX-OTHER (file)"
+    )
+
+
+def test_a_reused_entity_of_no_other_item_is_kept():
+    world = _world()
+    world[0].files[("VX-41", FILE_ORIGINAL)] = "VX-F0"
+    result = _plan(world)
+    assert result.verdict == verdicts.READY, result.reason
+    assert result.plan["originals"][0]["file_id"] == "VX-F0"
+
+
+def test_an_original_to_register_is_not_checked():
+    calls = []
+    world = _world()
+    real = world[0].file_items
+    world[0].file_items = lambda file_id: calls.append(file_id) or real(file_id)
+    assert _plan(world).verdict == verdicts.READY
+    assert calls == []
+
+
+def test_an_already_migrated_entity_shared_with_another_item_is_refused():
+    world = _world(
+        file_mov_document(storage="VX-41", state="CLOSED", name=FILE_ORIGINAL)
+    )
+    _entity_on(world[0], "VX-OTHER", file_id="VX-W1")
+    result = _plan(world, original=None)
+    assert result.verdict == verdicts.UNEXPECTED
+    assert result.reason == (
+        "VX-41 entity VX-W1 already belongs to item VX-OTHER (file)"
+    )
+
+
+def test_an_already_migrated_entity_on_this_item_only_is_kept():
+    world = _world(
+        file_mov_document(storage="VX-41", state="CLOSED", name=FILE_ORIGINAL)
+    )
+    assert _plan(world, original=None).verdict == verdicts.ALREADY_MIGRATED

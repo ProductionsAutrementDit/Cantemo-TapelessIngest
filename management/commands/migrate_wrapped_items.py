@@ -97,6 +97,7 @@ _MIN_SHARE = 0.95
 _TEMPLATE_OPTIONS = (("out", "--out"), ("min_refs", "--min-refs"))
 _TEMPLATE_OPTIONS += (("min_share", "--min-share"),)
 _SHOWN_DISAGREEMENTS = 5
+_PROGRESS_EVERY = 1000
 AUDIO_BITS = "audio_bits_per_sample"
 _RELOCATE_OPTIONS = (("from_prefix", "--from"), ("to_prefix", "--to"))
 _RELOCATE_OPTIONS += (("backup", "--backup"),)
@@ -326,11 +327,24 @@ class Command(BaseCommand):
         clips = wrapped_clips(provider, options["item_id"], options["collection_id"])
         if options["limit"]:
             clips = clips[: options["limit"]]
+        if provider == FILE_PROVIDER:
+            # ~23,000 clips: streamed in item_id order, never all in memory.
+            clips = clips.iterator(chunk_size=_PROGRESS_EVERY)
         counts = Counter()
-        for clip in clips:
+        for seen, clip in enumerate(clips, start=1):
+            if provider == FILE_PROVIDER and seen % _PROGRESS_EVERY == 0:
+                self.stdout.write(f"planned {seen} clips")
             existing = WrappedMigration.objects.filter(item_id=clip.item_id).first()
             if existing and existing.phase:
                 counts["frozen"] += 1
+                continue
+            if existing and existing.clip_umid != clip.umid:
+                # One row per item: another clip's (another provider's, or
+                # another file clip's) plan is never overwritten.
+                counts["other clip's row"] += 1
+                self.stdout.write(
+                    f"{clip.item_id}: kept, row belongs to clip {existing.clip_umid}"
+                )
                 continue
             try:
                 if provider == FILE_PROVIDER:
