@@ -19,6 +19,9 @@ from tests.wrapped_fakes import (
     FakeArchive,
     FakeDisk,
     InMemoryGateway,
+    binary_only_document,
+    doubly_attached_document,
+    fileless_document,
     p2_clip_metadata,
     p2_originals,
     p2_template,
@@ -496,3 +499,105 @@ def test_a_row_planned_before_technical_source_is_restated_from_wrapped(
     (posted,) = [w[2] for w in gateway.writes if w[0] == "post_shape"]
     assert posted["containerComponent"]["format"] == "mxf"
     assert posted["videoComponent"][0]["codec"] == "dvvideo"
+
+
+# G3: the wrapped MXF attached on both online legacy storages
+
+BOTH_COPIES = [("delete_file", "VX-11", "VX-W11"), ("delete_file", "VX-26", "VX-W26")]
+
+
+def test_a_doubly_attached_item_keeps_both_copies_by_default(migrated_db):
+    gateway = InMemoryGateway()
+    row, disk = _setup(gateway, document=doubly_attached_document())
+    assert len(row.plan["wrapped_files"]) == 2
+    Executor(gateway, disk).run(row)
+
+    row.refresh_from_db()
+    assert row.phase == "done" and row.error == ""
+    (new,) = gateway.original_shapes(ITEM)
+    assert new.shape_id == row.plan["new_shape_id"]
+    (wrapped_doc,) = [d for d in gateway.shapes[ITEM] if d["id"] == "VX-SW"]
+    assert "original" not in wrapped_doc["tag"]
+    (posted,) = [w[2] for w in gateway.writes if w[0] == "post_shape"]
+    assert posted["containerComponent"]["format"] == "mxf"
+    assert "delete_file" not in gateway.write_names()
+    assert row.plan["wrapped_kept"] is True
+
+
+def test_a_doubly_attached_item_deletes_both_closed_copies_when_asked(migrated_db):
+    gateway = InMemoryGateway()
+    row, disk = _setup(gateway, document=doubly_attached_document())
+    Executor(gateway, disk, delete_online_wrapped=True).run(row)
+    row.refresh_from_db()
+    assert row.phase == "done"
+    assert gateway.writes[-2:] == BOTH_COPIES
+    assert "wrapped_kept" not in row.plan
+
+
+def test_each_copy_is_checked_against_the_online_allowlist(migrated_db):
+    gateway = InMemoryGateway()
+    row, disk = _setup(gateway, document=doubly_attached_document())
+    gateway.file_states[("VX-11", "VX-W11")] = "LOST"
+    Executor(gateway, disk, delete_online_wrapped=True).run(row)
+    deleted = [w for w in gateway.writes if w[0] == "delete_file"]
+    assert deleted == [("delete_file", "VX-26", "VX-W26")]
+
+
+def test_crash_after_the_first_copy_deleted_resumes_with_the_second(migrated_db):
+    gateway = CrashingGateway(crash_after="delete_file")
+    row, disk = _setup(gateway, document=doubly_attached_document())
+    with pytest.raises(Crash):
+        Executor(gateway, disk, delete_online_wrapped=True).run(row)
+    row.refresh_from_db()
+    assert row.phase == "verified"
+
+    Executor(gateway, disk, delete_online_wrapped=True).run(row)
+    row.refresh_from_db()
+    assert row.phase == "done"
+    assert [w for w in gateway.writes if w[0] == "delete_file"] == BOTH_COPIES
+
+
+# G4: a binary-only original shape, posted from its template
+
+
+def test_a_binary_only_item_is_posted_from_its_template(migrated_db):
+    gateway = InMemoryGateway()
+    key = "AVC-I_1080/50i|50i|AVC-I100|A24"
+    row, disk = _setup(
+        gateway,
+        document=binary_only_document(),
+        duration="19.88",
+        cpaa_marker="true",
+        clip_metadata=p2_clip_metadata(),
+        templates={key: {"template": p2_template()}},
+    )
+    assert row.plan["technical_source"] == f"template:{key}"
+    Executor(gateway, disk).run(row)
+
+    row.refresh_from_db()
+    assert row.phase == "done" and row.error == ""
+    (posted,) = [w[2] for w in gateway.writes if w[0] == "post_shape"]
+    assert posted["containerComponent"]["format"] == "mxf_d10"
+    assert "binaryComponent" not in posted
+
+
+# G5: a fileless original shape, restated, nothing to keep or delete
+
+
+@pytest.mark.parametrize("delete_online_wrapped", [False, True])
+def test_a_fileless_item_is_migrated_and_finish_does_nothing(
+    migrated_db, delete_online_wrapped
+):
+    gateway = InMemoryGateway()
+    row, disk = _setup(gateway, document=fileless_document())
+    assert "wrapped_file" not in row.plan and "wrapped_files" not in row.plan
+    Executor(gateway, disk, delete_online_wrapped=delete_online_wrapped).run(row)
+
+    row.refresh_from_db()
+    assert row.phase == "done" and row.error == ""
+    (posted,) = [w[2] for w in gateway.writes if w[0] == "post_shape"]
+    assert posted["videoComponent"][0]["codec"] == "dvvideo"
+    (wrapped_doc,) = [d for d in gateway.shapes[ITEM] if d["id"] == "VX-SW"]
+    assert "original" not in wrapped_doc["tag"]
+    assert "delete_file" not in gateway.write_names()
+    assert "wrapped_kept" not in row.plan

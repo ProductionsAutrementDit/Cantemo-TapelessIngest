@@ -267,6 +267,51 @@ def wrapped_p2_document(
     }
 
 
+LEGACY_PATH = "2018/AH_20180314_H160_USA_HPX600_1/060A2B34.MXF"
+
+
+def doubly_attached_document(copies=None, name="060A2B34.MXF"):
+    """A genuine wrapped shape whose every component names TWO entities of
+    the same wrapped MXF (measured: 182 items), one per online legacy
+    storage. ``copies`` is ``[(file_id, storage, path), ...]``."""
+    if copies is None:
+        copies = [("VX-W26", "VX-26", LEGACY_PATH), ("VX-W11", "VX-11", name)]
+    document = wrapped_p2_document(name=name)
+    entities = [
+        {"id": file_id, "storage": storage, "state": "CLOSED", "path": path}
+        for file_id, storage, path in copies
+    ]
+    for body in _component_bodies(document):
+        body["file"] = [dict(entity) for entity in entities]
+    return document
+
+
+def binary_only_document(
+    shape_id="VX-SW",
+    file_id="VX-W1",
+    storage="VX-2",
+    state="ARCHIVED",
+    name="060A2B34.MXF",
+):
+    """An original shape Vidispine never analysed: one ``binaryComponent``
+    naming the wrapped MXF, no container/video/audio (measured: 12 items)."""
+    wrapped = {"id": file_id, "storage": storage, "state": state, "path": name}
+    return {
+        "id": shape_id,
+        "tag": ["original"],
+        "binaryComponent": [{"id": f"{shape_id}-B", "file": [dict(wrapped)]}],
+    }
+
+
+def fileless_document(document=None):
+    """``document`` (a genuine wrapped shape by default) with no component
+    naming any file (measured: 10 items)."""
+    document = copy.deepcopy(document or wrapped_p2_document())
+    for body in _component_bodies(document) + document.get("binaryComponent", []):
+        body.pop("file", None)
+    return document
+
+
 def p2_originals(clip_dir="2016/AH_TEST/CONTENTS", stem="00924E", audio_count=4):
     return [OriginalFile(f"{clip_dir}/VIDEO/{stem}.MXF", "video")] + [
         OriginalFile(f"{clip_dir}/AUDIO/{stem}{n:02d}.MXF", "audio")

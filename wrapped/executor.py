@@ -270,8 +270,19 @@ class Executor:
             raise StepError("; ".join(problems))
 
     def _finish(self, row) -> None:
-        wrapped = row.plan.get("wrapped_file")
-        if not wrapped or wrapped["storage_id"] not in fields.ONLINE_LEGACY_STORAGES:
+        # One wrapped file (``wrapped_file``, every row planned before
+        # copies existed), one per online legacy storage (``wrapped_files``),
+        # or none at all (a fileless original shape: nothing to do).
+        if "wrapped_files" in row.plan:
+            wrapped_files = row.plan["wrapped_files"]
+        else:
+            single = row.plan.get("wrapped_file")
+            wrapped_files = [single] if single else []
+        for wrapped in wrapped_files:
+            self._finish_file(row, wrapped)
+
+    def _finish_file(self, row, wrapped: Dict[str, str]) -> None:
+        if wrapped["storage_id"] not in fields.ONLINE_LEGACY_STORAGES:
             return
         if not self.delete_online_wrapped:
             row.plan["wrapped_kept"] = True

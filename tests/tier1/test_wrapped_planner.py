@@ -7,9 +7,13 @@ from portal.plugins.TapelessIngest.wrapped.archive import CachedArchive
 from portal.plugins.TapelessIngest.wrapped.paths import to_absolute
 from portal.plugins.TapelessIngest.wrapped.planner import plan_item
 from tests.wrapped_fakes import (
+    LEGACY_PATH,
     FakeArchive,
     FakeDisk,
     InMemoryGateway,
+    binary_only_document,
+    doubly_attached_document,
+    fileless_document,
     p2_clip_metadata,
     p2_originals,
     p2_template,
@@ -593,3 +597,251 @@ def test_a_template_that_cannot_state_this_items_duration_is_refused():
         f"this item: "
     )
     assert "audio samples" in result.reason
+
+
+# G3: the wrapped MXF attached twice, once per online legacy storage
+
+TWO_FILES = "2 distinct files on the original shape, expected 1"
+
+
+def test_a_wrapped_mxf_attached_on_both_legacy_storages_is_ready():
+    result = _plan(*_world(doubly_attached_document()))
+    assert result.verdict == verdicts.READY, result.reason
+    assert result.plan["technical_source"] == "wrapped"
+    # ordered by storage_id, whatever order the components name them in
+    assert result.plan["wrapped_files"] == [
+        {
+            "file_id": "VX-W11",
+            "storage_id": "VX-11",
+            "state": "CLOSED",
+            "path": "060A2B34.MXF",
+        },
+        {
+            "file_id": "VX-W26",
+            "storage_id": "VX-26",
+            "state": "CLOSED",
+            "path": LEGACY_PATH,
+        },
+    ]
+    assert "wrapped_file" not in result.plan
+    assert {f["file_id"] for f in result.rollback["shape_files"]} == {
+        "VX-W11",
+        "VX-W26",
+    }
+
+
+@pytest.mark.parametrize(
+    "copies",
+    [
+        # a copy with another basename
+        [
+            ("VX-W26", "VX-26", "2018/AH_X/OTHER.MXF"),
+            ("VX-W11", "VX-11", "060A2B34.MXF"),
+        ],
+        # a copy on the tape-only storage
+        [("VX-W2", "VX-2", "060A2B34.MXF"), ("VX-W11", "VX-11", "060A2B34.MXF")],
+        # a copy on the rushes storage
+        [("VX-W41", "VX-41", LEGACY_PATH), ("VX-W26", "VX-26", LEGACY_PATH)],
+        # two files on the same storage
+        [("VX-W26", "VX-26", LEGACY_PATH), ("VX-W27", "VX-26", "060A2B34.MXF")],
+    ],
+    ids=["other-basename", "vx-2", "vx-41", "same-storage"],
+)
+def test_a_refused_double_attachment_stays_unexpected(copies):
+    result = _plan(*_world(doubly_attached_document(copies)))
+    assert result.verdict == verdicts.UNEXPECTED
+    assert result.reason == TWO_FILES
+    assert result.plan == {}
+
+
+@pytest.mark.parametrize("output_file", ["", None])
+def test_a_double_attachment_without_an_output_file_is_unexpected(output_file):
+    result = _plan(*_world(doubly_attached_document()), output_file=output_file)
+    assert result.verdict == verdicts.UNEXPECTED
+    assert result.reason == TWO_FILES
+
+
+def test_three_copies_of_the_wrapped_mxf_are_unexpected():
+    copies = [
+        ("VX-W11", "VX-11", "060A2B34.MXF"),
+        ("VX-W26", "VX-26", LEGACY_PATH),
+        ("VX-W27", "VX-26", "2019/AH_Y/060A2B34.MXF"),
+    ]
+    result = _plan(*_world(doubly_attached_document(copies)))
+    assert result.reason == "3 distinct files on the original shape, expected 1"
+
+
+def test_a_double_attachment_reuses_a_not_imported_entity_of_on_disk_originals():
+    gateway, fake, disk, originals = _world(doubly_attached_document())
+    disk.contents = {o.relative: b"x" for o in originals}
+    gateway.files[("VX-41", originals[0].relative)] = "VX-NI"
+    gateway.file_states[("VX-41", "VX-NI")] = "NOT_IMPORTED"
+    result = _plan(gateway, fake, disk, originals)
+    assert result.verdict == verdicts.READY, result.reason
+    assert result.plan["originals"][0]["file_id"] == "VX-NI"
+    assert result.plan["originals"][0]["entity_state"] == "NOT_IMPORTED"
+    assert result.plan["originals"][0]["on_disk"] is True
+
+
+def test_a_single_wrapped_file_keeps_the_single_file_plan():
+    result = _plan(*_world())
+    assert "wrapped_files" not in result.plan
+    assert result.plan["wrapped_file"]["file_id"] == "VX-W1"
+
+
+# G4: a never-analysed original shape (binaryComponent only)
+
+BINARY_NO_MARKER = (
+    "binary-only original shape without the CPAA marker (portal_p5_migration_done)"
+)
+
+
+def _binary_world(duration=P2_SECONDS, cpaa_marker="true"):
+    return _world(binary_only_document(), duration=duration, cpaa_marker=cpaa_marker)
+
+
+def test_a_binary_only_shape_with_a_template_is_ready_from_the_template():
+    result = _proxy_plan(world=_binary_world())
+    assert result.verdict == verdicts.READY, result.reason
+    assert result.plan["technical_source"] == f"template:{KEY}"
+    assert result.plan["template"] == p2_template()
+    assert result.plan["timing"] == {
+        "frames": 497,
+        "num": 1,
+        "den": 25,
+        "start_tc_frames": 1657612,
+    }
+    assert result.plan["wrapped_file"] == {
+        "file_id": "VX-W1",
+        "storage_id": "VX-2",
+        "state": "ARCHIVED",
+        "path": "060A2B34.MXF",
+    }
+    assert result.rollback["component_metadata"] == {"VX-SW-B": {}}
+
+
+def test_a_binary_only_shape_without_the_cpaa_marker_is_unexpected():
+    result = _proxy_plan(world=_binary_world(cpaa_marker=None))
+    assert result.verdict == verdicts.UNEXPECTED
+    assert result.reason == BINARY_NO_MARKER
+    assert result.plan == {}
+
+
+def test_a_binary_only_shape_without_a_template_names_the_key():
+    result = _proxy_plan(templates={}, world=_binary_world())
+    assert result.verdict == verdicts.UNEXPECTED
+    assert result.reason == f"binary-only original shape; no template for {KEY}"
+
+
+def test_a_binary_only_shape_with_incomplete_metadata_is_unexpected():
+    result = _proxy_plan(world=_binary_world(), video_codec=None)
+    assert result.reason == (
+        "binary-only original shape; P2 metadata incomplete for a template"
+    )
+
+
+def test_a_binary_only_p2_duration_disagreeing_with_durationseconds_is_unexpected():
+    result = _proxy_plan(world=_binary_world(duration="8.72"))
+    assert result.verdict == verdicts.UNEXPECTED
+    assert result.reason == (
+        "binary-only original shape; P2 duration 19.880 s != durationSeconds 8.72"
+    )
+    assert result.plan == {}
+
+
+def test_a_binary_only_shape_still_checks_the_attached_file():
+    world = _binary_world()
+    result = _plan(
+        *world,
+        output_file="/mnt/ActiveMedia/CANTEMO_FILES/OTHER.MXF",
+        clip_metadata=p2_clip_metadata(),
+        templates=TEMPLATES,
+    )
+    assert result.verdict == verdicts.UNEXPECTED
+    assert "OTHER.MXF" in result.reason
+
+
+# G5: a genuine original shape that names no file at all
+
+
+def test_a_fileless_genuine_shape_with_a_matching_duration_is_ready():
+    # wrapped_p2_document: 218 frames at 1/25 = 8.72 s, the item's duration
+    result = _plan(*_world(fileless_document()))
+    assert result.verdict == verdicts.READY, result.reason
+    assert result.plan["technical_source"] == "wrapped"
+    assert result.plan["kind"] == "wrap"
+    assert "wrapped_file" not in result.plan
+    assert "wrapped_files" not in result.plan
+    assert result.rollback["shape_files"] == []
+
+
+def test_a_fileless_duration_tolerates_half_a_millisecond():
+    assert _plan(*_world(fileless_document(), duration="8.7204")).verdict == (
+        verdicts.READY
+    )
+    assert _plan(*_world(fileless_document(), duration="8.7206")).verdict == (
+        verdicts.UNEXPECTED
+    )
+
+
+def test_a_fileless_shape_disagreeing_with_durationseconds_is_unexpected():
+    result = _plan(*_world(fileless_document(), duration="9.00"))
+    assert result.verdict == verdicts.UNEXPECTED
+    assert result.reason == (
+        "fileless original shape; container duration 8.720 s != durationSeconds 9.00"
+    )
+    assert result.plan == {}
+
+
+def test_a_fileless_shape_without_a_container_duration_is_unexpected():
+    document = fileless_document()
+    del document["containerComponent"]["duration"]
+    result = _plan(*_world(document))
+    assert result.verdict == verdicts.UNEXPECTED
+    assert result.reason == "fileless original shape; no container duration"
+
+
+def test_a_fileless_shape_without_durationseconds_is_unexpected():
+    world = _world(fileless_document())
+    del world[0].items[ITEM]["durationSeconds"]
+    result = _plan(*world)
+    assert result.reason == (
+        "fileless original shape; no durationSeconds to cross-check"
+    )
+
+
+def test_a_fileless_shape_with_a_non_numeric_durationseconds_is_unexpected():
+    result = _plan(*_world(fileless_document(), duration="n/a"))
+    assert result.reason == (
+        "fileless original shape; durationSeconds 'n/a' is not a number"
+    )
+
+
+def test_a_fileless_proxy_copy_is_unexpected():
+    world = _world(
+        fileless_document(proxy_copy_document()),
+        duration=P2_SECONDS,
+        cpaa_marker="true",
+    )
+    result = _plan(*world, clip_metadata=p2_clip_metadata(), templates=TEMPLATES)
+    assert result.verdict == verdicts.UNEXPECTED
+    assert result.reason == (
+        "fileless original shape: proxy-copied technical description"
+    )
+
+
+def test_a_fileless_binary_only_shape_is_unexpected():
+    world = _world(
+        fileless_document(binary_only_document()),
+        duration=P2_SECONDS,
+        cpaa_marker="true",
+    )
+    result = _plan(*world, clip_metadata=p2_clip_metadata(), templates=TEMPLATES)
+    assert result.verdict == verdicts.UNEXPECTED
+    assert result.reason == "fileless original shape: binary-only"
+
+
+def test_a_fileless_shape_with_a_bad_layout_stays_unexpected():
+    result = _plan(*_world(fileless_document(wrapped_p2_document(audio_count=1))))
+    assert result.verdict == verdicts.UNEXPECTED
+    assert result.reason == "1 audio component(s) for 4 audio original(s)"
