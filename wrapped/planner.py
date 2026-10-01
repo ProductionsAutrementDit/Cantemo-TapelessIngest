@@ -18,6 +18,11 @@ its container duration is cross-checked against durationSeconds instead).
 A spanned take (``span``, master first) is planned as ONE original shape
 naming every segment's files, plus the pad-assembly manifest pad_forge
 reads; the segments must sum exactly to the wrapped duration.
+
+A wrapped ``file`` item (``plan_file_item``) has ONE original, of which
+the wrapped file is a byte-for-byte copy: a genuine original shape is
+restated whole (``technical_source`` "copy") once the sizes prove the
+copy; a proxy-copied or ambiguous description stays ``unexpected``.
 """
 
 import copy
@@ -30,6 +35,13 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from portal.plugins.TapelessIngest.wrapped import fields, verdicts
 from portal.plugins.TapelessIngest.wrapped.archive import CachedArchive
+from portal.plugins.TapelessIngest.wrapped.ffprobe import (
+    AMBIGUOUS,
+    PROXY,
+    Signature,
+    classify_copy,
+    shape_signature,
+)
 from portal.plugins.TapelessIngest.wrapped.gateway import (
     Gateway,
     Shape,
@@ -40,6 +52,7 @@ from portal.plugins.TapelessIngest.wrapped.paths import OriginalFile, to_absolut
 from portal.plugins.TapelessIngest.wrapped.shape import (
     ShapeMismatch,
     audio_time_base,
+    build_copy_document,
     build_document_from_template,
     build_span_document,
     duration_seconds,
@@ -492,6 +505,59 @@ def _wrapped_files(shape: Shape) -> Dict[str, Any]:
     return {"wrapped_files": files} if files else {}
 
 
+def _complete(
+    item_id: str,
+    shape: Shape,
+    originals: Sequence[OriginalFile],
+    gateway: Gateway,
+    archive: CachedArchive,
+    disk,
+    extra: Optional[Mapping[str, Any]] = None,
+) -> PlanResult:
+    """The shape already names every original on VX-41: only metadata is
+    left to write (``extra`` adds plan keys, e.g. the provider)."""
+    by_path = {f.path: f.file_id for f in shape.files().values()}
+    located = [
+        _locate(o, gateway, archive, disk, by_path[o.relative]) for o in originals
+    ]
+    # For a complete plan, rollback records the current original shape
+    # because the 2023 migration swapped files in place on the original shape,
+    # and this is what apply will overwrite (metadata only).
+    return PlanResult(
+        verdicts.ALREADY_MIGRATED,
+        plan={
+            "kind": "complete",
+            "technical_source": "existing",
+            "new_shape_id": shape.shape_id,
+            "originals": located,
+            **(extra or {}),
+        },
+        rollback=_rollback(item_id, shape, gateway),
+    )
+
+
+def _located_problem(located: Sequence[Mapping[str, Any]]) -> Optional[PlanResult]:
+    """Before any write: every original is on disk or in P5, and a
+    tape-only one is not bound to a stale VX-41 entity."""
+    missing = [o["relative"] for o in located if not o["on_disk"] and not o["entry"]]
+    if missing:
+        return PlanResult(
+            verdicts.ORIGINALS_MISSING,
+            "neither on disk nor in P5: " + ", ".join(missing),
+        )
+    for o in located:
+        # A tape-only original is registered ARCHIVED; any other entity the
+        # VX-41 index still holds for it (a shoot deleted from disk: LOST,
+        # NOT_IMPORTED, CLOSED...) is stale and must not be reused.
+        if not o["on_disk"] and o["file_id"] and o["entity_state"] != "ARCHIVED":
+            return PlanResult(
+                verdicts.UNEXPECTED,
+                f"stale VX-41 entity {o['file_id']} ({o['entity_state']}) "
+                f"for tape-only original {o['relative']}",
+            )
+    return None
+
+
 def plan_item(
     *,
     item_id: str,
@@ -521,23 +587,7 @@ def plan_item(
     (shape,) = shapes
 
     if _names_originals(shape, originals):
-        by_path = {f.path: f.file_id for f in shape.files().values()}
-        located = [
-            _locate(o, gateway, archive, disk, by_path[o.relative]) for o in originals
-        ]
-        # For a complete plan, rollback records the current original shape
-        # because the 2023 migration swapped files in place on the original shape,
-        # and this is what apply will overwrite (metadata only).
-        return PlanResult(
-            verdicts.ALREADY_MIGRATED,
-            plan={
-                "kind": "complete",
-                "technical_source": "existing",
-                "new_shape_id": shape.shape_id,
-                "originals": located,
-            },
-            rollback=_rollback(item_id, shape, gateway),
-        )
+        return _complete(item_id, shape, originals, gateway, archive, disk)
 
     problem = _attachment_problem(shape, output_file)
     if problem:
@@ -564,22 +614,9 @@ def plan_item(
         for original, segment in zip(located, index):
             original["segment"] = segment
         layout = {"segments": _segments(span), "manifest": _manifest(span)}
-    missing = [o["relative"] for o in located if not o["on_disk"] and not o["entry"]]
-    if missing:
-        return PlanResult(
-            verdicts.ORIGINALS_MISSING,
-            "neither on disk nor in P5: " + ", ".join(missing),
-        )
-    for o in located:
-        # A tape-only original is registered ARCHIVED; any other entity the
-        # VX-41 index still holds for it (a shoot deleted from disk: LOST,
-        # NOT_IMPORTED, CLOSED...) is stale and must not be reused.
-        if not o["on_disk"] and o["file_id"] and o["entity_state"] != "ARCHIVED":
-            return PlanResult(
-                verdicts.UNEXPECTED,
-                f"stale VX-41 entity {o['file_id']} ({o['entity_state']}) "
-                f"for tape-only original {o['relative']}",
-            )
+    refused = _located_problem(located)
+    if refused:
+        return refused
     return PlanResult(
         verdicts.READY,
         plan={
@@ -590,6 +627,150 @@ def plan_item(
             "originals": located,
             **technical,
             **layout,
+        },
+        rollback=_rollback(item_id, shape, gateway, item_values),
+    )
+
+
+FILE = "file"
+# Measured on prod 2026-10-01: P5's inventory size is the true size plus a
+# small overhead (+178 for 7,720 items, +190/275/276 for ~900).
+P5_OVERHEAD_MAX = 512
+NO_SIZE_PROOF = "no size proof (file)"
+
+
+def size_problem(
+    exact: Mapping[str, Optional[int]], p5: Optional[int]
+) -> Optional[str]:
+    """Byte identity of a wrapped ``file`` copy and its original, before
+    any write. ``exact`` maps each source (``ffprobe``, ``wrapped <id>``,
+    ``disk``) to its exact size, None when unknown. Every known one must
+    agree; two sources (all wrapped copies count as one) are a proof;
+    with one, P5's size must exceed it by less than P5_OVERHEAD_MAX."""
+    known = {label: size for label, size in exact.items() if size is not None}
+    if len(set(known.values())) > 1:
+        return "copy and original differ in size: " + ", ".join(
+            f"{label} {size}" for label, size in known.items()
+        )
+    sources = {label.split(" ", 1)[0] for label in known}
+    if len(sources) >= 2:
+        return None
+    if not known:
+        return f"{NO_SIZE_PROOF}: no exact size known"
+    size = next(iter(known.values()))
+    if p5 is None:
+        return f"{NO_SIZE_PROOF}: only {', '.join(known)} {size}, no P5 size"
+    if 0 <= p5 - size < P5_OVERHEAD_MAX:
+        return None
+    return (
+        f"{NO_SIZE_PROOF}: P5 size {p5} is {p5 - size:+d} bytes from "
+        f"{', '.join(known)} {size}, outside [0, {P5_OVERHEAD_MAX})"
+    )
+
+
+def _file_original(shape: Shape) -> Optional[OriginalFile]:
+    """No ClipFile: the original is the shape's one file when it is on
+    VX-41 (measured: 1,788 items)."""
+    files = list(shape.files().values())
+    if len(files) != 1 or files[0].storage_id != fields.RUSHES_STORAGE:
+        return None
+    kind = "video" if shape.of_kind("video") else "audio"
+    return OriginalFile(files[0].path, kind)
+
+
+def _copy_problem(
+    item_id: str, shape: Shape, gateway: Gateway, ffprobe: Optional[Signature]
+) -> Optional[str]:
+    """Whether the shape's own description is the original's (option B)."""
+    if _is_binary_only(shape):
+        return f"{BINARY_ONLY} (file)"
+    try:
+        build_copy_document(shape, "")
+    except ShapeMismatch as error:
+        return f"original shape (file) cannot be restated: {error}"
+    lowres = [
+        shape_signature(s) for s in gateway.tagged_shapes(item_id, fields.LOWRES_TAG)
+    ]
+    verdict = classify_copy(shape_signature(shape), lowres, ffprobe)
+    if verdict == PROXY:
+        return f"{PROXY_COPY} (file); ffprobe route pending"
+    if verdict == AMBIGUOUS:
+        return "original shape equals the lowres (file); ambiguous"
+    return None
+
+
+def plan_file_item(
+    *,
+    item_id: str,
+    original: Optional[OriginalFile],
+    output_file: Optional[str],
+    gateway: Gateway,
+    archive: CachedArchive,
+    disk,
+    ffprobe: Optional[Signature] = None,
+    ffprobe_size: Optional[int] = None,
+) -> PlanResult:
+    """A wrapped ``file`` item: its wrapped file is a byte-for-byte copy
+    of ONE original, so a genuine original shape is restated whole onto
+    it (``technical_source`` "copy"). ``original`` is the clip's ClipFile
+    (None when it has none); ``ffprobe``/``ffprobe_size`` come from the
+    ffprobe XML stored in ``Clip.clip_xml``."""
+    shapes = gateway.original_shapes(item_id)
+    if len(shapes) != 1:
+        return PlanResult(verdicts.UNEXPECTED, f"{len(shapes)} original shapes")
+    (shape,) = shapes
+    provider = {"provider": FILE}
+
+    if original is None:
+        original = _file_original(shape)
+        if original is None:
+            return PlanResult(
+                verdicts.UNEXPECTED,
+                "no ClipFile and the original shape does not name one VX-41 file",
+            )
+    if _names_originals(shape, [original]):
+        return _complete(item_id, shape, [original], gateway, archive, disk, provider)
+
+    if not shape.files():
+        return PlanResult(
+            verdicts.UNEXPECTED, f"{FILELESS} (file): not measured for this provider"
+        )
+    problem = _attachment_problem(shape, output_file) or _copy_problem(
+        item_id, shape, gateway, ffprobe
+    )
+    if problem:
+        return PlanResult(verdicts.UNEXPECTED, problem)
+
+    exact: Dict[str, Optional[int]] = {"ffprobe": ffprobe_size}
+    for wrapped in sorted(shape.files().values(), key=lambda f: f.storage_id):
+        exact[f"wrapped {wrapped.file_id}"] = gateway.file_size(wrapped.file_id)
+    if disk.exists(original.relative):
+        exact["disk"] = disk.size(original.relative)
+    known = {label: size for label, size in exact.items() if size is not None}
+    p5 = None
+    if len({label.split(" ", 1)[0] for label in known}) < 2:
+        entry = archive.resolve(to_absolute(original.relative))
+        p5 = entry.size if entry else None
+    problem = size_problem(exact, p5)
+    if problem:
+        return PlanResult(verdicts.UNEXPECTED, problem)
+
+    item_values = gateway.item_fields(item_id, ROLLBACK_ITEM_FIELDS)
+    located = [_locate(original, gateway, archive, disk, None)]
+    refused = _located_problem(located)
+    if refused:
+        return refused
+    return PlanResult(
+        verdicts.READY,
+        plan={
+            "kind": "wrap",
+            **provider,
+            "wrapped_shape_id": shape.shape_id,
+            "wrapped_shape": shape.to_document(),
+            **_wrapped_files(shape),
+            "originals": located,
+            "technical_source": "copy",
+            "size_proof": {"exact": known, "p5": p5},
         },
         rollback=_rollback(item_id, shape, gateway, item_values),
     )

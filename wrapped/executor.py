@@ -32,6 +32,7 @@ from portal.plugins.TapelessIngest.wrapped.metadata import (
     item_fields,
 )
 from portal.plugins.TapelessIngest.wrapped.shape import (
+    build_copy_document,
     build_document,
     build_document_from_template,
     build_span_document,
@@ -189,6 +190,15 @@ class Executor:
             document = self._span_document(row.plan)
             row.plan["new_shape_id"] = self.gateway.post_shape(row.item_id, document)
             return
+        if row.plan.get("technical_source") == "copy":
+            # A wrapped ``file`` item: its one original holds every stream,
+            # which may be audio only (a WAV), so no video id is assumed.
+            document = build_copy_document(
+                parse_shape(row.plan["wrapped_shape"]),
+                row.plan["originals"][0]["file_id"],
+            )
+            row.plan["new_shape_id"] = self.gateway.post_shape(row.item_id, document)
+            return
         video_id = self._file_ids(row, "video")[0]
         audio_ids = self._file_ids(row, "audio")
         # The planner stored the template and timing: apply never reads
@@ -275,12 +285,14 @@ class Executor:
             self.gateway.untag_shape(row.item_id, wrapped_id, fields.ORIGINAL_TAG)
 
     def _update_clip(self, row) -> None:
-        video_file_id = self._file_ids(row, "video")[0]
+        # The first original: a P2 take's video (always listed first), or a
+        # wrapped ``file`` item's one original, which may be an audio WAV.
+        file_id = row.plan["originals"][0]["file_id"]
         if not self.persist:
             self.planned_clip_updates.append(
                 {
                     "umid": row.clip_umid,
-                    "file_id": video_file_id,
+                    "file_id": file_id,
                     "output_file": None,
                     "status": Clip.STATUS_SHAPE_POSTED,
                     "job_id": "",
@@ -288,7 +300,7 @@ class Executor:
             )
             return
         updated = Clip.objects.filter(umid=row.clip_umid).update(
-            file_id=video_file_id,
+            file_id=file_id,
             output_file=None,
             status=Clip.STATUS_SHAPE_POSTED,
             job_id="",

@@ -175,3 +175,34 @@ def test_set_file_state_is_a_single_put():
     assert [(c["method"], c["path"].rsplit("/", 1)[-1]) for c in _calls("rest")] == [
         ("PUT", "ARCHIVED"),
     ]
+
+
+@pytest.mark.parametrize(
+    "answer, size",
+    [
+        ({"id": "VX-W1", "size": 123456789}, 123456789),
+        ({"id": "VX-W1", "size": "123456789"}, 123456789),
+        ({"id": "VX-W1", "size": -1}, None),
+        ({"id": "VX-W1"}, None),
+    ],
+)
+def test_file_size_reads_the_storage_file_document(answer, size):
+    RestTransportFake.route("GET", r".*/storage/file/VX-W1", lambda m, q: answer)
+    assert VidispineGateway().file_size("VX-W1") == size
+    (call,) = _calls("rest")
+    assert call["method"] == "GET"
+
+
+def test_tagged_shapes_lists_by_tag_then_reads_each_shape():
+    RestTransportFake.route(
+        "GET",
+        r".*/item/VX-1/shape",
+        lambda m, q: {"uri": ["VX-LOW"]} if q.get("tag") == ["lowres"] else {},
+    )
+    RestTransportFake.route(
+        "GET",
+        r".*/item/VX-1/shape/VX-LOW",
+        lambda m, q: {"id": "VX-LOW", "tag": ["lowres"]},
+    )
+    (shape,) = VidispineGateway().tagged_shapes("VX-1", "lowres")
+    assert shape.shape_id == "VX-LOW"

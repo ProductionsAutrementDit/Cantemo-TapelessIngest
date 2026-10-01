@@ -74,10 +74,21 @@ class VidispineGateway:
         return list(listing.get("uri", []))
 
     def original_shapes(self, item_id: str) -> List[Shape]:
+        return self.tagged_shapes(item_id, fields.ORIGINAL_TAG)
+
+    def tagged_shapes(self, item_id: str, tag: str) -> List[Shape]:
         return [
             parse_shape(self._request("GET", f"item/{item_id}/shape/{shape_id}"))
-            for shape_id in self.shape_ids(item_id, fields.ORIGINAL_TAG)
+            for shape_id in self.shape_ids(item_id, tag)
         ]
+
+    def file_size(self, file_id: str) -> Optional[int]:
+        document = self._request("GET", f"storage/file/{file_id}") or {}
+        try:
+            size = int(document.get("size"))
+        except (TypeError, ValueError):
+            return None
+        return None if size < 0 else size
 
     def component_metadata(
         self, item_id: str, shape_id: str, component_id: str

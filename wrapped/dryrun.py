@@ -80,6 +80,13 @@ class RecordingGateway:
     def shape_ids(self, item_id, tag):
         return self._inner.shape_ids(item_id, tag)
 
+    def tagged_shapes(self, item_id, tag):
+        # Only ever read for a lowres tag, which a dry run never writes.
+        return self._inner.tagged_shapes(item_id, tag)
+
+    def file_size(self, file_id):
+        return self._inner.file_size(file_id)
+
     def component_metadata(self, item_id, shape_id, component_id):
         return self._inner.component_metadata(item_id, shape_id, component_id)
 

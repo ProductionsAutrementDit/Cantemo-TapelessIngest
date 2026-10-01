@@ -76,3 +76,12 @@ def test_disk_reads_text_of_a_real_file(tmp_path):
     assert disk.read_text("2016/CLIP/a.XML") == "<P2Main>é</P2Main>"
     assert disk.read_text("2016/CLIP/b.XML") is None
     assert disk.read_text("2016/CLIP") is None  # a directory is not a file
+
+
+def test_disk_size_is_the_real_file_size(tmp_path):
+    (tmp_path / "2019").mkdir()
+    (tmp_path / "2019" / "A.MOV").write_bytes(b"x" * 1234)
+    disk = Disk(str(tmp_path))
+    assert disk.size("2019/A.MOV") == 1234
+    assert disk.size("2019/B.MOV") is None
+    assert disk.size("2019") is None  # a directory is not a file

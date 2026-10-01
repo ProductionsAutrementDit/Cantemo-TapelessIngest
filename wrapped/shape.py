@@ -11,6 +11,10 @@ original, which is why these values have to be stated at all.
 When the wrapped shape's technical description is a copy of the lowres
 proxy, ``build_document_from_template`` states the content from the P2
 format's template and the timing from the clip's P2 metadata instead.
+
+A wrapped ``file`` item (``build_copy_document``) is different: its
+wrapped file is a renamed copy of ONE original holding every stream, so
+the genuine shape is restated whole, stream ids kept.
 """
 
 import copy
@@ -70,6 +74,39 @@ def build_document(
             for audio, file_id in zip(audios, audio_file_ids)
         ],
     }
+    if wrapped.mime_types:
+        document["mimeType"] = list(wrapped.mime_types)
+    return document
+
+
+def build_copy_document(wrapped: Shape, file_id: str) -> Dict[str, Any]:
+    """A wrapped ``file`` item: the wrapped file is a byte-for-byte copy of
+    its ONE original, so the genuine shape describes the original exactly.
+    Every container/video/audio body is kept as is (``essenceStreamId``,
+    ``itemTrack``, durations included: the streams of one file), minus
+    what identified the wrapped file, and names ``file_id`` instead."""
+    containers = wrapped.of_kind("container")
+    videos = wrapped.of_kind("video")
+    audios = wrapped.of_kind("audio")
+    if len(containers) > 1:
+        raise ShapeMismatch(f"{len(containers)} container components, expected 1")
+    if not (containers or videos or audios):
+        raise ShapeMismatch("no container, video or audio component to restate")
+
+    def body(component: Component) -> Dict[str, Any]:
+        restated = {
+            k: copy.deepcopy(v) for k, v in component.body.items() if k not in _DROPPED
+        }
+        restated["file"] = [{"id": file_id}]
+        return restated
+
+    document: Dict[str, Any] = {}
+    if containers:
+        document["containerComponent"] = body(containers[0])
+    if videos:
+        document["videoComponent"] = [body(v) for v in videos]
+    if audios:
+        document["audioComponent"] = [body(a) for a in audios]
     if wrapped.mime_types:
         document["mimeType"] = list(wrapped.mime_types)
     return document

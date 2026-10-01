@@ -27,8 +27,8 @@ class FakeArchive:
         self.folder_calls = []
         self.lookup_calls = []
 
-    def archive(self, abs_path, handle, volumes=("10509",), btime=1506011266):
-        self.entries[abs_path] = Entry(handle, tuple(volumes), btime, 1)
+    def archive(self, abs_path, handle, volumes=("10509",), btime=1506011266, size=1):
+        self.entries[abs_path] = Entry(handle, tuple(volumes), btime, size)
         for volume_id in volumes:
             self.volumes.setdefault(
                 volume_id, Volume(volume_id, f"BC{volume_id}", f"LABEL.{volume_id}")
@@ -62,6 +62,10 @@ class FakeDisk:
     def sha1(self, relative):
         return hashlib.sha1(self.contents[relative]).hexdigest()
 
+    def size(self, relative):
+        data = self.contents.get(relative)
+        return None if data is None else len(data)
+
     def read_text(self, relative):
         data = self.contents.get(relative)
         return None if data is None else data.decode("utf-8-sig")
@@ -82,6 +86,7 @@ class InMemoryGateway:
         # online unless the test says otherwise). register_file records
         # "ARCHIVED" or "CLOSED" for what it creates.
         self.file_states = {}
+        self.file_sizes = {}  # file_id -> size; absent means unknown (None)
         self.writes = []
         self._minted = 0
 
@@ -104,6 +109,16 @@ class InMemoryGateway:
         return [
             d["id"] for d in self.shapes.get(item_id, []) if tag in d.get("tag", [])
         ]
+
+    def tagged_shapes(self, item_id, tag):
+        return [
+            parse_shape(d)
+            for d in self.shapes.get(item_id, [])
+            if tag in d.get("tag", [])
+        ]
+
+    def file_size(self, file_id):
+        return self.file_sizes.get(file_id)
 
     def component_metadata(self, item_id, shape_id, component_id):
         return dict(self.component_md.get((item_id, shape_id, component_id), {}))
@@ -539,3 +554,182 @@ def p2_span(takes=SPAN_TAKES, contents=SPAN_CONTENTS, audio_count=4, edit_unit=(
         Segment(name, *segment_files(contents, name, audio_count), frames, edit_unit)
         for name, frames in takes
     ]
+
+
+FILE_OUTPUT = "/mnt/ActiveMedia/CANTEMO_FILES/5f1c0de4-6b1e-4f43-9d0c-2a8f6f1e9b10.mov"
+FILE_ORIGINAL = "2019/AH_20190402_H175_TEST/A001C003.MOV"
+WAV_OUTPUT = "/mnt/ActiveMedia/CANTEMO_FILES/0b7e2c1a-3d4f-4e5a-8b6c-7d8e9f0a1b2c.wav"
+WAV_ORIGINAL = "2019/AH_20190402_H175_TEST/SOUND/ZOOM0001.WAV"
+
+
+def _wrapped_entity(file_id, storage, state, name):
+    return {"id": file_id, "storage": storage, "state": state, "path": name}
+
+
+def file_mov_document(
+    shape_id="VX-SW",
+    file_id="VX-W1",
+    storage="VX-2",
+    state="ARCHIVED",
+    name=posixpath.basename(FILE_OUTPUT),
+    video_codec="prores",
+    resolution=(1920, 1080),
+    audio_codecs=("pcm_s24le", "pcm_s24le"),
+):
+    """A genuine wrapped ``file`` shape as Vidispine returns it: container,
+    video and audio streams of the ONE copied MOV, told apart by
+    ``essenceStreamId`` (measured: 13,638 items)."""
+    wrapped = _wrapped_entity(file_id, storage, state, name)
+    width, height = resolution
+    return {
+        "id": shape_id,
+        "tag": ["original"],
+        "mimeType": ["video/quicktime"],
+        "containerComponent": {
+            "id": f"{shape_id}-C",
+            "file": [dict(wrapped)],
+            "format": "mov,mp4,m4a,3gp,3g2,mj2",
+            "duration": {
+                "samples": 19_880_000,
+                "timeBase": {"numerator": 1, "denominator": 1_000_000},
+            },
+            "startTimecode": 1657612,
+            "bitrate": 147_000_000,
+            "metadata": {"field": [{"key": "major_brand", "value": "qt"}]},
+            "mediaInfo": {"property": [{"key": "Format", "value": "MPEG-4"}]},
+        },
+        "videoComponent": [
+            {
+                "id": f"{shape_id}-V",
+                "file": [dict(wrapped)],
+                "codec": video_codec,
+                "resolution": {"width": width, "height": height},
+                "duration": {
+                    "samples": 497,
+                    "timeBase": {"numerator": 1, "denominator": 25},
+                },
+                "essenceStreamId": 0,
+                "itemTrack": "V1",
+                "mediaInfo": {"property": [{"key": "Format", "value": "ProRes"}]},
+            }
+        ],
+        "audioComponent": [
+            {
+                "id": f"{shape_id}-A{n}",
+                "file": [dict(wrapped)],
+                "codec": codec,
+                "channelCount": 1,
+                "timeBase": {"numerator": 1, "denominator": 48000},
+                "duration": {
+                    "samples": 954_240,
+                    "timeBase": {"numerator": 1, "denominator": 48000},
+                },
+                "essenceStreamId": n + 1,
+                "itemTrack": f"A{n + 1}",
+            }
+            for n, codec in enumerate(audio_codecs)
+        ],
+    }
+
+
+def file_wav_document(
+    shape_id="VX-SW",
+    file_id="VX-W1",
+    storage="VX-26",
+    state="CLOSED",
+    name=posixpath.basename(WAV_OUTPUT),
+):
+    """A genuine wrapped audio-only ``file`` shape: one WAV, no video."""
+    wrapped = _wrapped_entity(file_id, storage, state, name)
+    return {
+        "id": shape_id,
+        "tag": ["original"],
+        "mimeType": ["audio/x-wav"],
+        "containerComponent": {
+            "id": f"{shape_id}-C",
+            "file": [dict(wrapped)],
+            "format": "wav",
+            "duration": {
+                "samples": 12_000_000,
+                "timeBase": {"numerator": 1, "denominator": 1_000_000},
+            },
+        },
+        "audioComponent": [
+            {
+                "id": f"{shape_id}-A0",
+                "file": [dict(wrapped)],
+                "codec": "pcm_s24le",
+                "channelCount": 2,
+                "timeBase": {"numerator": 1, "denominator": 48000},
+                "duration": {
+                    "samples": 576_000,
+                    "timeBase": {"numerator": 1, "denominator": 48000},
+                },
+                "essenceStreamId": 0,
+                "itemTrack": "A1",
+            }
+        ],
+    }
+
+
+def seed_lowres(
+    gateway,
+    item_id,
+    video_codec="h264",
+    resolution=(480, 272),
+    audio_codecs=("aac",),
+    shape_id="VX-LOW",
+):
+    """Give the item's (bare, seeded) lowres shape a technical description."""
+    document = {"id": shape_id, "tag": ["lowres"]}
+    if video_codec is not None:
+        width, height = resolution
+        document["videoComponent"] = [
+            {
+                "id": f"{shape_id}-V",
+                "codec": video_codec,
+                "resolution": {"width": width, "height": height},
+                "essenceStreamId": 0,
+            }
+        ]
+    document["audioComponent"] = [
+        {"id": f"{shape_id}-A{n}", "codec": codec, "essenceStreamId": n + 1}
+        for n, codec in enumerate(audio_codecs)
+    ]
+    shapes = gateway.shapes.setdefault(item_id, [])
+    shapes[:] = [d for d in shapes if d["id"] != shape_id] + [document]
+
+
+def ffprobe_xml(
+    video=("prores", 1920, 1080),
+    audio=("pcm_s24le", "pcm_s24le"),
+    size=123_456_789,
+    format_name="mov,mp4,m4a,3gp,3g2,mj2",
+    data_stream=True,
+):
+    """``ffprobe -print_format xml -show_format -show_streams`` of an
+    original, as the ``file`` provider stored it in Clip.clip_xml."""
+    streams = []
+    if video is not None:
+        codec, width, height = video
+        streams.append(
+            f'<stream index="{len(streams)}" codec_name="{codec}" '
+            f'codec_type="video" width="{width}" height="{height}"/>'
+        )
+    for codec in audio:
+        streams.append(
+            f'<stream index="{len(streams)}" codec_name="{codec}" '
+            f'codec_type="audio" sample_rate="48000" channels="1"/>'
+        )
+    if data_stream:
+        streams.append(
+            f'<stream index="{len(streams)}" codec_type="data" '
+            f'codec_tag_string="tmcd"/>'
+        )
+    size_attribute = "" if size is None else f' size="{size}"'
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n<ffprobe>\n'
+        f"<streams>{''.join(streams)}</streams>\n"
+        f'<format filename="/x" nb_streams="{len(streams)}" '
+        f'format_name="{format_name}"{size_attribute}/>\n</ffprobe>\n'
+    )

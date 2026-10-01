@@ -103,6 +103,13 @@ class Gateway(Protocol):
 
     def shape_ids(self, item_id: str, tag: str) -> List[str]: ...
 
+    def tagged_shapes(self, item_id: str, tag: str) -> List[Shape]: ...
+
+    def file_size(self, file_id: str) -> Optional[int]:
+        """The file's size in bytes; None when Vidispine does not know it
+        (no ``size``, or -1)."""
+        ...
+
     def component_metadata(
         self, item_id: str, shape_id: str, component_id: str
     ) -> Dict[str, str]: ...

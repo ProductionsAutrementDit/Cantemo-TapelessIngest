@@ -1399,3 +1399,19 @@ def test_relocate_leaves_a_clip_already_on_the_new_folder(migrated_db, tmp_path)
     assert _clip_rows()["ONNEW"] == rows["ONNEW"]
     backup = json.loads((tmp_path / "clipfiles.json").read_text())
     assert "ONNEW" not in [umid for umid, *_ in backup["clip"]]
+
+
+def test_templates_never_learns_from_a_file_provider_row(migrated_db):
+    for n in range(1, 3):
+        _ready_clip(n, genuine_p2_document())
+    WrappedMigration.objects.filter(item_id="VX-02").update(
+        plan={
+            "kind": "wrap",
+            "provider": "file",
+            "technical_source": "wrapped",
+            "wrapped_shape": genuine_p2_document(),
+        }
+    )
+    out, err = _templates("--min-refs", "1")
+    assert json.loads(out)[KEY]["references"] == 1
+    assert f"{KEY}: 1 ref(s), majority 1 (100.0%): kept" in err

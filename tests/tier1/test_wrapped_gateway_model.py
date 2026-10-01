@@ -4,7 +4,12 @@ import pytest
 
 from portal.plugins.TapelessIngest.wrapped.dryrun import RecordingGateway
 from portal.plugins.TapelessIngest.wrapped.gateway import Gateway, parse_shape
-from tests.wrapped_fakes import InMemoryGateway, seed_item, wrapped_p2_document
+from tests.wrapped_fakes import (
+    InMemoryGateway,
+    seed_item,
+    seed_lowres,
+    wrapped_p2_document,
+)
 
 
 def test_a_wrapped_p2_shape_parses_into_its_components():
@@ -148,3 +153,16 @@ def test_the_recording_gateway_forgets_a_file_it_deleted():
     recording.delete_file("VX-41", "VX-OLD1")
     assert recording.find_file("VX-41", "2014/OLD/V.MXF") is None
     assert recording.file_state("VX-41", "VX-OLD1") is None
+
+
+def test_the_recording_gateway_reads_sizes_and_tagged_shapes_through():
+    inner = InMemoryGateway()
+    seed_item(inner, "VX-1", wrapped_p2_document())
+    seed_lowres(inner, "VX-1")
+    inner.file_sizes["VX-W1"] = 42
+    recording = RecordingGateway(inner)
+    assert recording.file_size("VX-W1") == 42
+    assert recording.file_size("VX-NONE") is None
+    (lowres,) = recording.tagged_shapes("VX-1", "lowres")
+    assert lowres.of_kind("video")[0].body["codec"] == "h264"
+    assert recording.writes == []

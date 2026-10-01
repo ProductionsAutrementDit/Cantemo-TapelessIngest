@@ -1,9 +1,12 @@
 """Which clips are in scope, and what their original files are.
 
-P2 only (spec, first slice). The originals are the clip's ClipFile rows,
-recorded at wrapping time: one video MXF and N audio MXFs. ``order`` is
-0 on every measured row, so the audio order comes from the file names
-(``…00.MXF``, ``…01.MXF``…), which is the channel order P2 writes.
+P2: the originals are the clip's ClipFile rows, recorded at wrapping
+time: one video MXF and N audio MXFs. ``order`` is 0 on every measured
+row, so the audio order comes from the file names (``…00.MXF``,
+``…01.MXF``…), which is the channel order P2 writes.
+
+``file``: exactly one original (video, audio or still), one ClipFile row
+(21,285 clips) or none at all (1,819 clips, measured 2026-10-01).
 """
 
 from typing import Dict, List, Optional
@@ -35,6 +38,7 @@ from portal.plugins.TapelessIngest.wrapped.span import (
 )
 
 P2_PROVIDER = "panasonicP2"
+FILE_PROVIDER = "file"
 
 
 class ResolveError(Exception):
@@ -44,8 +48,14 @@ class ResolveError(Exception):
 def wrapped_p2_clips(
     item_id: Optional[str] = None, collection_id: Optional[str] = None
 ) -> QuerySet:
+    return wrapped_clips(P2_PROVIDER, item_id, collection_id)
+
+
+def wrapped_clips(
+    provider: str, item_id: Optional[str] = None, collection_id: Optional[str] = None
+) -> QuerySet:
     clips = (
-        Clip.objects.filter(provider_name=P2_PROVIDER)
+        Clip.objects.filter(provider_name=provider)
         .exclude(Q(output_file__isnull=True) | Q(output_file=""))
         .exclude(Q(item_id__isnull=True) | Q(item_id=""))
     )
@@ -69,6 +79,23 @@ def resolve_p2(clip: Clip) -> List[OriginalFile]:
         return [OriginalFile(to_relative(videos[0].path), "video")] + [
             OriginalFile(to_relative(r.path), "audio") for r in audios
         ]
+    except UnknownPrefix as error:
+        raise ResolveError(str(error)) from error
+
+
+def resolve_file(clip: Clip) -> Optional[OriginalFile]:
+    """The ``file`` clip's one original, or None when it has no ClipFile
+    (the original shape may then name it on VX-41)."""
+    rows = list(ClipFile.objects.filter(clip=clip))
+    if not rows:
+        return None
+    if len(rows) > 1:
+        raise ResolveError(f"{len(rows)} ClipFile rows, expected 1 for a file clip")
+    (row,) = rows
+    if row.filetype not in ("video", "audio"):
+        raise ResolveError(f"ClipFile row of unknown type {row.filetype!r}")
+    try:
+        return OriginalFile(to_relative(row.path), row.filetype)
     except UnknownPrefix as error:
         raise ResolveError(str(error)) from error
 

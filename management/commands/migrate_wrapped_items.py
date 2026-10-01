@@ -1,8 +1,10 @@
-"""Re-point legacy wrapped P2 items to their original files.
+"""Re-point legacy wrapped P2 (and `file`) items to their original files.
 
 Spec: _bmad-output/implementation-artifacts/spec-wrapped-items-migration-p2.md
 
-  plan    read-only; one WrappedMigration row per item, with its verdict
+  plan    read-only; one WrappedMigration row per item, with its verdict;
+          --provider file plans the wrapped ``file`` clips instead of P2
+          (option B: a genuine original shape restated onto its one copy)
   apply   ready / already-migrated rows, one resumable phase at a time;
           needs --item, --collection, --limit or an explicit --all, and
           stops after --max-failures (default 20) failures in a row
@@ -52,9 +54,11 @@ from portal.plugins.TapelessIngest.wrapped.archive import (
 from portal.plugins.TapelessIngest.wrapped.disk import Disk
 from portal.plugins.TapelessIngest.wrapped.dryrun import RecordingGateway
 from portal.plugins.TapelessIngest.wrapped.executor import Executor
+from portal.plugins.TapelessIngest.wrapped.ffprobe import parse_ffprobe
 from portal.plugins.TapelessIngest.wrapped.gateway import parse_shape
 from portal.plugins.TapelessIngest.wrapped.planner import (
     PlanResult,
+    plan_file_item,
     plan_item,
 )
 from portal.plugins.TapelessIngest.wrapped.relocate import (
@@ -64,10 +68,13 @@ from portal.plugins.TapelessIngest.wrapped.relocate import (
     under,
 )
 from portal.plugins.TapelessIngest.wrapped.resolver import (
+    FILE_PROVIDER,
+    P2_PROVIDER,
     ResolveError,
+    resolve_file,
     resolve_p2,
     resolve_span,
-    wrapped_p2_clips,
+    wrapped_clips,
 )
 from portal.plugins.TapelessIngest.wrapped.shape import template_disagreements
 from portal.plugins.TapelessIngest.wrapped.span import SpanUnresolved
@@ -131,8 +138,24 @@ def _originals(clip, disk):
     return [], span, None
 
 
+def _plan_file(clip, gateway, archive, disk):
+    """A wrapped ``file`` clip: its one original, and what ffprobe said of
+    it when it was scanned (Clip.clip_xml)."""
+    probe = parse_ffprobe(clip.clip_xml)
+    return plan_file_item(
+        item_id=clip.item_id,
+        original=resolve_file(clip),
+        output_file=clip.output_file,
+        gateway=gateway,
+        archive=archive,
+        disk=disk,
+        ffprobe=probe.signature if probe else None,
+        ffprobe_size=probe.size if probe else None,
+    )
+
+
 class Command(BaseCommand):
-    help = "Migrate legacy wrapped P2 items to their original files."
+    help = "Migrate legacy wrapped P2 and file items to their original files."
 
     gateway_factory = staticmethod(_vidispine_gateway)
     archive_factory = staticmethod(load_archive_lookup)
@@ -143,6 +166,13 @@ class Command(BaseCommand):
         parser.add_argument(
             "action",
             choices=("plan", "apply", "verify", "report", "templates", "relocate"),
+        )
+        parser.add_argument(
+            "--provider",
+            choices=(P2_PROVIDER, FILE_PROVIDER),
+            default=P2_PROVIDER,
+            help=f"plan: the wrapped clips to plan (default {P2_PROVIDER}); "
+            f"apply, verify and report act on rows whatever their provider",
         )
         parser.add_argument("--item", dest="item_id")
         parser.add_argument("--collection", dest="collection_id")
@@ -217,6 +247,8 @@ class Command(BaseCommand):
         )
 
     def handle(self, *args, **options):
+        if options["provider"] != P2_PROVIDER and options["action"] != "plan":
+            raise CommandError("--provider only applies to 'plan'")
         if options["limit"] is not None and options["limit"] < 1:
             raise CommandError("--limit must be a positive integer")
         if options["dryrun"] and options["action"] not in ("apply", "relocate"):
@@ -290,7 +322,8 @@ class Command(BaseCommand):
         archive = CachedArchive(self.archive_factory())
         gateway, disk = self.gateway_factory(), self.disk_factory()
         templates = self.templates_factory()
-        clips = wrapped_p2_clips(options["item_id"], options["collection_id"])
+        provider = options["provider"]
+        clips = wrapped_clips(provider, options["item_id"], options["collection_id"])
         if options["limit"]:
             clips = clips[: options["limit"]]
         counts = Counter()
@@ -300,20 +333,23 @@ class Command(BaseCommand):
                 counts["frozen"] += 1
                 continue
             try:
-                originals, span, span_problem = _originals(clip, disk)
-                result = plan_item(
-                    item_id=clip.item_id,
-                    originals=originals,
-                    spanned=clip.spanned,
-                    output_file=clip.output_file,
-                    gateway=gateway,
-                    archive=archive,
-                    disk=disk,
-                    clip_metadata=_clip_metadata(clip),
-                    templates=templates,
-                    span=span,
-                    span_problem=span_problem,
-                )
+                if provider == FILE_PROVIDER:
+                    result = _plan_file(clip, gateway, archive, disk)
+                else:
+                    originals, span, span_problem = _originals(clip, disk)
+                    result = plan_item(
+                        item_id=clip.item_id,
+                        originals=originals,
+                        spanned=clip.spanned,
+                        output_file=clip.output_file,
+                        gateway=gateway,
+                        archive=archive,
+                        disk=disk,
+                        clip_metadata=_clip_metadata(clip),
+                        templates=templates,
+                        span=span,
+                        span_problem=span_problem,
+                    )
             except ResolveError as error:
                 result = PlanResult(verdicts.UNEXPECTED, str(error))
             except Exception as error:  # noqa: BLE001 - reclassified next plan
@@ -631,6 +667,9 @@ class Command(BaseCommand):
         for row in self._rows(options).filter(verdict=verdicts.READY):
             plan = row.plan
             if plan.get("technical_source", "wrapped") != "wrapped":
+                continue
+            # P2 formats only: a row planned before ``provider`` existed is P2.
+            if plan.get("provider", P2_PROVIDER) != P2_PROVIDER:
                 continue
             if row.phase or "wrapped_shape" not in plan:
                 continue

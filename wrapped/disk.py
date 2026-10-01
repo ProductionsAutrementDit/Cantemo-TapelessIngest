@@ -27,6 +27,11 @@ class Disk:
                 digest.update(chunk)
         return digest.hexdigest()
 
+    def size(self, relative: str) -> Optional[int]:
+        """The file's size in bytes, or None when it is not a file."""
+        path = os.path.join(self.root, relative)
+        return os.path.getsize(path) if os.path.isfile(path) else None
+
     def read_text(self, relative: str) -> Optional[str]:
         """A small text file (a P2 CLIP XML), or None when it is not a file."""
         path = os.path.join(self.root, relative)
