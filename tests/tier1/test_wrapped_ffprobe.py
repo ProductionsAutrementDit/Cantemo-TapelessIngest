@@ -6,6 +6,7 @@ from portal.plugins.TapelessIngest.wrapped.ffprobe import (
     AMBIGUOUS,
     GENUINE,
     PROXY,
+    Probe,
     classify_copy,
     parse_ffprobe,
     probe_disagreement,
@@ -159,3 +160,53 @@ def test_a_video_on_one_side_only_is_a_disagreement():
 def test_a_still_is_video_on_both_sides():
     still = ("mjpeg", (4000, 3000), ())
     assert probe_disagreement(("jpeg", (4000, 3000), ()), still) is None
+
+
+# Verbatim structure of prod's Clip.clip_xml for `file` clips (97%): the
+# ffprobe <streams> and <format> wrapped in <Material umid="...">.
+MATERIAL_XML = """<Material umid="de16f5f6-a9c3-4057-b734-4b40eaedba3a">
+    <streams>
+        <stream index="0" codec_type="data" codec_time_base="1/50" \
+codec_tag_string="tmcd" codec_tag="0x64636d74"/>
+        <stream index="1" codec_name="h264" codec_long_name="H.264" \
+codec_type="video" codec_time_base="1/50" width="1920" height="1080" \
+pix_fmt="yuv420p"/>
+        <stream index="2" codec_name="pcm_s16be" codec_type="audio" \
+sample_rate="48000" channels="2"/>
+    </streams>
+    <format filename="2015-05-05_09-58-21.mov" nb_streams="3" nb_programs="0" \
+format_name="mov,mp4,m4a,3gp,3g2,mj2" format_long_name="QuickTime / MOV" \
+start_time="0.000000" duration="9.135000" size="34346963" bit_rate="30079442" \
+probe_score="100">
+        <tag key="major_brand" value="qt  "/>
+    </format>
+</Material>
+"""
+
+NON_REAL_TIME_META = """<?xml version="1.0" encoding="UTF-8"?>
+<NonRealTimeMeta xmlns="urn:schemas-professionalDisc:nonRealTimeMeta:ver.2.00" \
+lastUpdate="2015-05-05T09:58:21+02:00">
+    <Duration value="457"/>
+    <VideoFormat><VideoFrame videoCodec="AVC_1920_1080_HP@L42"/></VideoFormat>
+</NonRealTimeMeta>
+"""
+
+
+def test_the_material_wrapper_is_read_as_ffprobe():
+    probe = parse_ffprobe(MATERIAL_XML)
+    assert probe.signature == ("h264", (1920, 1080), ("pcm_s16be",))
+    assert probe.size == 34346963
+
+
+def test_a_material_with_only_a_format_still_gives_its_size():
+    xml = '<Material umid="x"><format size="12"/></Material>'
+    assert parse_ffprobe(xml) == Probe((None, None, ()), 12)
+
+
+def test_a_material_nesting_streams_deeper_is_not_ffprobe():
+    xml = '<Material umid="x"><other><streams/><format size="1"/></other></Material>'
+    assert parse_ffprobe(xml) is None
+
+
+def test_sony_non_real_time_meta_is_not_ffprobe():
+    assert parse_ffprobe(NON_REAL_TIME_META) is None

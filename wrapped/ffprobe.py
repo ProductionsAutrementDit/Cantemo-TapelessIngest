@@ -2,7 +2,8 @@
 
 The ``file`` provider stored ``ffprobe -print_format xml -show_format
 -show_streams`` of the original in ``Clip.clip_xml`` (measured on prod:
-21,967 clips; ``<format … size="N">`` equals the wrapped copy's size).
+21,967 clips; ``<format … size="N">`` equals the wrapped copy's size),
+in 97% of them wrapped in ``<Material umid=…>`` rather than ``<ffprobe>``.
 Here it is read for two things: the original's technical signature
 (video codec, video resolution, audio codecs in stream order) and its
 byte size.
@@ -54,9 +55,11 @@ def _resolution(width: Any, height: Any) -> Optional[Tuple[int, int]]:
 
 
 def parse_ffprobe(xml: Optional[str]) -> Optional[Probe]:
-    """None when there is no ffprobe document (empty, unparsable, or
-    another provider's XML). Only the top-level ``<streams>`` count:
-    ffprobe lists a program's streams again under ``<programs>``."""
+    """None when there is no ffprobe document (empty, unparsable, or a
+    root with no direct ``<streams>`` or ``<format>``: Sony's
+    NonRealTimeMeta, another provider's XML). Only the top-level
+    ``<streams>`` count: ffprobe lists a program's streams again under
+    ``<programs>``."""
     text = (xml or "").strip().lstrip("\ufeff").strip()
     if not text:
         return None
@@ -64,7 +67,9 @@ def parse_ffprobe(xml: Optional[str]) -> Optional[Probe]:
         root = ElementTree.fromstring(text.encode("utf-8"))
     except ElementTree.ParseError:
         return None
-    if _local(root.tag) != "ffprobe":
+    # The plain ``<ffprobe>`` root, or (97% on prod) ``<Material umid=…>``
+    # wrapping the same top-level ``<streams>`` and ``<format>``.
+    if not {_local(child.tag) for child in root} & {"streams", "format"}:
         return None
     video_codec, resolution, audios = None, None, []
     size = None
