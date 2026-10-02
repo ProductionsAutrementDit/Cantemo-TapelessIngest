@@ -10,6 +10,7 @@ from django.core.management.base import CommandError
 from portal.plugins.TapelessIngest.management.commands import migrate_wrapped_items
 from portal.plugins.TapelessIngest.models.clip import Clip, ClipFile, ClipMetadata
 from portal.plugins.TapelessIngest.models.wrapped_migration import WrappedMigration
+from portal.plugins.TapelessIngest.wrapped import fields
 from portal.plugins.TapelessIngest.wrapped.paths import to_absolute
 from portal.plugins.TapelessIngest.wrapped.templates import strip_for_template
 from tests.wrapped_fakes import (
@@ -1415,3 +1416,90 @@ def test_templates_never_learns_from_a_file_provider_row(migrated_db):
     out, err = _templates("--min-refs", "1")
     assert json.loads(out)[KEY]["references"] == 1
     assert f"{KEY}: 1 ref(s), majority 1 (100.0%): kept" in err
+
+
+ORIGINAL = fields.ITEM_ORIGINAL_FILENAME_FIELD
+RELATIVE = "2016/AH_0/CONTENTS/VIDEO/0001IE.MXF"
+
+
+def _backfill_row(item_id, phase="done", kind="complete", relative=RELATIVE):
+    return WrappedMigration.objects.create(
+        item_id=item_id,
+        clip_umid=f"U-{item_id}",
+        verdict="already-migrated",
+        phase=phase,
+        plan={
+            "kind": kind,
+            "originals": [
+                {"relative": relative, "kind": "video"},
+                {"relative": "2016/AH_0/CONTENTS/AUDIO/x.MXF", "kind": "audio"},
+            ],
+        },
+    )
+
+
+def _backfill(items, *args):
+    gateway = InMemoryGateway()
+    for item_id, value in items.items():
+        gateway.items[item_id] = {ORIGINAL: [value]}
+    world = (gateway, FakeArchive(), FakeDisk())
+    return world, _run(world, "backfill-original-filename", *args)
+
+
+def test_backfill_changes_a_wrong_value_and_leaves_a_right_one(migrated_db):
+    _backfill_row("VX-1")
+    _backfill_row("VX-2")
+    world, out = _backfill({"VX-1": "0001IE.MXF", "VX-2": RELATIVE})
+    assert world[0].items["VX-1"][ORIGINAL] == [RELATIVE]
+    assert f"VX-1: 0001IE.MXF -> {RELATIVE}" in out
+    assert "VX-2:" not in out
+    assert "changed: 1, already right: 1, failed: 0" in out
+    assert [w[:2] for w in world[0].writes] == [("set_item_metadata", "VX-1")]
+    assert world[0].writes[0][2] == {ORIGINAL: RELATIVE}
+
+
+def test_backfill_ignores_rows_not_done_or_not_complete(migrated_db):
+    _backfill_row("VX-1", phase="metadata_written")
+    _backfill_row("VX-2", kind="wrap")
+    world, out = _backfill({"VX-1": "old", "VX-2": "old"})
+    assert world[0].writes == []
+    assert "changed: 0, already right: 0, failed: 0" in out
+
+
+def test_backfill_dryrun_prints_and_writes_nothing(migrated_db):
+    _backfill_row("VX-1")
+    world, out = _backfill({"VX-1": "0001IE.MXF"}, "--dryrun")
+    assert f"VX-1: 0001IE.MXF -> {RELATIVE}" in out
+    assert "changed: 1" in out
+    assert world[0].writes == []
+    assert world[0].items["VX-1"][ORIGINAL] == ["0001IE.MXF"]
+
+
+def test_backfill_honours_item_and_limit(migrated_db):
+    for item_id in ("VX-1", "VX-2", "VX-3"):
+        _backfill_row(item_id)
+    items = {i: "old" for i in ("VX-1", "VX-2", "VX-3")}
+    world, out = _backfill(items, "--item", "VX-2")
+    assert [w[1] for w in world[0].writes] == ["VX-2"]
+    world, out = _backfill(items, "--limit", "2")
+    assert [w[1] for w in world[0].writes] == ["VX-1", "VX-2"]
+
+
+def test_backfill_isolates_a_failing_item(migrated_db):
+    _backfill_row("VX-1")
+    _backfill_row("VX-2")
+    gateway = InMemoryGateway()
+    for item_id in ("VX-1", "VX-2"):
+        gateway.items[item_id] = {ORIGINAL: ["old"]}
+    real = gateway.set_item_metadata
+
+    def flaky(item_id, values):
+        if item_id == "VX-1":
+            raise RuntimeError("boom")
+        real(item_id, values)
+
+    gateway.set_item_metadata = flaky
+    out = _run((gateway, FakeArchive(), FakeDisk()), "backfill-original-filename")
+    assert "VX-1: FAILED RuntimeError: boom" in out
+    assert gateway.items["VX-2"][ORIGINAL] == [RELATIVE]
+    assert "changed: 1, already right: 0, failed: 1" in out

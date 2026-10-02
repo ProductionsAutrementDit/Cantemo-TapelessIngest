@@ -274,6 +274,13 @@ class Executor:
         summary = item_fields(row.plan["originals"])
         if "manifest" in row.plan:
             summary[fields.PAD_ASSEMBLY_FIELD] = row.plan["manifest"]
+        if row.plan["kind"] == "complete":
+            # Vidispine fills this from a posted shape; a complete row never
+            # posts one, so its legacy basename is replaced by the VX-41
+            # relative path of the first original.
+            summary[fields.ITEM_ORIGINAL_FILENAME_FIELD] = row.plan["originals"][0][
+                "relative"
+            ]
         if summary:
             self.gateway.set_item_metadata(row.item_id, summary)
 

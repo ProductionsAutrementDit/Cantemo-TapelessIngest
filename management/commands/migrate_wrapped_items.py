@@ -52,6 +52,7 @@ from portal.plugins.TapelessIngest.wrapped.archive import (
     load_archive_lookup,
 )
 from portal.plugins.TapelessIngest.wrapped.disk import Disk
+from portal.plugins.TapelessIngest.wrapped import fields
 from portal.plugins.TapelessIngest.wrapped.dryrun import RecordingGateway
 from portal.plugins.TapelessIngest.wrapped.executor import Executor
 from portal.plugins.TapelessIngest.wrapped.ffprobe import parse_ffprobe
@@ -102,6 +103,7 @@ AUDIO_BITS = "audio_bits_per_sample"
 _RELOCATE_OPTIONS = (("from_prefix", "--from"), ("to_prefix", "--to"))
 _RELOCATE_OPTIONS += (("backup", "--backup"),)
 # ClipFile.path keeps the legacy mount points; this is what they share.
+_DRYRUN_ACTIONS = ("apply", "relocate", "backfill-original-filename")
 _RUSHES_MARKER = "RUSHES TAPELESS/"
 
 
@@ -166,7 +168,15 @@ class Command(BaseCommand):
     def add_arguments(self, parser):
         parser.add_argument(
             "action",
-            choices=("plan", "apply", "verify", "report", "templates", "relocate"),
+            choices=(
+                "plan",
+                "apply",
+                "verify",
+                "report",
+                "templates",
+                "relocate",
+                "backfill-original-filename",
+            ),
         )
         parser.add_argument(
             "--provider",
@@ -252,8 +262,11 @@ class Command(BaseCommand):
             raise CommandError("--provider only applies to 'plan'")
         if options["limit"] is not None and options["limit"] < 1:
             raise CommandError("--limit must be a positive integer")
-        if options["dryrun"] and options["action"] not in ("apply", "relocate"):
-            raise CommandError("--dryrun only applies to 'apply' and 'relocate'")
+        if options["dryrun"] and options["action"] not in _DRYRUN_ACTIONS:
+            raise CommandError(
+                "--dryrun only applies to 'apply', 'relocate' and "
+                "'backfill-original-filename'"
+            )
         if options["delete_online_wrapped"] and options["action"] != "apply":
             raise CommandError("--delete-online-wrapped only applies to 'apply'")
         if options["max_failures"] < 1:
@@ -285,7 +298,7 @@ class Command(BaseCommand):
             raise CommandError("--portal-only only applies to 'relocate'")
         if options["action"] == "relocate":
             self._check_relocate(options)
-        getattr(self, f"_{options['action']}")(options)
+        getattr(self, "_" + options["action"].replace("-", "_"))(options)
 
     @staticmethod
     def _check_relocate(options):
@@ -607,6 +620,42 @@ class Command(BaseCommand):
         verb = "to rewrite" if dry else "rewritten"
         self.stdout.write(f"clipfiles {verb}: {len(clipfiles)}")
         self.stdout.write(f"clips {verb}: {len(clips)}")
+
+    def _backfill_original_filename(self, options):
+        """Point originalFilename of every done ``complete`` row at its first
+        original's VX-41 relative path (only that field is written)."""
+        gateway = self.gateway_factory()
+        dry = options["dryrun"]
+        field = fields.ITEM_ORIGINAL_FILENAME_FIELD
+        # plan is a text column: the kind can only be tested in Python.
+        rows = [
+            row
+            for row in self._rows(options).filter(phase="done")
+            if row.plan.get("kind") == "complete"
+        ]
+        if options["limit"]:
+            rows = rows[: options["limit"]]
+        changed = right = failed = 0
+        for row in rows:
+            try:
+                new = row.plan["originals"][0]["relative"]
+                old = (gateway.item_fields(row.item_id, [field]).get(field) or [""])[0]
+                if old == new:
+                    right += 1
+                    continue
+                if not dry:
+                    gateway.set_item_metadata(row.item_id, {field: new})
+            except Exception as error:  # noqa: BLE001 - isolate the item
+                failed += 1
+                self.stdout.write(
+                    f"{row.item_id}: FAILED {type(error).__name__}: {error}"
+                )
+                continue
+            changed += 1
+            self.stdout.write(f"{row.item_id}: {old} -> {new}")
+        self.stdout.write(
+            f"changed: {changed}, already right: {right}, failed: {failed}"
+        )
 
     def _verify(self, options):
         gateway = self.gateway_factory()

@@ -406,6 +406,54 @@ def test_already_migrated_items_only_get_metadata(migrated_db):
     assert set(gateway.write_names()) == {"set_component_metadata", "set_item_metadata"}
 
 
+def test_a_complete_row_also_corrects_the_item_original_filename(migrated_db):
+    gateway = InMemoryGateway()
+    row, disk = _setup(gateway)
+    Executor(gateway, disk).run(row)  # migrate once
+    completed = WrappedMigration.objects.create(
+        item_id="VX-2",
+        clip_umid="U2",
+        verdict="already-migrated",
+        plan={
+            "kind": "complete",
+            "new_shape_id": row.plan["new_shape_id"],
+            "originals": row.plan["originals"],
+        },
+        rollback={**row.rollback, "lowres_shape_ids": ["VX-LOW"]},
+    )
+    gateway.shapes["VX-2"] = gateway.shapes[ITEM]
+    gateway.items["VX-2"] = dict(gateway.items[ITEM])
+    gateway.items["VX-2"][fields.ITEM_ORIGINAL_FILENAME_FIELD] = ["0001IE.MXF"]
+    gateway.writes.clear()
+    output_before = Clip.objects.get(umid="U1").output_file
+    Executor(gateway, disk).run(completed)
+    first = completed.plan["originals"][0]["relative"]
+    assert gateway.items["VX-2"][fields.ITEM_ORIGINAL_FILENAME_FIELD] == [first]
+    (write,) = [w for w in gateway.writes if w[0] == "set_item_metadata"]
+    assert write[2][fields.ITEM_ORIGINAL_FILENAME_FIELD] == first
+    # idempotent: a second pass writes the same value
+    completed.phase = ""
+    Executor(gateway, disk).run(completed)
+    assert gateway.items["VX-2"][fields.ITEM_ORIGINAL_FILENAME_FIELD] == [first]
+    assert Clip.objects.get(umid="U1").output_file == output_before
+
+
+def test_a_wrap_row_leaves_original_filename_to_vidispine(migrated_db):
+    gateway = InMemoryGateway()
+    row, disk = _setup(gateway)
+    gateway.writes.clear()
+    Executor(gateway, disk).run(row)
+    for write in gateway.writes:
+        if write[0] == "set_item_metadata":
+            assert fields.ITEM_ORIGINAL_FILENAME_FIELD not in write[2]
+
+
+def test_rollback_keeps_the_legacy_original_filename():
+    from portal.plugins.TapelessIngest.wrapped.planner import ROLLBACK_ITEM_FIELDS
+
+    assert fields.ITEM_ORIGINAL_FILENAME_FIELD in ROLLBACK_ITEM_FIELDS
+
+
 def test_dry_run_writes_nothing_and_lists_every_write(migrated_db):
     gateway = InMemoryGateway()
     row, disk = _setup(gateway)
