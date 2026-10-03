@@ -4,16 +4,24 @@ import pytest
 
 from portal.plugins.TapelessIngest.wrapped.ffprobe import (
     AMBIGUOUS,
+    FFPROBE_ROUTE_FORMATS,
     GENUINE,
     PROXY,
     Probe,
     classify_copy,
     parse_ffprobe,
+    parse_ffprobe_description,
     probe_disagreement,
+    route_format,
     shape_signature,
 )
 from portal.plugins.TapelessIngest.wrapped.gateway import parse_shape
-from tests.wrapped_fakes import ffprobe_xml, file_mov_document, file_wav_document
+from tests.wrapped_fakes import (
+    ffprobe_route_xml,
+    ffprobe_xml,
+    file_mov_document,
+    file_wav_document,
+)
 
 MOV = ("prores", (1920, 1080), ("pcm_s24le", "pcm_s24le"))
 PROXY_SIG = ("h264", (480, 272), ("aac",))
@@ -210,3 +218,129 @@ def test_a_material_nesting_streams_deeper_is_not_ffprobe():
 
 def test_sony_non_real_time_meta_is_not_ffprobe():
     assert parse_ffprobe(NON_REAL_TIME_META) is None
+
+
+# The ffprobe route: what is stated of the original from its ffprobe.
+
+PRORES_DESCRIPTION = {
+    "format": "mov,mp4,m4a,3gp,3g2,mj2",
+    "duration": "8.720000",
+    "streams": [
+        {
+            "index": 1,
+            "kind": "video",
+            "codec": "prores",
+            "width": 1920,
+            "height": 1080,
+            "avg_frame_rate": [25, 1],
+            "time_base": [1, 25],
+            "sample_aspect_ratio": [1, 1],
+        },
+        {
+            "index": 2,
+            "kind": "audio",
+            "codec": "pcm_s24le",
+            "channels": 1,
+            "sample_rate": 48000,
+        },
+        {
+            "index": 3,
+            "kind": "audio",
+            "codec": "pcm_s24le",
+            "channels": 1,
+            "sample_rate": 48000,
+        },
+    ],
+}
+
+
+def test_a_prores_mov_keeps_its_stream_indexes_past_a_data_stream():
+    assert parse_ffprobe_description(ffprobe_route_xml()) == PRORES_DESCRIPTION
+
+
+def test_an_avchd_mpegts_gives_its_video_and_ac3():
+    description = parse_ffprobe_description(ffprobe_route_xml("avchd"))
+    assert description["format"] == "mpegts"
+    assert [s["index"] for s in description["streams"]] == [0, 1]
+    video, audio = description["streams"]
+    assert (video["codec"], video["sample_aspect_ratio"]) == ("h264", [1, 1])
+    assert (audio["codec"], audio["channels"], audio["sample_rate"]) == (
+        "ac3",
+        2,
+        48000,
+    )
+    assert "problem" not in description
+
+
+def test_a_material_root_is_read_like_an_ffprobe_root():
+    xml = ffprobe_route_xml(root="material")
+    assert parse_ffprobe_description(xml) == PRORES_DESCRIPTION
+
+
+def test_a_bom_and_whitespace_are_ignored():
+    xml = "﻿\n  " + ffprobe_route_xml()
+    assert parse_ffprobe_description(xml) == PRORES_DESCRIPTION
+
+
+@pytest.mark.parametrize("aspect", [None, "0:1", "N/A", "1:0"])
+def test_an_unstated_sample_aspect_ratio_is_none(aspect):
+    description = parse_ffprobe_description(
+        ffprobe_route_xml(sample_aspect_ratio=aspect)
+    )
+    assert description["streams"][0]["sample_aspect_ratio"] is None
+    assert "problem" not in description
+
+
+@pytest.mark.parametrize(
+    "dropped, named",
+    [
+        ("sample_rate", "sample_rate"),
+        ("channels", "channels"),
+        ("avg_frame_rate", "avg_frame_rate"),
+        ("time_base", "time_base"),
+        ("width", "width"),
+        ("codec_name", "no codec_name"),
+    ],
+)
+def test_a_stream_missing_a_required_value_names_it(dropped, named):
+    description = parse_ffprobe_description(ffprobe_route_xml(drop=(dropped,)))
+    assert named in description["problem"]
+
+
+def test_a_zero_frame_rate_term_is_a_problem():
+    xml = ffprobe_route_xml().replace('avg_frame_rate="25/1"', 'avg_frame_rate="0/0"')
+    assert "avg_frame_rate" in parse_ffprobe_description(xml)["problem"]
+
+
+def test_a_format_without_a_duration_is_a_problem():
+    xml = ffprobe_route_xml().replace(' duration="8.720000"', "")
+    assert parse_ffprobe_description(xml)["problem"] == "no format duration"
+
+
+@pytest.mark.parametrize(
+    "xml", [None, "", "  ", "<not-xml", "<NonRealTimeMeta><x/></NonRealTimeMeta>"]
+)
+def test_no_ffprobe_document_gives_none(xml):
+    assert parse_ffprobe_description(xml) is None
+
+
+def test_the_route_format_is_the_container_first_video_and_distinct_audios():
+    assert route_format(PRORES_DESCRIPTION) == (
+        "mov,mp4,m4a,3gp,3g2,mj2",
+        "prores",
+        ("pcm_s24le",),
+    )
+    assert route_format({"format": "wav", "streams": []}) == ("wav", None, ())
+    assert route_format(PRORES_DESCRIPTION) in FFPROBE_ROUTE_FORMATS
+
+
+def test_an_mxf_h264_pcm_description_has_no_reference():
+    description = parse_ffprobe_description(ffprobe_route_xml("mxf"))
+    assert route_format(description) == ("mxf", "h264", ("pcm_s24le",))
+    assert route_format(description) not in FFPROBE_ROUTE_FORMATS
+
+
+def test_the_route_formats_are_the_nine_measured_ones():
+    assert len(FFPROBE_ROUTE_FORMATS) == 9
+    assert ("mpegts", "h264", ("ac3",)) in FFPROBE_ROUTE_FORMATS
+    assert ("mov,mp4,m4a,3gp,3g2,mj2", "prores", ()) in FFPROBE_ROUTE_FORMATS

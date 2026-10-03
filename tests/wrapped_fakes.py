@@ -748,3 +748,64 @@ def ffprobe_xml(
         f'<format filename="/x" nb_streams="{len(streams)}" '
         f'format_name="{format_name}"{size_attribute}/>\n</ffprobe>\n'
     )
+
+
+def ffprobe_route_xml(
+    kind="mov",
+    duration="8.720000",
+    size=123_456_789,
+    root="ffprobe",
+    drop=(),
+    sample_aspect_ratio="1:1",
+):
+    """ffprobe XML carrying everything the ffprobe route reads (frame rate,
+    time base, channels, sample rate, duration). ``kind`` is "mov" (a
+    ProRes MOV with a ``tmcd`` data stream at index 0, video 1, audio 2
+    and 3), "avchd" (mpegts h264 + ac3) or "mxf" (h264 + pcm in MXF).
+    ``drop`` names attributes left out of every stream."""
+    aspect = (
+        ""
+        if sample_aspect_ratio is None
+        else f' sample_aspect_ratio="{sample_aspect_ratio}"'
+    )
+    if kind == "mov":
+        format_name = "mov,mp4,m4a,3gp,3g2,mj2"
+        streams = [
+            '<stream index="0" codec_type="data" codec_tag_string="tmcd"/>',
+            '<stream index="1" codec_name="prores" codec_type="video" '
+            f'width="1920" height="1080"{aspect} avg_frame_rate="25/1" '
+            'time_base="1/25"/>',
+            '<stream index="2" codec_name="pcm_s24le" codec_type="audio" '
+            'sample_rate="48000" channels="1" time_base="1/48000"/>',
+            '<stream index="3" codec_name="pcm_s24le" codec_type="audio" '
+            'sample_rate="48000" channels="1" time_base="1/48000"/>',
+        ]
+    elif kind == "avchd":
+        format_name = "mpegts"
+        streams = [
+            '<stream index="0" codec_name="h264" codec_type="video" '
+            f'width="1920" height="1080"{aspect} avg_frame_rate="25/1" '
+            'time_base="1/90000"/>',
+            '<stream index="1" codec_name="ac3" codec_type="audio" '
+            'sample_rate="48000" channels="2" time_base="1/90000"/>',
+        ]
+    else:
+        format_name = "mxf"
+        streams = [
+            '<stream index="0" codec_name="h264" codec_type="video" '
+            f'width="1920" height="1080"{aspect} avg_frame_rate="25/1" '
+            'time_base="1/25"/>',
+            '<stream index="1" codec_name="pcm_s24le" codec_type="audio" '
+            'sample_rate="48000" channels="1" time_base="1/48000"/>',
+        ]
+    for name in drop:
+        streams = [s.replace(f' {name}="', f' x-{name}="') for s in streams]
+    top = "<ffprobe>" if root == "ffprobe" else '<Material umid="U1">'
+    end = "</ffprobe>" if root == "ffprobe" else "</Material>"
+    return (
+        f'<?xml version="1.0" encoding="UTF-8"?>\n{top}\n'
+        f"<streams>{''.join(streams)}</streams>\n"
+        f'<format filename="/x" nb_streams="{len(streams)}" '
+        f'format_name="{format_name}" duration="{duration}" size="{size}"/>\n'
+        f"{end}\n"
+    )

@@ -14,7 +14,9 @@ format's template and the timing from the clip's P2 metadata instead.
 
 A wrapped ``file`` item (``build_copy_document``) is different: its
 wrapped file is a renamed copy of ONE original holding every stream, so
-the genuine shape is restated whole, stream ids kept.
+the genuine shape is restated whole, stream ids kept. When that shape is a
+copy of the lowres proxy, ``build_ffprobe_document`` states the identity of
+the same streams from the original's ffprobe instead.
 """
 
 import copy
@@ -113,6 +115,74 @@ def build_copy_document(wrapped: Shape, file_id: str) -> Dict[str, Any]:
 
 
 MICROSECONDS = {"numerator": 1, "denominator": 1_000_000}
+
+
+def _fraction(pair: Sequence[int], numerator: str, denominator: str):
+    return {numerator: pair[0], denominator: pair[1]}
+
+
+def build_ffprobe_document(
+    description: Mapping[str, Any], file_id: str, container_microseconds: int
+) -> Dict[str, Any]:
+    """A wrapped ``file`` item whose description is the lowres proxy's:
+    state the original's identity from its ffprobe (``ffprobe.
+    parse_ffprobe_description``) and nothing Vidispine's analysis does not
+    reproduce from it (no stream durations, packets, pixel format, timecodes;
+    no ``itemTrack``, Vidispine numbers the tracks itself). ``essenceStreamId``
+    is ffprobe's stream index. An audio ``timeBase`` is always 1/sample_rate,
+    which is not ffprobe's own (1/90000 in mpegts)."""
+    if description.get("problem"):
+        raise ShapeMismatch(f"ffprobe description: {description['problem']}")
+    streams = description.get("streams") or []
+    if not streams:
+        raise ShapeMismatch("no video or audio stream in the ffprobe description")
+    videos: List[Dict[str, Any]] = []
+    audios: List[Dict[str, Any]] = []
+    for stream in streams:
+        if stream["kind"] == "video":
+            video = {
+                "codec": stream["codec"],
+                "resolution": {"width": stream["width"], "height": stream["height"]},
+                "averageFrameRate": _fraction(
+                    stream["avg_frame_rate"], "numerator", "denominator"
+                ),
+                "timeBase": _fraction(stream["time_base"], "numerator", "denominator"),
+            }
+            if stream.get("sample_aspect_ratio"):
+                video["pixelAspectRatio"] = _fraction(
+                    stream["sample_aspect_ratio"], "horizontal", "vertical"
+                )
+            videos.append(
+                {**video, "essenceStreamId": stream["index"], "file": [{"id": file_id}]}
+            )
+        else:
+            audios.append(
+                {
+                    "codec": stream["codec"],
+                    "channelCount": stream["channels"],
+                    "timeBase": {
+                        "numerator": 1,
+                        "denominator": stream["sample_rate"],
+                    },
+                    "essenceStreamId": stream["index"],
+                    "file": [{"id": file_id}],
+                }
+            )
+    document: Dict[str, Any] = {
+        "containerComponent": {
+            "format": description["format"],
+            "duration": {
+                "samples": container_microseconds,
+                "timeBase": dict(MICROSECONDS),
+            },
+            "file": [{"id": file_id}],
+        }
+    }
+    if videos:
+        document["videoComponent"] = videos
+    if audios:
+        document["audioComponent"] = audios
+    return document
 
 
 def _exact(numerator: int, denominator: int, unit: str) -> int:

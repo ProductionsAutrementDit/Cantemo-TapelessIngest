@@ -6,7 +6,9 @@ from portal.plugins.TapelessIngest.wrapped.gateway import parse_shape
 from portal.plugins.TapelessIngest.wrapped.shape import (
     ShapeMismatch,
     build_copy_document,
+    build_ffprobe_document,
 )
+from tests.tier1.test_wrapped_ffprobe import PRORES_DESCRIPTION
 from tests.wrapped_fakes import (
     binary_only_document,
     file_mov_document,
@@ -70,3 +72,61 @@ def test_two_containers_are_refused():
     document["containerComponent"] = [document["containerComponent"], second]
     with pytest.raises(ShapeMismatch, match="2 container"):
         build_copy_document(parse_shape(document), "VX-F9")
+
+
+def test_a_prores_description_is_stated_from_ffprobe_alone():
+    document = build_ffprobe_document(PRORES_DESCRIPTION, "VX-F9", 8_720_000)
+
+    file = [{"id": "VX-F9"}]
+    assert document == {
+        "containerComponent": {
+            "format": "mov,mp4,m4a,3gp,3g2,mj2",
+            "duration": {
+                "samples": 8_720_000,
+                "timeBase": {"numerator": 1, "denominator": 1_000_000},
+            },
+            "file": file,
+        },
+        "videoComponent": [
+            {
+                "codec": "prores",
+                "resolution": {"width": 1920, "height": 1080},
+                "averageFrameRate": {"numerator": 25, "denominator": 1},
+                "timeBase": {"numerator": 1, "denominator": 25},
+                "pixelAspectRatio": {"horizontal": 1, "vertical": 1},
+                "essenceStreamId": 1,
+                "file": file,
+            }
+        ],
+        "audioComponent": [
+            {
+                "codec": "pcm_s24le",
+                "channelCount": 1,
+                "timeBase": {"numerator": 1, "denominator": 48000},
+                "essenceStreamId": index,
+                "file": file,
+            }
+            for index in (2, 3)
+        ],
+    }
+
+
+def test_an_unknown_pixel_aspect_ratio_is_left_out():
+    description = {
+        **PRORES_DESCRIPTION,
+        "streams": [
+            {**PRORES_DESCRIPTION["streams"][0], "sample_aspect_ratio": None},
+        ],
+    }
+    document = build_ffprobe_document(description, "VX-F9", 1)
+    assert "pixelAspectRatio" not in document["videoComponent"][0]
+    assert "audioComponent" not in document
+
+
+def test_a_description_with_a_problem_or_no_stream_cannot_be_stated():
+    with pytest.raises(ShapeMismatch, match="no sample_rate"):
+        build_ffprobe_document(
+            {**PRORES_DESCRIPTION, "problem": "no sample_rate"}, "", 1
+        )
+    with pytest.raises(ShapeMismatch, match="no video or audio stream"):
+        build_ffprobe_document({**PRORES_DESCRIPTION, "streams": []}, "", 1)
