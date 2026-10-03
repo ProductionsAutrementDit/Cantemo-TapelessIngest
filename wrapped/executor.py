@@ -35,6 +35,7 @@ from portal.plugins.TapelessIngest.wrapped.shape import (
     build_copy_document,
     build_document,
     build_document_from_template,
+    build_ffprobe_document,
     build_span_document,
 )
 from portal.plugins.TapelessIngest.wrapped.templates import Timing
@@ -196,6 +197,16 @@ class Executor:
             document = build_copy_document(
                 parse_shape(row.plan["wrapped_shape"]),
                 row.plan["originals"][0]["file_id"],
+            )
+            row.plan["new_shape_id"] = self.gateway.post_shape(row.item_id, document)
+            return
+        if row.plan.get("technical_source") == "ffprobe":
+            # The description and duration the planner stored: apply never
+            # re-reads Clip.clip_xml.
+            document = build_ffprobe_document(
+                row.plan["ffprobe"],
+                row.plan["originals"][0]["file_id"],
+                row.plan["container_microseconds"],
             )
             row.plan["new_shape_id"] = self.gateway.post_shape(row.item_id, document)
             return

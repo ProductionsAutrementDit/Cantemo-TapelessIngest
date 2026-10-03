@@ -15,6 +15,7 @@ from tests.wrapped_fakes import (
     FakeArchive,
     FakeDisk,
     InMemoryGateway,
+    ffprobe_route_xml,
     ffprobe_xml,
     file_mov_document,
     p2_originals,
@@ -111,6 +112,22 @@ def _world():
         ["2019/AH_TEST/A005.MOV", "2019/AH_TEST/A005B.MOV"],
         xml,
     )
+    # ready: a proxy-copied description, stated from the original's ffprobe
+    _file_clip(
+        gateway,
+        archive,
+        6,
+        "VX-16",
+        file_mov_document(
+            file_id="VX-W6",
+            name="W6.mov",
+            video_codec="h264",
+            resolution=(480, 272),
+            audio_codecs=("aac",),
+        ),
+        ["2019/AH_TEST/A006.MOV"],
+        ffprobe_route_xml(size=SIZE, root="material"),
+    )
     # a P2 clip, which --provider file never plans
     seed_item(gateway, "VX-1", wrapped_p2_document())
     p2 = Clip.objects.create(
@@ -160,10 +177,10 @@ def test_plan_provider_file_gives_each_item_its_verdict(migrated_db):
         "VX-13": "already-migrated",
         "VX-14": "unexpected",
         "VX-15": "unexpected",
+        "VX-16": "ready",
     }
-    assert rows["VX-12"][1] == (
-        "proxy-copied technical description (file); ffprobe route pending"
-    )
+    # its ffprobe carries no duration: the route refuses it by name
+    assert rows["VX-12"][1] == "ffprobe route (file): no format duration"
     assert rows["VX-14"][1] == (
         "no ClipFile and the original shape does not name one VX-41 file"
     )
@@ -175,10 +192,25 @@ def test_plan_provider_file_gives_each_item_its_verdict(migrated_db):
     assert ready.rollback["clip"]["output_file"] == (
         "/mnt/ActiveMedia/CANTEMO_FILES/W1.mov"
     )
+    routed = WrappedMigration.objects.get(item_id="VX-16")
+    assert routed.plan["technical_source"] == "ffprobe"
+    assert routed.plan["container_microseconds"] == 8_720_000
+    assert routed.plan["ffprobe"]["format"] == "mov,mp4,m4a,3gp,3g2,mj2"
+    assert [s["index"] for s in routed.plan["ffprobe"]["streams"]] == [1, 2, 3]
     migrated = WrappedMigration.objects.get(item_id="VX-13")
     assert migrated.plan["provider"] == "file"
-    assert "ready: 1" in out and "unexpected: 3" in out
+    assert "ready: 2" in out and "unexpected: 3" in out
     assert world[0].writes == []
+
+
+def test_an_ffprobe_routed_row_is_applied_verified_and_reported(migrated_db):
+    world = _world()
+    _run(world, "plan", "--provider", "file")
+    _run(world, "apply", "--item", "VX-16")
+    row = WrappedMigration.objects.get(item_id="VX-16")
+    assert (row.phase, row.error) == ("done", "")
+    assert "VX-16: ok" in _run(world, "verify", "--item", "VX-16")
+    assert "technical source ffprobe: 1" in _run(world, "report")
 
 
 def test_plan_without_provider_still_plans_p2_only(migrated_db):

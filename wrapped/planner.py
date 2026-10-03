@@ -22,7 +22,10 @@ reads; the segments must sum exactly to the wrapped duration.
 A wrapped ``file`` item (``plan_file_item``) has ONE original, of which
 the wrapped file is a byte-for-byte copy: a genuine original shape is
 restated whole (``technical_source`` "copy") once the sizes prove the
-copy; a proxy-copied or ambiguous description stays ``unexpected``.
+copy. A proxy-copied or ambiguous description is stated from the
+original's ffprobe instead (``technical_source`` "ffprobe"), for the
+formats measured against Vidispine; without an ffprobe it stays
+``unexpected``.
 """
 
 import copy
@@ -31,17 +34,19 @@ import posixpath
 from dataclasses import asdict, dataclass, field, replace
 from fractions import Fraction
 from types import MappingProxyType
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from portal.plugins.TapelessIngest.wrapped import fields, verdicts
 from portal.plugins.TapelessIngest.wrapped.archive import CachedArchive
 from portal.plugins.TapelessIngest.wrapped.ffprobe import (
     AMBIGUOUS,
+    FFPROBE_ROUTE_FORMATS,
     NO_SIGNATURE,
     PROXY,
     Signature,
     classify_copy,
     probe_disagreement,
+    route_format,
     shape_signature,
 )
 from portal.plugins.TapelessIngest.wrapped.gateway import (
@@ -56,6 +61,7 @@ from portal.plugins.TapelessIngest.wrapped.shape import (
     audio_time_base,
     build_copy_document,
     build_document_from_template,
+    build_ffprobe_document,
     build_span_document,
     duration_seconds,
     mismatch,
@@ -73,6 +79,9 @@ BINARY_ONLY = "binary-only original shape"
 FILELESS = "fileless original shape"
 # durationSeconds is written with millisecond precision or better.
 DURATION_TOLERANCE_S = 0.0005
+# The ffprobe route compares two analyses of one file (prod 2026-10-03: within
+# 0.12 s on all 9,196 targets; mpegts ffprobe is up to one frame longer).
+FFPROBE_DURATION_TOLERANCE_S = 0.2
 
 ROLLBACK_ITEM_FIELDS = (
     fields.DURATION_FIELD,
@@ -470,7 +479,12 @@ def _locate(
 
 
 def _duration_problem(
-    label: str, item_values: Mapping[str, Any], name: str, seconds: float
+    label: str,
+    item_values: Mapping[str, Any],
+    name: str,
+    seconds: float,
+    tolerance: float = DURATION_TOLERANCE_S,
+    separator: str = "; ",
 ) -> Optional[str]:
     """Before any write: the duration the new shape is stated from (``name``,
     ``seconds``) must be the item's current durationSeconds (the proxy
@@ -478,14 +492,14 @@ def _duration_problem(
     disagreement means that source does not describe this item's essence."""
     values = item_values.get(fields.DURATION_FIELD)
     if not values:
-        return f"{label}; no durationSeconds to cross-check"
+        return f"{label}{separator}no durationSeconds to cross-check"
     current = values[0]
     try:
-        agrees = abs(float(current) - seconds) <= DURATION_TOLERANCE_S
+        agrees = abs(float(current) - seconds) <= tolerance
     except ValueError:
-        return f"{label}; durationSeconds {current!r} is not a number"
+        return f"{label}{separator}durationSeconds {current!r} is not a number"
     if not agrees:
-        return f"{label}; {name} {seconds:.3f} s != durationSeconds {current}"
+        return f"{label}{separator}{name} {seconds:.3f} s != durationSeconds {current}"
     return None
 
 
@@ -639,6 +653,7 @@ FILE = "file"
 # small overhead (+178 for 7,720 items, +190/275/276 for ~900).
 P5_OVERHEAD_MAX = 512
 NO_SIZE_PROOF = "no size proof (file)"
+ROUTE = "ffprobe route"
 
 
 def size_problem(
@@ -702,33 +717,66 @@ def _file_original(shape: Shape) -> Optional[OriginalFile]:
 
 
 def _copy_problem(
-    item_id: str, shape: Shape, gateway: Gateway, ffprobe: Optional[Signature]
-) -> Optional[str]:
-    """Whether the shape's own description is the original's (option B)."""
+    item_id: str,
+    shape: Shape,
+    gateway: Gateway,
+    ffprobe: Optional[Signature],
+    described: bool = False,
+) -> Tuple[Optional[str], bool]:
+    """(problem, via_ffprobe): whether the shape's own description is the
+    original's (option B). A proxy-copied or ambiguous one is no problem
+    when the original's ffprobe is ``described`` in full: the shape is then
+    stated from it (``via_ffprobe``)."""
     if _is_binary_only(shape):
-        return f"{BINARY_ONLY} (file)"
+        return f"{BINARY_ONLY} (file)", False
     try:
         build_copy_document(shape, "")
     except ShapeMismatch as error:
-        return f"original shape (file) cannot be restated: {error}"
+        return f"original shape (file) cannot be restated: {error}", False
     lowres = [
         shape_signature(s) for s in gateway.tagged_shapes(item_id, fields.LOWRES_TAG)
     ]
     signature = shape_signature(shape)
     verdict = classify_copy(signature, lowres, ffprobe)
+    if verdict in (PROXY, AMBIGUOUS) and described:
+        return None, True
     if verdict == PROXY:
-        return f"{PROXY_COPY} (file); ffprobe route pending"
+        return f"{PROXY_COPY} (file); ffprobe route pending", False
     if verdict == AMBIGUOUS:
-        return "original shape equals the lowres (file); ambiguous"
+        return "original shape equals the lowres (file); ambiguous", False
     if ffprobe is None and all(s == NO_SIGNATURE for s in lowres):
         # Nothing could have refuted a proxy copy.
-        return "no ffprobe and no lowres to tell a proxy copy (file)"
+        return "no ffprobe and no lowres to tell a proxy copy (file)", False
     # Unlike the lowres is not enough: when the original's ffprobe is known,
     # the description must also agree with it.
     disagreement = probe_disagreement(signature, ffprobe) if ffprobe else None
     if disagreement:
-        return f"original shape disagrees with ffprobe (file): {disagreement}"
-    return None
+        return f"original shape disagrees with ffprobe (file): {disagreement}", False
+    return None, False
+
+
+def _route_problem(
+    description: Mapping[str, Any], item_values: Mapping[str, Any]
+) -> Optional[str]:
+    """Before any write: the ffprobe is complete, of a format measured
+    against Vidispine, and of the duration the item already has."""
+    if description.get("problem"):
+        return f"{ROUTE} (file): {description['problem']}"
+    key = route_format(description)
+    if key not in FFPROBE_ROUTE_FORMATS:
+        return f"{ROUTE} (file): format {key} has no Vidispine reference"
+    try:
+        seconds = float(Fraction(description["duration"]))
+    except (ValueError, ZeroDivisionError):
+        return f"{ROUTE} (file): duration {description['duration']!r} is not a number"
+    return _duration_problem(
+        f"{ROUTE} (file)",
+        item_values,
+        "ffprobe duration",
+        seconds,
+        FFPROBE_DURATION_TOLERANCE_S,
+        separator=": ",
+    )
 
 
 def plan_file_item(
@@ -741,12 +789,16 @@ def plan_file_item(
     disk,
     ffprobe: Optional[Signature] = None,
     ffprobe_size: Optional[int] = None,
+    ffprobe_description: Optional[Dict[str, Any]] = None,
 ) -> PlanResult:
     """A wrapped ``file`` item: its wrapped file is a byte-for-byte copy
     of ONE original, so a genuine original shape is restated whole onto
-    it (``technical_source`` "copy"). ``original`` is the clip's ClipFile
-    (None when it has none); ``ffprobe``/``ffprobe_size`` come from the
-    ffprobe XML stored in ``Clip.clip_xml``."""
+    it (``technical_source`` "copy"); a proxy-copied one is stated from the
+    original's ffprobe (``technical_source`` "ffprobe", which stores the
+    description and the container duration). ``original`` is the clip's
+    ClipFile (None when it has none); ``ffprobe``/``ffprobe_size``/
+    ``ffprobe_description`` come from the ffprobe XML stored in
+    ``Clip.clip_xml``."""
     shapes = gateway.original_shapes(item_id)
     if len(shapes) != 1:
         return PlanResult(verdicts.UNEXPECTED, f"{len(shapes)} original shapes")
@@ -769,13 +821,35 @@ def plan_file_item(
         return PlanResult(
             verdicts.UNEXPECTED, f"{FILELESS} (file): not measured for this provider"
         )
-    problem = _attachment_problem(shape, output_file) or _copy_problem(
-        item_id, shape, gateway, ffprobe
-    )
+    problem = _attachment_problem(shape, output_file)
+    via_ffprobe = False
+    if not problem:
+        problem, via_ffprobe = _copy_problem(
+            item_id, shape, gateway, ffprobe, ffprobe_description is not None
+        )
     if problem:
         return PlanResult(verdicts.UNEXPECTED, problem)
 
     item_values = gateway.item_fields(item_id, ROLLBACK_ITEM_FIELDS)
+    technical: Dict[str, Any] = {"technical_source": "copy"}
+    if via_ffprobe:
+        problem = _route_problem(ffprobe_description, item_values)
+        if problem:
+            return PlanResult(verdicts.UNEXPECTED, problem)
+        # The container states the duration the item already has: apply and
+        # verify leave durationSeconds alone.
+        microseconds = round(
+            Fraction(item_values[fields.DURATION_FIELD][0]) * 1_000_000
+        )
+        try:
+            build_ffprobe_document(ffprobe_description, "", microseconds)
+        except ShapeMismatch as error:
+            return PlanResult(verdicts.UNEXPECTED, f"{ROUTE} (file): {error}")
+        technical = {
+            "technical_source": "ffprobe",
+            "ffprobe": ffprobe_description,
+            "container_microseconds": microseconds,
+        }
     # Read-only, and the one P5 lookup: the size proof reuses its entry.
     located = [_locate(original, gateway, archive, disk, None)]
     (found,) = located
@@ -804,7 +878,7 @@ def plan_file_item(
             "wrapped_shape": shape.to_document(),
             **_wrapped_files(shape),
             "originals": located,
-            "technical_source": "copy",
+            **technical,
             "size_proof": {"exact": known, "p5": p5},
         },
         rollback=_rollback(item_id, shape, gateway, item_values),

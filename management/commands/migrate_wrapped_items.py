@@ -55,7 +55,10 @@ from portal.plugins.TapelessIngest.wrapped.disk import Disk
 from portal.plugins.TapelessIngest.wrapped import fields
 from portal.plugins.TapelessIngest.wrapped.dryrun import RecordingGateway
 from portal.plugins.TapelessIngest.wrapped.executor import Executor
-from portal.plugins.TapelessIngest.wrapped.ffprobe import parse_ffprobe
+from portal.plugins.TapelessIngest.wrapped.ffprobe import (
+    parse_ffprobe,
+    parse_ffprobe_description,
+)
 from portal.plugins.TapelessIngest.wrapped.gateway import parse_shape
 from portal.plugins.TapelessIngest.wrapped.planner import (
     PlanResult,
@@ -154,6 +157,7 @@ def _plan_file(clip, gateway, archive, disk):
         disk=disk,
         ffprobe=probe.signature if probe else None,
         ffprobe_size=probe.size if probe else None,
+        ffprobe_description=parse_ffprobe_description(clip.clip_xml),
     )
 
 

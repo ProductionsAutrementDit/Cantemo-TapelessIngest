@@ -1,5 +1,7 @@
 """Tier 2: a genuine wrapped ``file`` item applied end to end (option B)."""
 
+import posixpath
+
 import pytest
 
 from portal.plugins.TapelessIngest.models.clip import Clip
@@ -10,7 +12,9 @@ from portal.plugins.TapelessIngest.wrapped.executor import Executor
 from portal.plugins.TapelessIngest.wrapped.paths import OriginalFile, to_absolute
 from portal.plugins.TapelessIngest.wrapped.planner import plan_file_item
 from portal.plugins.TapelessIngest.wrapped.relocate import Relocator
+from portal.plugins.TapelessIngest.wrapped.shape import build_ffprobe_document
 from portal.plugins.TapelessIngest.wrapped.verifier import verify_item
+from tests.tier1.test_wrapped_ffprobe import PRORES_DESCRIPTION
 from tests.wrapped_fakes import (
     FILE_ORIGINAL,
     FILE_OUTPUT,
@@ -29,7 +33,9 @@ ITEM = "VX-50001"
 SIZE = 1000
 
 
-def _setup(gateway, document, original, output_file, signature, on_disk=False):
+def _setup(
+    gateway, document, original, output_file, signature, on_disk=False, description=None
+):
     seed_item(gateway, ITEM, document)
     seed_lowres(gateway, ITEM)
     gateway.file_sizes["VX-W1"] = SIZE
@@ -56,6 +62,7 @@ def _setup(gateway, document, original, output_file, signature, on_disk=False):
         disk=disk,
         ffprobe=signature,
         ffprobe_size=SIZE,
+        ffprobe_description=description,
     )
     assert result.verdict == verdicts.READY, result.reason
     row = WrappedMigration.objects.create(
@@ -71,6 +78,49 @@ def _setup(gateway, document, original, output_file, signature, on_disk=False):
 def _posted(gateway):
     (document,) = [w[2] for w in gateway.writes if w[0] == "post_shape"]
     return document
+
+
+@pytest.mark.parametrize("on_disk", [False, True])
+def test_a_proxy_copied_mov_is_stated_from_its_ffprobe(migrated_db, on_disk):
+    gateway = InMemoryGateway()
+    row, disk = _setup(
+        gateway,
+        file_mov_document(
+            video_codec="h264", resolution=(480, 272), audio_codecs=("aac",)
+        ),
+        OriginalFile(FILE_ORIGINAL, "video"),
+        FILE_OUTPUT,
+        ("prores", (1920, 1080), ("pcm_s24le", "pcm_s24le")),
+        on_disk=on_disk,
+        description=PRORES_DESCRIPTION,
+    )
+    assert row.plan["technical_source"] == "ffprobe"
+    Executor(gateway, disk).run(row)
+
+    row.refresh_from_db()
+    assert row.phase == "done" and row.error == ""
+    file_id = row.plan["originals"][0]["file_id"]
+    assert _posted(gateway) == build_ffprobe_document(
+        PRORES_DESCRIPTION, file_id, 8_720_000
+    )
+    (new,) = gateway.original_shapes(ITEM)
+    assert new.shape_id == row.plan["new_shape_id"]
+    assert new.file_ids() == frozenset([file_id])
+    handles = {
+        gateway.component_metadata(ITEM, new.shape_id, c.component_id)[
+            fields.EXTERNAL_ID_FIELD
+        ]
+        for c in new.components
+    }
+    assert handles == {"AirbusHelicopters#7"}
+    assert gateway.items[ITEM]["durationSeconds"] == ["8.72"]
+    clip = Clip.objects.get(umid="U1")
+    assert clip.file_id == file_id and clip.output_file is None
+    assert clip.status == Clip.STATUS_SHAPE_POSTED
+    assert posixpath.basename(row.plan["wrapped_file"]["path"]) == posixpath.basename(
+        FILE_OUTPUT
+    )
+    assert verify_item(row, gateway) == []
 
 
 @pytest.mark.parametrize("on_disk", [False, True])

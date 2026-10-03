@@ -8,6 +8,7 @@ from portal.plugins.TapelessIngest.wrapped import verdicts
 from portal.plugins.TapelessIngest.wrapped.archive import CachedArchive
 from portal.plugins.TapelessIngest.wrapped.paths import OriginalFile, to_absolute
 from portal.plugins.TapelessIngest.wrapped.planner import plan_file_item
+from tests.tier1.test_wrapped_ffprobe import PRORES_DESCRIPTION
 from tests.wrapped_fakes import (
     FILE_ORIGINAL,
     FILE_OUTPUT,
@@ -56,6 +57,7 @@ def _plan(
     output_file=FILE_OUTPUT,
     ffprobe=MOV,
     ffprobe_size=SIZE,
+    ffprobe_description=None,
 ):
     gateway, fake, disk = world
     return plan_file_item(
@@ -67,6 +69,7 @@ def _plan(
         disk=disk,
         ffprobe=ffprobe,
         ffprobe_size=ffprobe_size,
+        ffprobe_description=ffprobe_description,
     )
 
 
@@ -405,3 +408,144 @@ def test_an_already_migrated_entity_on_this_item_only_is_kept():
         file_mov_document(storage="VX-41", state="CLOSED", name=FILE_ORIGINAL)
     )
     assert _plan(world, original=None).verdict == verdicts.ALREADY_MIGRATED
+
+
+# The ffprobe route: a proxy-copied or ambiguous description is replaced by
+# the original's ffprobe.
+
+
+def _proxy_world(duration="8.72"):
+    world = _world(
+        file_mov_document(
+            video_codec="h264", resolution=(480, 272), audio_codecs=("aac",)
+        )
+    )
+    world[0].items[ITEM]["durationSeconds"] = [duration]
+    return world
+
+
+def test_a_proxy_copy_with_an_ffprobe_description_is_ready_from_ffprobe():
+    world = _proxy_world()
+    result = _plan(world, ffprobe_description=PRORES_DESCRIPTION)
+
+    assert result.verdict == verdicts.READY, result.reason
+    plan = result.plan
+    assert plan["technical_source"] == "ffprobe"
+    assert plan["ffprobe"] == PRORES_DESCRIPTION
+    assert plan["container_microseconds"] == 8_720_000
+    assert plan["wrapped_shape_id"] == "VX-SW"
+    assert plan["size_proof"]["exact"] == {"ffprobe": SIZE, "wrapped VX-W1": SIZE}
+    assert result.rollback["wrapped_shape_id"] == "VX-SW"
+    assert world[0].writes == []
+
+
+@pytest.mark.parametrize("ffprobe", [LOWRES, None])
+def test_an_ambiguous_description_with_an_ffprobe_description_is_ready(ffprobe):
+    result = _plan(
+        _proxy_world(), ffprobe=ffprobe, ffprobe_description=PRORES_DESCRIPTION
+    )
+    assert result.verdict == verdicts.READY, result.reason
+    assert result.plan["technical_source"] == "ffprobe"
+
+
+def test_the_container_duration_is_the_items_own_in_microseconds():
+    result = _plan(
+        _proxy_world(duration="8.7204"), ffprobe_description=PRORES_DESCRIPTION
+    )
+    assert result.verdict == verdicts.READY, result.reason
+    assert result.plan["container_microseconds"] == 8_720_400
+
+
+def test_a_format_without_a_vidispine_reference_is_refused():
+    description = {**PRORES_DESCRIPTION, "format": "mxf"}
+    result = _plan(_proxy_world(), ffprobe_description=description)
+    assert result.verdict == verdicts.UNEXPECTED
+    assert result.reason == (
+        "ffprobe route (file): format ('mxf', 'prores', ('pcm_s24le',)) "
+        "has no Vidispine reference"
+    )
+
+
+def test_a_description_with_a_problem_is_refused_by_name():
+    description = {**PRORES_DESCRIPTION, "problem": "audio stream 2 has no usable x"}
+    result = _plan(_proxy_world(), ffprobe_description=description)
+    assert result.verdict == verdicts.UNEXPECTED
+    assert result.reason == "ffprobe route (file): audio stream 2 has no usable x"
+
+
+def test_a_duration_more_than_a_fifth_of_a_second_off_is_refused():
+    result = _plan(
+        _proxy_world(duration="9.02"), ffprobe_description=PRORES_DESCRIPTION
+    )
+    assert result.verdict == verdicts.UNEXPECTED
+    assert result.reason == (
+        "ffprobe route (file): ffprobe duration 8.720 s != durationSeconds 9.02"
+    )
+
+
+def test_a_duration_within_a_fifth_of_a_second_is_ready():
+    result = _plan(
+        _proxy_world(duration="8.92"), ffprobe_description=PRORES_DESCRIPTION
+    )
+    assert result.verdict == verdicts.READY, result.reason
+    assert result.plan["container_microseconds"] == 8_920_000
+
+
+@pytest.mark.parametrize(
+    "duration, reason",
+    [
+        (None, "ffprobe route (file): no durationSeconds to cross-check"),
+        (
+            "soon",
+            "ffprobe route (file): durationSeconds 'soon' is not a number",
+        ),
+    ],
+)
+def test_an_unusable_duration_seconds_is_refused(duration, reason):
+    world = _proxy_world()
+    if duration is None:
+        del world[0].items[ITEM]["durationSeconds"]
+    else:
+        world[0].items[ITEM]["durationSeconds"] = [duration]
+    result = _plan(world, ffprobe_description=PRORES_DESCRIPTION)
+    assert result.verdict == verdicts.UNEXPECTED
+    assert result.reason == reason
+
+
+def test_a_description_that_is_not_a_number_of_seconds_is_refused():
+    description = {**PRORES_DESCRIPTION, "duration": "N/A"}
+    result = _plan(_proxy_world(), ffprobe_description=description)
+    assert result.verdict == verdicts.UNEXPECTED
+    assert result.reason == "ffprobe route (file): duration 'N/A' is not a number"
+
+
+def test_a_genuine_shape_stays_a_copy_whatever_the_description():
+    result = _plan(_world(), ffprobe_description=PRORES_DESCRIPTION)
+    assert result.verdict == verdicts.READY, result.reason
+    assert result.plan["technical_source"] == "copy"
+    assert "ffprobe" not in result.plan
+    assert "container_microseconds" not in result.plan
+
+
+def test_the_ffprobe_route_still_needs_its_size_proof():
+    result = _plan(
+        _proxy_world(),
+        ffprobe_size=SIZE + 1,
+        ffprobe_description=PRORES_DESCRIPTION,
+    )
+    assert result.verdict == verdicts.UNEXPECTED
+    assert result.reason.startswith("copy and original differ in size: ")
+
+
+def test_the_ffprobe_route_still_refuses_a_shared_entity():
+    world = _proxy_world()
+    _entity_on(world[0], "VX-OTHER")
+    result = _plan(world, ffprobe_description=PRORES_DESCRIPTION)
+    assert result.verdict == verdicts.UNEXPECTED
+    assert "already belongs to item VX-OTHER" in result.reason
+
+
+def test_a_binary_only_shape_is_refused_even_with_a_description():
+    world = _world(binary_only_document(name=posixpath.basename(FILE_OUTPUT)))
+    result = _plan(world, ffprobe_description=PRORES_DESCRIPTION)
+    assert result.reason == "binary-only original shape (file)"
