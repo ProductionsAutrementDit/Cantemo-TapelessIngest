@@ -1,8 +1,30 @@
 """Post-apply checks. An empty list means the item is what the plan says."""
 
+from fractions import Fraction
 from typing import List
 
 from portal.plugins.TapelessIngest.wrapped import fields
+
+# Vidispine re-renders durationSeconds at 1 us after shape/create (palier-1 prod
+# measurement, 2026-10-03); only the ffprobe route states a us container.
+FFPROBE_DURATION_TOLERANCE = Fraction(1, 1_000_000)
+
+
+def _duration_unchanged(plan, before, after) -> bool:
+    if before == after:
+        return True
+    if plan.get("technical_source") != "ffprobe":
+        return False
+    if not isinstance(before, list) or not isinstance(after, list):
+        return False
+    if len(before) != 1 or len(after) != 1:
+        return False
+    try:
+        return abs(Fraction(str(after[0])) - Fraction(str(before[0]))) < (
+            FFPROBE_DURATION_TOLERANCE
+        )
+    except (ValueError, ZeroDivisionError):
+        return False
 
 
 def verify_item(row, gateway) -> List[str]:
@@ -36,7 +58,7 @@ def verify_item(row, gateway) -> List[str]:
         problems.append(f"lowres shapes {lowres} != {rollback.get('lowres_shape_ids')}")
     duration = gateway.item_fields(row.item_id, [fields.DURATION_FIELD])
     before = rollback.get("item_fields", {}).get(fields.DURATION_FIELD)
-    if duration.get(fields.DURATION_FIELD) != before:
+    if not _duration_unchanged(plan, before, duration.get(fields.DURATION_FIELD)):
         problems.append(
             f"durationSeconds {duration.get(fields.DURATION_FIELD)} != {before}"
         )

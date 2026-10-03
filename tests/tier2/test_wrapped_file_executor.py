@@ -211,3 +211,75 @@ def test_relocating_an_audio_only_row_repoints_its_clip_at_the_wav(migrated_db):
     assert gateway.items[ITEM][fields.ITEM_ORIGINAL_FILENAME_FIELD] == [
         original["relative"]
     ]
+
+
+def _applied(gateway, ffprobe_route):
+    if ffprobe_route:
+        row, disk = _setup(
+            gateway,
+            file_mov_document(
+                video_codec="h264", resolution=(480, 272), audio_codecs=("aac",)
+            ),
+            OriginalFile(FILE_ORIGINAL, "video"),
+            FILE_OUTPUT,
+            ("prores", (1920, 1080), ("pcm_s24le", "pcm_s24le")),
+            description=PRORES_DESCRIPTION,
+        )
+        assert row.plan["technical_source"] == "ffprobe"
+    else:
+        row, disk = _setup(
+            gateway,
+            file_mov_document(),
+            OriginalFile(FILE_ORIGINAL, "video"),
+            FILE_OUTPUT,
+            ("prores", (1920, 1080), ("pcm_s24le", "pcm_s24le")),
+        )
+        assert row.plan.get("technical_source") != "ffprobe"
+    Executor(gateway, disk).run(row)
+    row.refresh_from_db()
+    assert row.phase == "done" and row.error == ""
+    return row
+
+
+def _restated(gateway, row, before, after):
+    row.rollback["item_fields"]["durationSeconds"] = before
+    gateway.items[ITEM]["durationSeconds"] = after
+
+
+def test_ffprobe_row_tolerates_vidispines_microsecond_rerendering(migrated_db):
+    gateway = InMemoryGateway()
+    row = _applied(gateway, True)
+    _restated(gateway, row, ["191.55803333333333"], ["191.558033"])
+    assert verify_item(row, gateway) == []
+
+
+@pytest.mark.parametrize(
+    "before, after",
+    [
+        (["191.558033"], ["191.558034"]),
+        (["191.558033"], ["191.558032"]),
+        (["191.558033"], ["abc"]),
+        (["abc"], ["191.558033"]),
+        (["191.558033"], None),
+        (None, ["191.558033"]),
+        (["191.558033"], []),
+        (["191.558033"], ["191.558033", "191.558033"]),
+    ],
+)
+def test_ffprobe_row_still_fails_on_a_real_duration_change(migrated_db, before, after):
+    gateway = InMemoryGateway()
+    row = _applied(gateway, True)
+    _restated(gateway, row, before, after)
+    if after is None:
+        del gateway.items[ITEM]["durationSeconds"]
+    problems = verify_item(row, gateway)
+    assert len(problems) == 1 and problems[0].startswith("durationSeconds ")
+
+
+def test_non_ffprobe_row_keeps_the_exact_duration_comparison(migrated_db):
+    gateway = InMemoryGateway()
+    row = _applied(gateway, False)
+    _restated(gateway, row, ["191.55803333333333"], ["191.558033"])
+    assert verify_item(row, gateway) == [
+        "durationSeconds ['191.558033'] != ['191.55803333333333']"
+    ]
