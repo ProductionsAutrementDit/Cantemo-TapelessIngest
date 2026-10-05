@@ -649,15 +649,16 @@ def plan_item(
 
 
 FILE = "file"
+XDCAM = "xdcam"
 # Measured on prod 2026-10-01: P5's inventory size is the true size plus a
 # small overhead (+178 for 7,720 items, +190/275/276 for ~900).
 P5_OVERHEAD_MAX = 512
-NO_SIZE_PROOF = "no size proof (file)"
+NO_SIZE_PROOF = "no size proof"
 ROUTE = "ffprobe route"
 
 
 def size_problem(
-    exact: Mapping[str, Optional[int]], p5: Optional[int]
+    exact: Mapping[str, Optional[int]], p5: Optional[int], label: str = FILE
 ) -> Optional[str]:
     """Byte identity of a wrapped ``file`` copy and its original, before
     any write. ``exact`` maps each source (``ffprobe``, ``wrapped <id>``,
@@ -672,16 +673,16 @@ def size_problem(
             f"{label} {size}" for label, size in known.items()
         )
     if not known:
-        return f"{NO_SIZE_PROOF}: no exact size known"
+        return f"{NO_SIZE_PROOF} ({label}): no exact size known"
     size = next(iter(known.values()))
     if p5 is not None and not 0 <= p5 - size < P5_OVERHEAD_MAX:
         return (
-            f"P5 size {p5} is not the copy's (file): {p5 - size:+d} bytes from "
+            f"P5 size {p5} is not the copy's ({label}): {p5 - size:+d} bytes from "
             f"{', '.join(known)} {size}, outside [0, {P5_OVERHEAD_MAX})"
         )
     if len({label.split(" ", 1)[0] for label in known}) >= 2 or p5 is not None:
         return None
-    return f"{NO_SIZE_PROOF}: only {', '.join(known)} {size}, no P5 size"
+    return f"{NO_SIZE_PROOF} ({label}): only {', '.join(known)} {size}, no P5 size"
 
 
 def _p5_size(entry: Optional[Mapping[str, Any]]) -> Optional[int]:
@@ -690,7 +691,10 @@ def _p5_size(entry: Optional[Mapping[str, Any]]) -> Optional[int]:
 
 
 def _shared_entity(
-    item_id: str, located: Sequence[Mapping[str, Any]], gateway: Gateway
+    item_id: str,
+    located: Sequence[Mapping[str, Any]],
+    gateway: Gateway,
+    label: str = FILE,
 ) -> Optional[str]:
     """A reused VX-41 entity must not already be another item's: two items
     would then share one original's entity (file route only)."""
@@ -701,7 +705,7 @@ def _shared_entity(
         if others:
             return (
                 f"VX-41 entity {original['file_id']} already belongs to item "
-                f"{', '.join(others)} (file)"
+                f"{', '.join(others)} ({label})"
             )
     return None
 
@@ -722,17 +726,18 @@ def _copy_problem(
     gateway: Gateway,
     ffprobe: Optional[Signature],
     described: bool = False,
+    label: str = FILE,
 ) -> Tuple[Optional[str], bool]:
     """(problem, via_ffprobe): whether the shape's own description is the
     original's (option B). A proxy-copied or ambiguous one is no problem
     when the original's ffprobe is ``described`` in full: the shape is then
     stated from it (``via_ffprobe``)."""
     if _is_binary_only(shape):
-        return f"{BINARY_ONLY} (file)", False
+        return f"{BINARY_ONLY} ({label})", False
     try:
         build_copy_document(shape, "")
     except ShapeMismatch as error:
-        return f"original shape (file) cannot be restated: {error}", False
+        return f"original shape ({label}) cannot be restated: {error}", False
     lowres = [
         shape_signature(s) for s in gateway.tagged_shapes(item_id, fields.LOWRES_TAG)
     ]
@@ -741,36 +746,42 @@ def _copy_problem(
     if verdict in (PROXY, AMBIGUOUS) and described:
         return None, True
     if verdict == PROXY:
-        return f"{PROXY_COPY} (file); ffprobe route pending", False
+        if label != FILE:
+            return f"{PROXY_COPY} ({label}); no ffprobe for this provider", False
+        return f"{PROXY_COPY} ({label}); ffprobe route pending", False
     if verdict == AMBIGUOUS:
-        return "original shape equals the lowres (file); ambiguous", False
+        return f"original shape equals the lowres ({label}); ambiguous", False
     if ffprobe is None and all(s == NO_SIGNATURE for s in lowres):
         # Nothing could have refuted a proxy copy.
-        return "no ffprobe and no lowres to tell a proxy copy (file)", False
+        return f"no ffprobe and no lowres to tell a proxy copy ({label})", False
     # Unlike the lowres is not enough: when the original's ffprobe is known,
     # the description must also agree with it.
     disagreement = probe_disagreement(signature, ffprobe) if ffprobe else None
     if disagreement:
-        return f"original shape disagrees with ffprobe (file): {disagreement}", False
+        return f"original shape disagrees with ffprobe ({label}): {disagreement}", False
     return None, False
 
 
 def _route_problem(
-    description: Mapping[str, Any], item_values: Mapping[str, Any]
+    description: Mapping[str, Any],
+    item_values: Mapping[str, Any],
+    label: str = FILE,
 ) -> Optional[str]:
     """Before any write: the ffprobe is complete, of a format measured
     against Vidispine, and of the duration the item already has."""
     if description.get("problem"):
-        return f"{ROUTE} (file): {description['problem']}"
+        return f"{ROUTE} ({label}): {description['problem']}"
     key = route_format(description)
     if key not in FFPROBE_ROUTE_FORMATS:
-        return f"{ROUTE} (file): format {key} has no Vidispine reference"
+        return f"{ROUTE} ({label}): format {key} has no Vidispine reference"
     try:
         seconds = float(Fraction(description["duration"]))
     except (ValueError, ZeroDivisionError):
-        return f"{ROUTE} (file): duration {description['duration']!r} is not a number"
+        return (
+            f"{ROUTE} ({label}): duration {description['duration']!r} is not a number"
+        )
     return _duration_problem(
-        f"{ROUTE} (file)",
+        f"{ROUTE} ({label})",
         item_values,
         "ffprobe duration",
         seconds,
@@ -790,8 +801,10 @@ def plan_file_item(
     ffprobe: Optional[Signature] = None,
     ffprobe_size: Optional[int] = None,
     ffprobe_description: Optional[Dict[str, Any]] = None,
+    provider: str = FILE,
 ) -> PlanResult:
-    """A wrapped ``file`` item: its wrapped file is a byte-for-byte copy
+    """A wrapped ``file`` item (or ``xdcam``, the same copy route labelled
+    ``provider`` and never given an ffprobe): its wrapped file is a byte-for-byte copy
     of ONE original, so a genuine original shape is restated whole onto
     it (``technical_source`` "copy"); a proxy-copied one is stated from the
     original's ffprobe (``technical_source`` "ffprobe", which stores the
@@ -803,7 +816,7 @@ def plan_file_item(
     if len(shapes) != 1:
         return PlanResult(verdicts.UNEXPECTED, f"{len(shapes)} original shapes")
     (shape,) = shapes
-    provider = {"provider": FILE}
+    provider_key = {"provider": provider}
 
     if original is None:
         original = _file_original(shape)
@@ -813,19 +826,27 @@ def plan_file_item(
                 "no ClipFile and the original shape does not name one VX-41 file",
             )
     if _names_originals(shape, [original]):
-        result = _complete(item_id, shape, [original], gateway, archive, disk, provider)
-        shared = _shared_entity(item_id, result.plan["originals"], gateway)
+        result = _complete(
+            item_id, shape, [original], gateway, archive, disk, provider_key
+        )
+        shared = _shared_entity(item_id, result.plan["originals"], gateway, provider)
         return PlanResult(verdicts.UNEXPECTED, shared) if shared else result
 
     if not shape.files():
         return PlanResult(
-            verdicts.UNEXPECTED, f"{FILELESS} (file): not measured for this provider"
+            verdicts.UNEXPECTED,
+            f"{FILELESS} ({provider}): not measured for this provider",
         )
     problem = _attachment_problem(shape, output_file)
     via_ffprobe = False
     if not problem:
         problem, via_ffprobe = _copy_problem(
-            item_id, shape, gateway, ffprobe, ffprobe_description is not None
+            item_id,
+            shape,
+            gateway,
+            ffprobe,
+            ffprobe_description is not None,
+            provider,
         )
     if problem:
         return PlanResult(verdicts.UNEXPECTED, problem)
@@ -833,7 +854,7 @@ def plan_file_item(
     item_values = gateway.item_fields(item_id, ROLLBACK_ITEM_FIELDS)
     technical: Dict[str, Any] = {"technical_source": "copy"}
     if via_ffprobe:
-        problem = _route_problem(ffprobe_description, item_values)
+        problem = _route_problem(ffprobe_description, item_values, provider)
         if problem:
             return PlanResult(verdicts.UNEXPECTED, problem)
         # The container states the duration the item already has: apply and
@@ -844,7 +865,7 @@ def plan_file_item(
         try:
             build_ffprobe_document(ffprobe_description, "", microseconds)
         except ShapeMismatch as error:
-            return PlanResult(verdicts.UNEXPECTED, f"{ROUTE} (file): {error}")
+            return PlanResult(verdicts.UNEXPECTED, f"{ROUTE} ({provider}): {error}")
         technical = {
             "technical_source": "ffprobe",
             "ffprobe": ffprobe_description,
@@ -859,21 +880,21 @@ def plan_file_item(
     if found["on_disk"]:
         exact["disk"] = disk.size(original.relative)
     p5 = _p5_size(found["entry"])
-    problem = size_problem(exact, p5)
+    problem = size_problem(exact, p5, provider)
     if problem:
         return PlanResult(verdicts.UNEXPECTED, problem)
     known = {label: size for label, size in exact.items() if size is not None}
     refused = _located_problem(located)
     if refused:
         return refused
-    shared = _shared_entity(item_id, located, gateway)
+    shared = _shared_entity(item_id, located, gateway, provider)
     if shared:
         return PlanResult(verdicts.UNEXPECTED, shared)
     return PlanResult(
         verdicts.READY,
         plan={
             "kind": "wrap",
-            **provider,
+            **provider_key,
             "wrapped_shape_id": shape.shape_id,
             "wrapped_shape": shape.to_document(),
             **_wrapped_files(shape),
