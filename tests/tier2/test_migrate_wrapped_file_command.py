@@ -242,8 +242,8 @@ def test_provider_file_is_refused_outside_plan(migrated_db, action):
 
 
 def test_an_unknown_provider_is_refused(migrated_db):
-    with pytest.raises(CommandError, match="invalid choice: 'xdcam'"):
-        _run(_world(), "plan", "--provider", "xdcam")
+    with pytest.raises(CommandError, match="invalid choice: 'bogus'"):
+        _run(_world(), "plan", "--provider", "bogus")
 
 
 def test_provider_p2_stays_accepted_for_every_action(migrated_db):

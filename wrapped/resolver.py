@@ -39,6 +39,7 @@ from portal.plugins.TapelessIngest.wrapped.span import (
 
 P2_PROVIDER = "panasonicP2"
 FILE_PROVIDER = "file"
+XDCAM_PROVIDER = "xdcam"
 
 
 class ResolveError(Exception):
