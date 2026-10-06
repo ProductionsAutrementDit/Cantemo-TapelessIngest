@@ -29,6 +29,13 @@ Spec: _bmad-output/implementation-artifacts/spec-wrapped-items-migration-p2.md
           Clip.folder_path), for items whose Vidispine side already names
           the folder P5 knows
 
+  realign-clipfile
+          per item: an UNEXPECTED "attached file ..." row whose ONE ClipFile
+          names a shoot folder as it was before a rename gets the path of
+          its original shape's one VX-41 file (same basename, known to P5).
+          Only ClipFile.path is written (old values backed up first to
+          --backup, required unless --dryrun); re-plan the items afterwards
+
 Never interactive. A row whose phase is non-empty is frozen against plan.
 """
 
@@ -67,6 +74,7 @@ from portal.plugins.TapelessIngest.wrapped.planner import (
     plan_file_item,
     plan_item,
 )
+from portal.plugins.TapelessIngest.wrapped.realign import ALIGNED, REALIGN, examine
 from portal.plugins.TapelessIngest.wrapped.relocate import (
     PreexistingVerifyFailure,
     Relocator,
@@ -109,7 +117,13 @@ AUDIO_BITS = "audio_bits_per_sample"
 _RELOCATE_OPTIONS = (("from_prefix", "--from"), ("to_prefix", "--to"))
 _RELOCATE_OPTIONS += (("backup", "--backup"),)
 # ClipFile.path keeps the legacy mount points; this is what they share.
-_DRYRUN_ACTIONS = ("apply", "relocate", "backfill-original-filename")
+_DRYRUN_ACTIONS = (
+    "apply",
+    "relocate",
+    "realign-clipfile",
+    "backfill-original-filename",
+)
+_ATTACHED_FILE = "attached file "
 _RUSHES_MARKER = "RUSHES TAPELESS/"
 
 
@@ -199,6 +213,7 @@ class Command(BaseCommand):
                 "report",
                 "templates",
                 "relocate",
+                "realign-clipfile",
                 "backfill-original-filename",
             ),
         )
@@ -268,9 +283,10 @@ class Command(BaseCommand):
         )
         parser.add_argument(
             "--backup",
-            help="relocate: new JSON file for the old values of every rewritten "
-            "ClipFile and Clip (required unless --dryrun). The database step "
-            "is folder-wide: --item, --collection and --limit do not scope it",
+            help="relocate, realign-clipfile: new JSON file for the old values of "
+            "every rewritten ClipFile and Clip (required unless --dryrun). relocate's "
+            "database step is folder-wide: --item, --collection and --limit do "
+            "not scope it",
         )
         parser.add_argument(
             "--portal-only",
@@ -288,8 +304,8 @@ class Command(BaseCommand):
             raise CommandError("--limit must be a positive integer")
         if options["dryrun"] and options["action"] not in _DRYRUN_ACTIONS:
             raise CommandError(
-                "--dryrun only applies to 'apply', 'relocate' and "
-                "'backfill-original-filename'"
+                "--dryrun only applies to 'apply', 'relocate', "
+                "'realign-clipfile' and 'backfill-original-filename'"
             )
         if options["delete_online_wrapped"] and options["action"] != "apply":
             raise CommandError("--delete-online-wrapped only applies to 'apply'")
@@ -316,12 +332,16 @@ class Command(BaseCommand):
         if options["min_share"] is not None and not 0 < options["min_share"] <= 1:
             raise CommandError("--min-share must be in (0, 1]")
         for name, flag in _RELOCATE_OPTIONS:
+            if name == "backup" and options["action"] == "realign-clipfile":
+                continue
             if options[name] is not None and options["action"] != "relocate":
                 raise CommandError(f"{flag} only applies to 'relocate'")
         if options["portal_only"] and options["action"] != "relocate":
             raise CommandError("--portal-only only applies to 'relocate'")
         if options["action"] == "relocate":
             self._check_relocate(options)
+        if options["action"] == "realign-clipfile":
+            self._check_backup(options, "realign-clipfile")
         getattr(self, "_" + options["action"].replace("-", "_"))(options)
 
     @staticmethod
@@ -337,9 +357,13 @@ class Command(BaseCommand):
         if new.startswith(old):
             # A relocated path would match --from again on the next run.
             raise CommandError("--to must not be inside --from")
+        Command._check_backup(options, "relocate")
+
+    @staticmethod
+    def _check_backup(options, action):
         if not options["dryrun"]:
             if not options["backup"]:
-                raise CommandError("relocate needs --backup (or --dryrun)")
+                raise CommandError(f"{action} needs --backup (or --dryrun)")
             if os.path.exists(options["backup"]):
                 raise CommandError(
                     f"--backup {options['backup']} already exists; never overwritten"
@@ -487,6 +511,66 @@ class Command(BaseCommand):
                 row.error = ""
                 row.save(update_fields=["error", "updated_on"])
         self.stdout.write(f"applied: {done}, failed: {failed}")
+
+    def _realign_clipfile(self, options):
+        """Read-only pass over every selected row, then one transaction."""
+        rows = WrappedMigration.objects.filter(
+            verdict=verdicts.UNEXPECTED, phase="", reason__startswith=_ATTACHED_FILE
+        ).order_by("item_id")
+        if options["item_id"]:
+            rows = rows.filter(item_id=options["item_id"])
+        if options["limit"]:
+            rows = rows[: options["limit"]]
+        gateway = self.gateway_factory()
+        archive = CachedArchive(self.archive_factory())
+        counts = Counter()
+        changes = []
+        for row in rows:
+            clipfiles = list(
+                ClipFile.objects.filter(clip_id=row.clip_umid)
+                .order_by("pk")
+                .values_list("pk", "path")
+            )
+            outcome = examine(row.item_id, clipfiles, gateway, archive)
+            if outcome.kind == REALIGN:
+                counts["realigned"] += 1
+                changes.append(outcome)
+                self.stdout.write(
+                    f"{row.item_id}: clipfile {outcome.clipfile_pk}: "
+                    f"{outcome.old} -> {outcome.new}"
+                )
+            elif outcome.kind == ALIGNED:
+                counts["aligned"] += 1
+                self.stdout.write(f"{row.item_id}: already aligned")
+            else:
+                counts["skipped"] += 1
+                self.stdout.write(f"{row.item_id}: skipped: {outcome.why}")
+        dry = options["dryrun"]
+        if changes and not dry:
+            saved = [
+                {
+                    "item_id": c.item_id,
+                    "clipfile_pk": c.clipfile_pk,
+                    "old": c.old,
+                    "new": c.new,
+                }
+                for c in changes
+            ]
+            with open(options["backup"], "x", encoding="utf-8") as handle:
+                json.dump(saved, handle, indent=1)
+                handle.write("\n")
+            with transaction.atomic():
+                for c in changes:
+                    ClipFile.objects.filter(pk=c.clipfile_pk).update(path=c.new)
+        summary = (
+            f"realigned: {counts['realigned']}, "
+            f"already aligned: {counts['aligned']}, skipped: {counts['skipped']}"
+        )
+        if dry:
+            summary = "dry run: nothing written; " + summary
+        elif changes:
+            summary += "; re-plan these items to complete them"
+        self.stdout.write(summary)
 
     def _relocate(self, options):
         old, new = options["from_prefix"], options["to_prefix"]
