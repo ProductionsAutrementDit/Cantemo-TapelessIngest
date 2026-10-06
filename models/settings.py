@@ -18,6 +18,9 @@ class Settings(models.Model):
     # then the known install locations. Fill it in only when REDline
     # lives somewhere unusual.
     redline_path = models.CharField(max_length=255, blank=True, default="")
+    # Read by providers/braw.py, the same way: empty means PATH, then
+    # /usr/local/bin/brawprobe (built from tools/brawprobe).
+    brawprobe_path = models.CharField(max_length=255, blank=True, default="")
     base_folder = models.CharField(max_length=255, blank=True, default="")
 
     collections_ignore_folder_str = models.TextField(

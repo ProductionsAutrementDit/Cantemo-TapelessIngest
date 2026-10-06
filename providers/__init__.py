@@ -22,5 +22,6 @@ PROVIDER_NAMES = (
     "red",
     "avchd",
     "atomos",
+    "braw",
     "file",
 )

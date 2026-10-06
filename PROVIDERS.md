@@ -104,6 +104,12 @@ def getAvailableMetadatas(self):
     return ()
 ```
 
+The metadata-mapping form (`forms.get_provider_metadatas`) offers the
+UNION over `PROVIDER_NAMES`: the base provider's 13 keys first, then each
+provider's own in registry order, duplicates dropped. A provider that
+stores keys of its own (`braw`'s `braw_*`) overrides this hook to list
+them after the base keys.
+
 #### File Management Methods
 
 ```python
@@ -304,7 +310,8 @@ budget and importing.
 - **`None` — the default — keeps today's behaviour.** A provider that
   can answer the verdict but cannot describe its own essence must not be
   handed a route that would have to guess a codec, a resolution and a
-  frame rate on its behalf. That is what holds this route at `red`.
+  frame rate on its behalf. That is what holds this route at `red` and
+  `braw`, the two providers that compose one.
 - **Be pure.** Dicts in, a dict out: no Vidispine, no filesystem, no
   database, no subprocess. The document a production item receives is
   then readable in a unit test.
@@ -339,6 +346,15 @@ budget and importing.
   `.wav` that cannot be read fails the clip by name; a sample width that
   has never been measured omits `sampleFormat` instead of extrapolating
   it.
+- **`braw` has no reference shape at all.** Vidispine has never built a
+  shape for a `.braw`, so `braw`'s document names the format
+  (`braw` / `video/x-braw`) and states only what brawprobe measured and
+  the scan stored: frames, snapped frame rate, resolution and — when the
+  clip recorded sound — ONE `audioComponent` on the anchor, `itemTrack`
+  `A1`, from the SDK's own channel count, rate, bit depth and sample
+  count. Pixel format, bit depth, stream ids and timecode fields are
+  omitted. The document is built from the stored `ClipMetadata`;
+  brawprobe never runs at import.
 
 #### Import Configuration
 
@@ -390,6 +406,64 @@ on success, so the exit status never gates parsing.
 - Detects when R3D files span multiple parts
 - Groups by base filename (e.g., `A001_C001_*.R3D`)
 - Creates master clip with related segments
+
+### Blackmagic RAW Provider
+**File**: [providers/braw.py](providers/braw.py)
+**Format**: Blackmagic RAW (`.braw`, any case)
+
+**Detection**: extension `.braw`, guarded case-insensitively; no card
+structure, no sidecar. Registered just before `file`, which does NOT
+declare `.braw` and must not.
+
+**Metadata Extracted** — everything, once, at scan time. The provider
+runs `brawprobe -- <clip>` (`tools/brawprobe`, see its README) and stores:
+- **Every clip-scope and frame-0 metadata key** the SDK yields, as
+  `braw_<key>` (key whitespace-trimmed). A frame-0 key goes under
+  `braw_frame0_` only when the clip carries the same key
+  (`analog_gain`). Values are strings: scalars as text, arrays of 2–4
+  numbers joined (`braw_crop_size` = `6048x3200`, `braw_sensor_rate` =
+  `48/1`), anything else as compact JSON. Against the 200-character
+  `ClipMetadata` columns: a NAME over 200 is skipped with a warning,
+  never cut; a JSON value over 200 is skipped (a cut would not be JSON);
+  a value read back at import (`braw_probe_clip`, the shape's numbers,
+  `braw_anamorphic*`, `clipname`) over 200 refuses the clip; any other
+  value is truncated with a warning. Nothing overwrites silently: the
+  technical `braw_probe_*` keys win, and a raw key landing on a name
+  already stored (`probe_width`, two keys equal once trimmed) is kept as
+  `<name>_raw` (`_raw2`…) with a warning. Never stored:
+  `post_3dlut_*_data` (the LUT itself; its name, title, size and mode
+  are kept) and the `lens_distortion_correction_polynomial*` /
+  `lens_shading_*` arrays.
+- **The technical fields** as `braw_probe_<field>`: width, height,
+  frame count, snapped frame rate and sensor rate (`num`/`den`, plus the
+  SDK's reported float), `offspeed`, frame-0 timecode, gamma, gamut,
+  audio channels / rate / bits / samples. brawprobe's snapped rates are
+  the authority (it carries brawdump's `snapRate`); the Python port
+  `snap_rate` only cross-checks the reported floats and logs a warning on
+  a disagreement. `offspeed` is snapped sensor rate ≠ snapped frame
+  rate.
+- **The common keys**: `clipname` (`clip_number`), `timecode`,
+  `framerate` (`num/den`), `duration` (seconds), `shooting_date`
+  (`date_recorded` as `YYYY-MM-DD`), `device_manufacturer`,
+  `device_model` (`camera_type`), `device_serial` (`camera_id`),
+  `video_codec` (`Blackmagic RAW 12:1`), `aspect_ratio` (reduced `w:h`).
+
+**Clip key**: `umid = uuid5(BRAW_NAMESPACE, "camera_id|date_recorded|clip_number")`,
+each value stripped. `camera_id` identifies the camera, not the clip, and
+BRAW has no per-clip id. A clip missing any of the three is refused with
+a `TapelessIngestException` naming the key — never keyed on a hash.
+
+**Failures**: brawprobe is resolved like REDline (`Settings.brawprobe_path`,
+which must then be an absolute path to an executable, else PATH, else
+`/usr/local/bin/brawprobe`) and run as `[binary, "--", path]`, without a
+shell. A
+non-zero exit (4: the SDK refused the clip) raises
+`TapelessIngestException` with the exit status and a stderr excerpt; the
+clip is not ingested.
+
+**Import**: `getClipMainMediaFile` declares `MAIN_FILE_YIELDS_VIDEO:
+False`, so the clip takes the shape route (`buildShapeDocument`, see
+*Composing the shape yourself*) followed by the `lowres-forge` transcode.
 
 ### Sony XDCAM Provider
 **File**: [providers/xdcam.py](providers/xdcam.py)
@@ -774,20 +848,22 @@ class Provider(Provider):
 
 ### Step 6: Register Provider
 
-Add to `PROVIDERS_LIST` in [models/clip.py](models/clip.py:50-59):
+Add to `PROVIDER_NAMES` in [providers/__init__.py](providers/__init__.py),
+the single source of truth (see [docs/adding-a-provider.md](docs/adding-a-provider.md)):
 
 ```python
-PROVIDERS_LIST = [
-    "red",
+PROVIDER_NAMES = (
     "panasonicP2",
     "xdcam",
     "hdslr",
     "zoom",
+    "red",
     "avchd",
     "atomos",
+    "braw",
     "myformat",  # Add your provider
-    "file",
-]
+    "file",      # always last
+)
 ```
 
 ### Step 7: Test Provider

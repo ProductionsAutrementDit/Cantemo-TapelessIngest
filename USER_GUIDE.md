@@ -424,11 +424,13 @@ Two states are not resumed:
 
 **Sources Vidispine cannot decode.** Some media yields no video essence
 to Vidispine's shape deduction — every `.R3D` whose start timecode
-carries the drop-frame flag, for instance. Those produce a *binary*
-component, which satisfies the container slot and no video slot.
+carries the drop-frame flag, for instance, and every Blackmagic RAW
+`.braw` (neither Vidispine nor ffprobe can read one). Those produce a
+*binary* component, which satisfies the container slot and no video
+slot.
 
 For a provider that can describe its own essence — today that is `red`
-and only `red` — the plugin no longer imports such a clip at all. It
+and `braw` — the plugin no longer imports such a clip at all. It
 **posts the whole `original` shape itself** and then asks for the proxy
 explicitly:
 
@@ -441,7 +443,11 @@ explicitly:
    the `.wav`'s own header and declared as an audio component, so the
    sound is never silently left off the item; a `.wav` the standard
    `wave` reader refuses (RF64, floating-point) fails the clip by name
-   too, rather than posting a shape without its sound;
+   too, rather than posting a shape without its sound. For a `.braw`, the
+   document is composed from what brawprobe measured at scan time and
+   the scan stored (frames, frame rate, resolution, and the embedded
+   audio's channels, rate, bit depth and length when the clip recorded
+   sound); brawprobe is never run again at import;
 2. it is `POST`ed to `/API/item/{id}/shape/create?tag=original&updateItemMetadata=true`.
    The `updateItemMetadata` half is what makes the ITEM state its
    duration, its resolution and its codec; without it the shape is
@@ -467,7 +473,8 @@ removal.
 Providers that cannot compose a shape document keep the old behaviour
 exactly: the declared component count leaves the video slot out for the
 main file, and the clip is imported as before. Every provider but `red`
-keeps counting its main file as a video contributor in the first place.
+and `braw` keeps counting its main file as a video contributor in the
+first place.
 
 ### Dry Run Mode
 
@@ -723,6 +730,17 @@ aspect_ratio      -> originalVideoField/aspectRatio
 user_clip_name    -> description
 ```
 
+**Provider-specific keys**: the provider-field list offers the 13 common
+keys first, then every key a registered provider stores of its own. For
+Blackmagic RAW that is every `braw_*` key — the camera's clip metadata
+(`braw_lens_type`, `braw_reel_name`, `braw_scene`, `braw_take`,
+`braw_good_take`…), frame 0's (`braw_iso`, `braw_aperture`,
+`braw_white_balance_kelvin`…; `braw_frame0_<key>` when the clip carries
+the same key) and brawprobe's technical fields (`braw_probe_*`). Keys a
+newer camera adds appear in the list as soon as one of its clips has
+been scanned — within 5 minutes: the list of stored names is cached
+for that long.
+
 ### Performance Optimization
 
 **Storage Performance**:
@@ -807,6 +825,7 @@ Email: [Contact via studiopad.fr](http://www.studiopad.fr)
 | Provider | Spanned | Multi-Audio | XML | UMID |
 |----------|---------|-------------|-----|------|
 | RED | Yes | Yes | Yes | Yes |
+| Blackmagic RAW | No | No | No | Yes** |
 | XDCAM | No | Yes | Yes | Yes |
 | P2 | No | Yes | Yes | Yes |
 | HDSLR | No | No | Partial | No* |
@@ -816,6 +835,12 @@ Email: [Contact via studiopad.fr](http://www.studiopad.fr)
 | File | No | No | No | No* |
 
 \* UMID generated from file hash
+
+\** `uuid5` of the clip's `camera_id`, `date_recorded` and `clip_number`;
+only `*.braw` and `*.BRAW` are discovered — a mixed-case `.Braw` file is
+not found by the scan (rename it);
+a clip missing any of them is refused, never keyed on a hash. Requires
+`brawprobe` on the server (see `tools/brawprobe/README.md`).
 
 ### Keyboard Shortcuts (UI)
 

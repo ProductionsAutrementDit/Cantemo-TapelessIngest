@@ -33,7 +33,7 @@ Complete documentation for the Cantemo Portal TapelessIngest plugin.
 **Audience**: Developers extending the plugin, format specialists
 
 **Key Topics**:
-- RED, XDCAM, P2, HDSLR, AVCHD, Atomos, Zoom providers
+- RED, Blackmagic RAW, XDCAM, P2, HDSLR, AVCHD, Atomos, Zoom providers
 - Provider method reference
 - Step-by-step custom provider creation
 - Format-specific folder structures
@@ -157,7 +157,10 @@ Django models representing media and storage folders.
 - **Clip**: [README.md](README.md#clip)
 
 ### Metadata Mapping
-Configurable mapping between camera and Portal metadata fields.
+Configurable mapping between camera and Portal metadata fields. The
+provider-field list is the union over the registered providers: the 13
+common keys first, then provider-specific ones such as Blackmagic RAW's
+`braw_*`.
 - **Configuration**: [README.md](README.md#metadata-mapping)
 - **API**: [API.md](API.md#metadata-mapping-operations)
 
@@ -170,6 +173,14 @@ Multi-file clips spanning across multiple media files.
 One item whose media is several files (span files, or a separate audio track); the ingest waits for the components to attach before importing the main file, and a failure leaves a resumable item.
 - **User Guide**: [USER_GUIDE.md](USER_GUIDE.md#multi-component-import)
 - **Provider Impl**: [PROVIDERS.md](PROVIDERS.md#the-main-files-own-video-component)
+
+### Blackmagic RAW
+`.braw` clips are probed once at scan time by `tools/brawprobe` (built
+on the Portal server against the Blackmagic RAW SDK RPM); every clip and
+frame-0 metadata key is stored, and the `original` shape is posted from
+the stored values.
+- **Provider**: [PROVIDERS.md](PROVIDERS.md#blackmagic-raw-provider)
+- **Build**: [tools/brawprobe/README.md](tools/brawprobe/README.md)
 
 ### Legacy Storage Migration
 Re-importing media from old storages using hash matching.
@@ -226,7 +237,12 @@ Re-importing media from old storages using hash matching.
 - [ ] Detection methods implemented
 - [ ] Metadata extraction implemented
 - [ ] File management methods implemented
-- [ ] Provider registered in PROVIDERS_LIST
+- [ ] Provider registered in `PROVIDER_NAMES` (`providers/__init__.py`)
+- [ ] Golden search doc re-recorded after human sign-off
+      (`PYTHONHASHSEED=0 python tests/tier1/build_golden_doc.py >
+      tests/fixtures/golden_search_doc.json`) — registering a provider
+      changes the discovery query
+- [ ] Real probe outputs committed as test fixtures (`tests/fixtures/<provider>/`)
 - [ ] Tested with sample media
 
 **Reference**: [PROVIDERS.md](PROVIDERS.md#creating-a-custom-provider)
@@ -312,6 +328,7 @@ TapelessIngest/
 ├── models/            # Data models
 ├── providers/         # Format providers
 ├── templates/         # UI templates
+├── tools/brawprobe/   # Blackmagic RAW probe CLI (C++, built on the server)
 └── ...
 ```
 

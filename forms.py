@@ -4,15 +4,58 @@ from portal.plugins.TapelessIngest.models.settings import Settings, MetadataMapp
 
 
 def get_provider_metadatas():
+    """Every mappable provider key: the base 13 first, then each registry
+    provider's own (``PROVIDER_NAMES`` order), duplicates dropped.
 
+    A provider that cannot be loaded or listed costs its own keys only —
+    the mapping page must still open."""
+    import logging
+
+    from portal.plugins.TapelessIngest.models.clip import Clip
+    from portal.plugins.TapelessIngest.providers import PROVIDER_NAMES
     from portal.plugins.TapelessIngest.providers.providers import (
         Provider as BaseProvider,
     )
 
-    provider = BaseProvider()
-    provider_metadatas = provider.getAvailableMetadatas()
+    provider_metadatas = []
+    seen = set()
 
-    return provider_metadatas
+    def add(entries):
+        for key, label in entries:
+            if key not in seen:
+                seen.add(key)
+                provider_metadatas.append((key, label))
+
+    add(BaseProvider().getAvailableMetadatas())
+    for name in PROVIDER_NAMES:
+        try:
+            add(Clip.get_provider_by_name(name).getAvailableMetadatas())
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "provider %s: its mappable metadatas could not be listed", name
+            )
+
+    return tuple(provider_metadatas)
+
+
+# The mapping formset builds one MetadataMappingForm per mapping row; the
+# union is computed once per form build and reused for this long.
+PROVIDER_METADATAS_TTL_SECONDS = 10
+_provider_metadatas_cache = None  # (expires at, choices)
+
+
+def provider_metadata_choices():
+    """``get_provider_metadatas()``, memoized for a form build."""
+    import time
+
+    global _provider_metadatas_cache
+    now = time.monotonic()
+    cached = _provider_metadatas_cache
+    if cached is not None and cached[0] > now:
+        return cached[1]
+    choices = get_provider_metadatas()
+    _provider_metadatas_cache = (now + PROVIDER_METADATAS_TTL_SECONDS, choices)
+    return choices
 
 
 def get_system_fields():
@@ -63,7 +106,7 @@ class MetadataMappingForm(forms.ModelForm):
     def __init__(self, *args, **kwargs):
         super(MetadataMappingForm, self).__init__(*args, **kwargs)
         self.fields["metadata_provider"] = forms.ChoiceField(
-            choices=(("", "Select a provider field"),) + get_provider_metadatas(),
+            choices=(("", "Select a provider field"),) + provider_metadata_choices(),
             required=False,
         )
         self.fields["metadata_portal"] = forms.ChoiceField(

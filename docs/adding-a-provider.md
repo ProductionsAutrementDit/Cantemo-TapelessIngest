@@ -163,3 +163,64 @@ dict, so their runtime reach is wider than their declaration — the
 superset rule is violated for the whole family, and the pre-filter
 therefore changes which subclass wins for several suffixes. This is
 recorded as deferred work; do not model a new provider on them.
+
+## Optional hooks the newer providers use
+
+`red` and `braw` show three hooks beyond the extraction contract.
+
+* **`getAvailableMetadatas()`** — the keys the metadata-mapping form
+  offers. The form takes the UNION over `PROVIDER_NAMES`
+  (`forms.get_provider_metadatas`): the base provider's 13 keys first,
+  then each provider's own, duplicates dropped. Override it only to ADD
+  keys you store (`braw` lists every `braw_*` key: a measured inventory
+  plus the names already stored for `braw` clips), and return the base
+  13 first. A provider whose listing raises costs only its own keys.
+* **`MAIN_FILE_YIELDS_VIDEO: False` + `buildShapeDocument()`** — for a
+  format Vidispine cannot decode. The clip then takes the shape route:
+  the plugin posts the whole `original` shape your pure builder returns
+  and requests the `lowres-forge` transcode itself (see PROVIDERS.md,
+  *Composing the shape yourself*). Build it from the metadatas the scan
+  STORED; never re-run a probe at import.
+* **An external binary at scan time** — resolve an ABSOLUTE path (a
+  `Settings` field, then `shutil.which`, then the known install
+  location: cron's PATH does not carry `/usr/local/bin`), call it with
+  an argv list and no shell, give it a timeout, and turn a non-zero exit
+  into a `TapelessIngestException` carrying the exit status and a stderr
+  excerpt. `red` (REDline) and `braw` (`brawprobe`) both do.
+
+`braw` also illustrates a case-insensitive guard: it declares `.braw`
+lowercase, which is a superset for the extraction pre-filter (it
+compares lowercased suffixes) and which discovery widens to `*.braw` and
+`*.BRAW`. A mixed-case `.Braw` is not discovered by the wildcard pair at
+all — the same limitation every provider has.
+
+### Deploying `braw` and `brawprobe` on the Portal server
+
+`braw` needs `tools/brawprobe` built on the server against the installed
+Blackmagic RAW SDK RPM (nothing of the SDK is committed). The server has
+no git: the plugin arrives as a git bundle, deployed as usual, and the
+tool is built from the deployed tree.
+
+1. **Check the toolchain first** — `g++` and `make`, and C++17:
+   ```sh
+   command -v g++ make && g++ --version
+   echo 'int main(){ if constexpr (true) return 0; }' | g++ -std=c++17 -x c++ - -o /dev/null && echo c++17 ok
+   ls /usr/lib64/blackmagic/BlackmagicRAWSDK/Linux/{Include,Libraries}
+   ```
+   No compiler on the server means building elsewhere on the same
+   distribution and copying only the binary.
+2. **Apply migration `0021_settings_brawprobe_path`** before opening the
+   settings page (the form reads the new column). Empty setting =
+   auto-detect.
+3. **Build and install** to the location cron finds without PATH:
+   ```sh
+   make -C tools/brawprobe                    # SDK_DIR defaults to the RPM path
+   install -m 0755 tools/brawprobe/brawprobe /usr/local/bin/brawprobe
+   /usr/local/bin/brawprobe -- /mnt/PAD_Storage/<some clip>.braw | python3 -m json.tool
+   ```
+4. **Rollback**: remove `/usr/local/bin/brawprobe` (and empty
+   `brawprobe_path` if it was set). The provider then refuses every
+   `.braw` cleanly, with "brawprobe not found" in the scan report, and
+   nothing else changes; clips already ingested keep their shapes.
+
+See `tools/brawprobe/README.md` for the output contract and exit codes.

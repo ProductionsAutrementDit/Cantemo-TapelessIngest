@@ -90,6 +90,7 @@ Extensible camera format handlers:
 |----------|------|--------|
 | `Provider` (Base) | `providers.py` | Base class |
 | `REDProvider` | `red.py` | RED camera |
+| `BRAWProvider` | `braw.py` | Blackmagic RAW (`.braw`, via `tools/brawprobe`) |
 | `XDCAMProvider` | `xdcam.py` | Sony XDCAM |
 | `PanasonicP2Provider` | `panasonicP2.py` | Panasonic P2 |
 | `HDSLRProvider` | `hdslr.py` | HDSLR cameras |
@@ -189,13 +190,27 @@ Used for file discovery:
 | `bmxtranswrap` | CharField | BMX tool path |
 | `mxf2raw` | CharField | MXF tool path |
 | `ffmpeg_path` | CharField | FFmpeg path |
+| `redline_path` | CharField | REDline binary (empty: PATH, then known locations) |
+| `brawprobe_path` | CharField | brawprobe binary (empty: PATH, then `/usr/local/bin/brawprobe`) |
 | `base_folder` | CharField | Base scan folder |
 | `collections_ignore_folder_str` | TextField | Folders to ignore |
 | `collections_rename_folder_str` | TextField | Folder renaming rules |
 
 ### Metadata Mappings
 
-Maps provider metadata fields to Portal/Vidispine fields.
+Maps provider metadata fields to Portal/Vidispine fields. The form's
+provider-field choices are the union of `getAvailableMetadatas()` over
+`PROVIDER_NAMES` (`forms.get_provider_metadatas`): the base 13 first,
+then each provider's own keys (`braw_*`), duplicates dropped.
+
+### External binaries
+
+Two providers shell out at SCAN time, never at import, and never through
+a shell: `red` runs REDline, `braw` runs `brawprobe` (`tools/brawprobe`,
+a C++ CLI built on the server against the Blackmagic RAW SDK RPM; the
+SDK is never vendored). Both resolve an absolute path — the setting,
+then PATH, then a known install location — because cron's PATH does not
+carry `/usr/local/bin`.
 
 ## Security Considerations
 
