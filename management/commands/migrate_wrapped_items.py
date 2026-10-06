@@ -284,7 +284,8 @@ class Command(BaseCommand):
         parser.add_argument(
             "--backup",
             help="relocate, realign-clipfile: new JSON file for the old values of "
-            "every rewritten ClipFile and Clip (required unless --dryrun). relocate's "
+            "every rewritten ClipFile (and, for relocate, Clip) (required unless "
+            "--dryrun). relocate's "
             "database step is folder-wide: --item, --collection and --limit do "
             "not scope it",
         )
@@ -556,12 +557,24 @@ class Command(BaseCommand):
                 }
                 for c in changes
             ]
-            with open(options["backup"], "x", encoding="utf-8") as handle:
-                json.dump(saved, handle, indent=1)
-                handle.write("\n")
+            try:
+                with open(options["backup"], "x", encoding="utf-8") as handle:
+                    json.dump(saved, handle, indent=1)
+                    handle.write("\n")
+            except FileExistsError:
+                raise CommandError(
+                    f"--backup {options['backup']} already exists; never overwritten"
+                )
             with transaction.atomic():
                 for c in changes:
-                    ClipFile.objects.filter(pk=c.clipfile_pk).update(path=c.new)
+                    done = ClipFile.objects.filter(pk=c.clipfile_pk, path=c.old).update(
+                        path=c.new
+                    )
+                    if done != 1:
+                        raise CommandError(
+                            f"{c.item_id}: clipfile {c.clipfile_pk} changed since "
+                            f"it was read; nothing written"
+                        )
         summary = (
             f"realigned: {counts['realigned']}, "
             f"already aligned: {counts['aligned']}, skipped: {counts['skipped']}"

@@ -82,7 +82,9 @@ def _path(n):
 def test_dryrun_prints_and_writes_nothing(migrated_db, tmp_path):
     world = _world()
     old = _path(1)
-    out = _run(world, "--dryrun")
+    backup = tmp_path / "b.json"
+    out = _run(world, "--dryrun", "--backup", str(backup))
+    assert not backup.exists()
     new = to_absolute("2019/AH_NEW_1/PRIVATE/CLIP/C0001.MP4")
     pk = ClipFile.objects.get(clip_id="U1").pk
     assert f"VX-1: clipfile {pk}: {old} -> {new}" in out
@@ -169,3 +171,23 @@ def test_item_and_limit_narrow_the_selection(migrated_db):
     assert "VX-2: clipfile" in out and "VX-1" not in out and "VX-3" not in out
     out = _run(world, "--dryrun", "--limit", "2")
     assert "VX-3" not in out and "realigned: 2," in out
+
+
+def test_a_clipfile_changed_since_it_was_read_rolls_everything_back(
+    migrated_db, tmp_path, monkeypatch
+):
+    world = _world()
+    old1 = _path(1)
+    real = migrate_wrapped_items.examine
+
+    def examine_then_change(item_id, *args):
+        outcome = real(item_id, *args)
+        if item_id == "VX-2":
+            ClipFile.objects.filter(clip_id="U2").update(path=LEGACY + "2019/Z/C.MP4")
+        return outcome
+
+    monkeypatch.setattr(migrate_wrapped_items, "examine", examine_then_change)
+    with pytest.raises(CommandError, match="VX-2: clipfile .* changed since"):
+        _run(world, "--backup", str(tmp_path / "b.json"))
+    assert _path(1) == old1
+    assert _path(2) == LEGACY + "2019/Z/C.MP4"
