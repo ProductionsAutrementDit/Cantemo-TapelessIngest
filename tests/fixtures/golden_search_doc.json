@@ -185,6 +185,16 @@
                           },
                           {
                             "wildcard": {
+                              "name": "*.braw"
+                            }
+                          },
+                          {
+                            "wildcard": {
+                              "name": "*.BRAW"
+                            }
+                          },
+                          {
+                            "wildcard": {
                               "name": "*.m2t"
                             }
                           },
