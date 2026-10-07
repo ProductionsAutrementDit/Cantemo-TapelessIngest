@@ -6,7 +6,8 @@ Spec: _bmad-output/implementation-artifacts/spec-wrapped-items-migration-p2.md
           --provider file plans the wrapped ``file`` clips instead of P2
           (option B: a genuine original shape restated onto its one copy);
           --provider xdcam plans the wrapped ``xdcam`` clips the same way,
-          without any ffprobe (spanned clips are deferred)
+          without any ffprobe: a proxy-copied description is stated from
+          the clip's Sony NRT XML (spanned clips are deferred)
   apply   ready / already-migrated rows, one resumable phase at a time;
           needs --item, --collection, --limit or an explicit --all, and
           stops after --max-failures (default 20) failures in a row
@@ -69,6 +70,7 @@ from portal.plugins.TapelessIngest.wrapped.ffprobe import (
     parse_ffprobe_description,
 )
 from portal.plugins.TapelessIngest.wrapped.gateway import parse_shape
+from portal.plugins.TapelessIngest.wrapped.nrt import nrt_description, parse_nrt
 from portal.plugins.TapelessIngest.wrapped.planner import (
     PlanResult,
     plan_file_item,
@@ -181,17 +183,25 @@ def _plan_file(clip, gateway, archive, disk):
 def _plan_xdcam(clip, gateway, archive, disk):
     """A wrapped ``xdcam`` clip: the same byte-for-byte copy route as a
     ``file`` clip, but Clip.clip_xml is Sony NonRealTimeMeta, never ffprobe,
-    so no ffprobe is read. A spanned clip is a concatenation: deferred."""
+    so no ffprobe is read: the NRT, keyed with the ClipFile's upper-case
+    extension, states a proxy-copied description instead. A spanned clip
+    is a concatenation: deferred."""
     if clip.spanned:
         return PlanResult(verdicts.UNEXPECTED, "spanned xdcam clip: deferred")
+    original = resolve_file(clip)
+    nrt = None
+    if original is not None:
+        extension = os.path.splitext(original.relative)[1].lstrip(".").upper()
+        nrt = nrt_description(parse_nrt(clip.clip_xml), extension)
     return plan_file_item(
         item_id=clip.item_id,
-        original=resolve_file(clip),
+        original=original,
         output_file=clip.output_file,
         gateway=gateway,
         archive=archive,
         disk=disk,
         provider=XDCAM_PROVIDER,
+        nrt=nrt,
     )
 
 

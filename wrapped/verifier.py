@@ -6,14 +6,15 @@ from typing import List
 from portal.plugins.TapelessIngest.wrapped import fields
 
 # Vidispine re-renders durationSeconds at 1 us after shape/create (palier-1 prod
-# measurement, 2026-10-03); only the ffprobe route states a us container.
+# measurement, 2026-10-03); only the ffprobe and NRT routes state a us
+# container.
 FFPROBE_DURATION_TOLERANCE = Fraction(1, 1_000_000)
 
 
 def _duration_unchanged(plan, before, after) -> bool:
     if before == after:
         return True
-    if plan.get("technical_source") != "ffprobe":
+    if plan.get("technical_source") not in ("ffprobe", "nrt"):
         return False
     if not isinstance(before, list) or not isinstance(after, list):
         return False

@@ -25,7 +25,10 @@ restated whole (``technical_source`` "copy") once the sizes prove the
 copy. A proxy-copied or ambiguous description is stated from the
 original's ffprobe instead (``technical_source`` "ffprobe"), for the
 formats measured against Vidispine; without an ffprobe it stays
-``unexpected``.
+``unexpected``. A wrapped ``xdcam`` item has no ffprobe: its proxy-copied
+or ambiguous description is stated from the Sony NRT XML instead
+(``technical_source`` "nrt", ``wrapped.nrt``), and P5's size alone may
+prove its tape-only original.
 """
 
 import copy
@@ -655,10 +658,14 @@ XDCAM = "xdcam"
 P5_OVERHEAD_MAX = 512
 NO_SIZE_PROOF = "no size proof"
 ROUTE = "ffprobe route"
+NRT_ROUTE = "NRT route"
 
 
 def size_problem(
-    exact: Mapping[str, Optional[int]], p5: Optional[int], label: str = FILE
+    exact: Mapping[str, Optional[int]],
+    p5: Optional[int],
+    label: str = FILE,
+    p5_alone: bool = False,
 ) -> Optional[str]:
     """Byte identity of a wrapped ``file`` copy and its original, before
     any write. ``exact`` maps each source (``ffprobe``, ``wrapped <id>``,
@@ -666,13 +673,17 @@ def size_problem(
     the original, None when unknown. Every known exact size must agree,
     and P5's, whenever known, must exceed it by less than P5_OVERHEAD_MAX.
     Two exact sources (all wrapped copies count as one), or one and P5's
-    size, are a proof."""
+    size, are a proof. With ``p5_alone`` (the NRT route only, accepted on
+    2026-10-07 for tape-only xdcam originals whose wrapped copy is gone),
+    P5's size is a proof when no exact size is known."""
     known = {label: size for label, size in exact.items() if size is not None}
     if len(set(known.values())) > 1:
         return "copy and original differ in size: " + ", ".join(
             f"{label} {size}" for label, size in known.items()
         )
     if not known:
+        if p5_alone and p5 is not None:
+            return None
         return f"{NO_SIZE_PROOF} ({label}): no exact size known"
     size = next(iter(known.values()))
     if p5 is not None and not 0 <= p5 - size < P5_OVERHEAD_MAX:
@@ -790,6 +801,42 @@ def _route_problem(
     )
 
 
+def _stated(
+    source: str,
+    description: Dict[str, Any],
+    item_values: Mapping[str, Any],
+    label: str,
+) -> Tuple[Optional[str], Dict[str, Any]]:
+    """(problem, technical plan keys) of a shape stated from ``description``
+    (``source`` "ffprobe" or "nrt"). The container states the duration the
+    item already has: apply and verify leave durationSeconds alone. A dry
+    build, so apply cannot fail on it after writes."""
+    microseconds = round(Fraction(item_values[fields.DURATION_FIELD][0]) * 1_000_000)
+    try:
+        build_ffprobe_document(description, "", microseconds)
+    except ShapeMismatch as error:
+        return f"{label}: {error}", {}
+    return None, {
+        "technical_source": source,
+        source: description,
+        "container_microseconds": microseconds,
+    }
+
+
+def _nrt_route_problem(
+    description: Mapping[str, Any], item_values: Mapping[str, Any], label: str
+) -> Optional[str]:
+    """Before any write: the NRT's duration is the one the item already has."""
+    return _duration_problem(
+        label,
+        item_values,
+        "NRT duration",
+        float(Fraction(description["duration"])),
+        FFPROBE_DURATION_TOLERANCE_S,
+        separator=": ",
+    )
+
+
 def plan_file_item(
     *,
     item_id: str,
@@ -802,6 +849,7 @@ def plan_file_item(
     ffprobe_size: Optional[int] = None,
     ffprobe_description: Optional[Dict[str, Any]] = None,
     provider: str = FILE,
+    nrt: Optional[Tuple[Optional[Dict[str, Any]], Optional[str]]] = None,
 ) -> PlanResult:
     """A wrapped ``file`` item (or ``xdcam``, the same copy route labelled
     ``provider`` and never given an ffprobe): its wrapped file is a byte-for-byte copy
@@ -811,7 +859,10 @@ def plan_file_item(
     description and the container duration). ``original`` is the clip's
     ClipFile (None when it has none); ``ffprobe``/``ffprobe_size``/
     ``ffprobe_description`` come from the ffprobe XML stored in
-    ``Clip.clip_xml``."""
+    ``Clip.clip_xml``. ``nrt`` is an ``xdcam`` clip's (description, problem)
+    from its NRT XML (``nrt.nrt_description``): a proxy-copied or ambiguous
+    shape is then stated from it (``technical_source`` "nrt"), or refused
+    with its problem."""
     shapes = gateway.original_shapes(item_id)
     if len(shapes) != 1:
         return PlanResult(verdicts.UNEXPECTED, f"{len(shapes)} original shapes")
@@ -838,14 +889,15 @@ def plan_file_item(
             f"{FILELESS} ({provider}): not measured for this provider",
         )
     problem = _attachment_problem(shape, output_file)
-    via_ffprobe = False
+    via_nrt = provider == XDCAM and nrt is not None
+    restated = False
     if not problem:
-        problem, via_ffprobe = _copy_problem(
+        problem, restated = _copy_problem(
             item_id,
             shape,
             gateway,
             ffprobe,
-            ffprobe_description is not None,
+            ffprobe_description is not None or via_nrt,
             provider,
         )
     if problem:
@@ -853,24 +905,26 @@ def plan_file_item(
 
     item_values = gateway.item_fields(item_id, ROLLBACK_ITEM_FIELDS)
     technical: Dict[str, Any] = {"technical_source": "copy"}
-    if via_ffprobe:
-        problem = _route_problem(ffprobe_description, item_values, provider)
+    if restated and via_nrt:
+        description, problem = nrt
+        if problem or description is None:
+            return PlanResult(
+                verdicts.UNEXPECTED, f"{PROXY_COPY} ({provider}); {problem}"
+            )
+        label = f"{NRT_ROUTE} ({provider})"
+        problem = _nrt_route_problem(description, item_values, label)
+        if not problem:
+            problem, technical = _stated("nrt", description, item_values, label)
         if problem:
             return PlanResult(verdicts.UNEXPECTED, problem)
-        # The container states the duration the item already has: apply and
-        # verify leave durationSeconds alone.
-        microseconds = round(
-            Fraction(item_values[fields.DURATION_FIELD][0]) * 1_000_000
-        )
-        try:
-            build_ffprobe_document(ffprobe_description, "", microseconds)
-        except ShapeMismatch as error:
-            return PlanResult(verdicts.UNEXPECTED, f"{ROUTE} ({provider}): {error}")
-        technical = {
-            "technical_source": "ffprobe",
-            "ffprobe": ffprobe_description,
-            "container_microseconds": microseconds,
-        }
+    elif restated:
+        problem = _route_problem(ffprobe_description, item_values, provider)
+        if not problem:
+            problem, technical = _stated(
+                "ffprobe", ffprobe_description, item_values, f"{ROUTE} ({provider})"
+            )
+        if problem:
+            return PlanResult(verdicts.UNEXPECTED, problem)
     # Read-only, and the one P5 lookup: the size proof reuses its entry.
     located = [_locate(original, gateway, archive, disk, None)]
     (found,) = located
@@ -880,10 +934,15 @@ def plan_file_item(
     if found["on_disk"]:
         exact["disk"] = disk.size(original.relative)
     p5 = _p5_size(found["entry"])
-    problem = size_problem(exact, p5, provider)
+    p5_alone = technical["technical_source"] == "nrt"
+    problem = size_problem(exact, p5, provider, p5_alone)
     if problem:
         return PlanResult(verdicts.UNEXPECTED, problem)
     known = {label: size for label, size in exact.items() if size is not None}
+    size_proof: Dict[str, Any] = {"exact": known, "p5": p5}
+    if not known:
+        # Only reachable through p5_alone: P5's size is the whole proof.
+        size_proof["p5_alone"] = True
     refused = _located_problem(located)
     if refused:
         return refused
@@ -900,7 +959,7 @@ def plan_file_item(
             **_wrapped_files(shape),
             "originals": located,
             **technical,
-            "size_proof": {"exact": known, "p5": p5},
+            "size_proof": size_proof,
         },
         rollback=_rollback(item_id, shape, gateway, item_values),
     )

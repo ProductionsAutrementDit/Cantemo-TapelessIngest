@@ -200,11 +200,12 @@ class Executor:
             )
             row.plan["new_shape_id"] = self.gateway.post_shape(row.item_id, document)
             return
-        if row.plan.get("technical_source") == "ffprobe":
-            # The description and duration the planner stored: apply never
-            # re-reads Clip.clip_xml.
+        source = row.plan.get("technical_source")
+        if source in ("ffprobe", "nrt"):
+            # The description (from ffprobe, or from the xdcam NRT) and the
+            # duration the planner stored: apply never re-reads Clip.clip_xml.
             document = build_ffprobe_document(
-                row.plan["ffprobe"],
+                row.plan[source],
                 row.plan["originals"][0]["file_id"],
                 row.plan["container_microseconds"],
             )

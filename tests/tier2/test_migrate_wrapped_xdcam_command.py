@@ -121,3 +121,127 @@ def test_an_xdcam_row_is_applied_and_verified_like_a_file_row(migrated_db):
     assert (row.phase, row.error) == ("done", "")
     assert "VX-21: ok" in _run(world, "verify", "--item", "VX-21")
     assert "technical source copy: 1" in _run(world, "report")
+
+
+# The NRT route: a proxy-copied xdcam shape stated from Clip.clip_xml's NRT,
+# the original on tape only and the wrapped copy gone (no size but P5's).
+
+
+def _nrt_clip(gateway, archive, clip_xml=None, clipfile=True):
+    from tests.tier1.test_wrapped_nrt import FS7_NRT
+
+    seed_item(
+        gateway,
+        "VX-31",
+        file_mov_document(
+            file_id="VX-W3",
+            name="W3.MXF",
+            video_codec="h264",
+            resolution=(480, 272),
+            audio_codecs=("aac",),
+        ),
+    )
+    seed_lowres(gateway, "VX-31")
+    clip = Clip.objects.create(
+        umid="X3",
+        path="2019/AH_TEST",
+        storage_id="VX-41",
+        reference_file="F",
+        item_id="VX-31",
+        provider_name="xdcam",
+        output_file="/mnt/ActiveMedia/CANTEMO_FILES/W3.MXF",
+        status=Clip.STATUS_IMPORTED,
+        clip_xml=FS7_NRT if clip_xml is None else clip_xml,
+    )
+    if clipfile:
+        relative = "2019/AH_TEST/C0003.mxf"
+        ClipFile.objects.create(clip=clip, path=LEGACY + relative, filetype="video")
+        archive.archive(to_absolute(relative), f"H#{relative}", size=SIZE + 178)
+    return clip
+
+
+def _nrt_world(**kwargs):
+    gateway, archive = InMemoryGateway(), FakeArchive()
+    _nrt_clip(gateway, archive, **kwargs)
+    return gateway, archive, FakeDisk()
+
+
+def test_plan_provider_xdcam_states_a_proxy_copy_from_its_nrt(migrated_db):
+    from portal.plugins.TapelessIngest.wrapped.nrt import nrt_description, parse_nrt
+    from tests.tier1.test_wrapped_nrt import FS7_NRT
+
+    world = _nrt_world()
+    _run(world, "plan", "--provider", "xdcam")
+    row = WrappedMigration.objects.get(item_id="VX-31")
+    assert row.verdict == "ready", row.reason
+    assert row.plan["technical_source"] == "nrt"
+    # the ClipFile's extension is upper-cased into the format key
+    assert row.plan["nrt"] == nrt_description(parse_nrt(FS7_NRT), "MXF")[0]
+    assert row.plan["size_proof"] == {
+        "exact": {},
+        "p5": SIZE + 178,
+        "p5_alone": True,
+    }
+    assert world[0].writes == []
+
+
+def test_the_planner_is_given_the_nrt_description(migrated_db, planner_calls):
+    from portal.plugins.TapelessIngest.wrapped.nrt import nrt_description, parse_nrt
+    from tests.tier1.test_wrapped_nrt import FS7_NRT
+
+    _run(_nrt_world(), "plan", "--provider", "xdcam")
+    (call,) = planner_calls
+    assert call["nrt"] == nrt_description(parse_nrt(FS7_NRT), "MXF")
+    assert call["original"].relative == "2019/AH_TEST/C0003.mxf"
+
+
+def test_a_clip_xml_that_is_not_nrt_is_named(migrated_db, planner_calls):
+    world = _nrt_world(clip_xml="<ffprobe><format size='1'/></ffprobe>")
+    _run(world, "plan", "--provider", "xdcam")
+    (call,) = planner_calls
+    assert call["nrt"] == (None, "no NRT XML")
+    row = WrappedMigration.objects.get(item_id="VX-31")
+    assert (row.verdict, row.reason) == (
+        "unexpected",
+        "proxy-copied technical description (xdcam); no NRT XML",
+    )
+
+
+def test_no_clipfile_passes_no_nrt(migrated_db, planner_calls):
+    _run(_nrt_world(clipfile=False), "plan", "--provider", "xdcam")
+    (call,) = planner_calls
+    assert call["original"] is None
+    assert call["nrt"] is None
+
+
+def test_an_nrt_row_is_applied_verified_and_reported(migrated_db):
+    from portal.plugins.TapelessIngest.wrapped.shape import build_ffprobe_document
+
+    world = _nrt_world()
+    gateway = world[0]
+    _run(world, "plan", "--provider", "xdcam")
+    _run(world, "apply", "--item", "VX-31")
+    row = WrappedMigration.objects.get(item_id="VX-31")
+    assert (row.phase, row.error) == ("done", "")
+    file_id = row.plan["originals"][0]["file_id"]
+    (posted,) = [w[2] for w in gateway.writes if w[0] == "post_shape"]
+    assert posted == build_ffprobe_document(row.plan["nrt"], file_id, 8_720_000)
+    assert [a["essenceStreamId"] for a in posted["audioComponent"]] == list(
+        range(2, 10)
+    )
+    (new,) = gateway.original_shapes("VX-31")
+    assert new.file_ids() == frozenset([file_id])
+    assert "VX-31: ok" in _run(world, "verify", "--item", "VX-31")
+    assert "technical source nrt: 1" in _run(world, "report")
+
+
+def test_an_nrt_row_tolerates_vidispines_microsecond_rerendering(migrated_db):
+    from portal.plugins.TapelessIngest.wrapped.verifier import verify_item
+
+    world = _nrt_world()
+    _run(world, "plan", "--provider", "xdcam")
+    _run(world, "apply", "--item", "VX-31")
+    row = WrappedMigration.objects.get(item_id="VX-31")
+    row.rollback["item_fields"]["durationSeconds"] = ["191.55803333333333"]
+    world[0].items["VX-31"]["durationSeconds"] = ["191.558033"]
+    assert verify_item(row, world[0]) == []
