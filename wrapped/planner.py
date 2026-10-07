@@ -739,10 +739,11 @@ def _copy_problem(
     described: bool = False,
     label: str = FILE,
 ) -> Tuple[Optional[str], bool]:
-    """(problem, via_ffprobe): whether the shape's own description is the
+    """(problem, restated): whether the shape's own description is the
     original's (option B). A proxy-copied or ambiguous one is no problem
-    when the original's ffprobe is ``described`` in full: the shape is then
-    stated from it (``via_ffprobe``)."""
+    when the original is ``described`` otherwise (its ffprobe description,
+    or an ``xdcam`` clip's NRT): the shape is then ``restated`` from that
+    description."""
     if _is_binary_only(shape):
         return f"{BINARY_ONLY} ({label})", False
     try:
@@ -907,10 +908,13 @@ def plan_file_item(
     technical: Dict[str, Any] = {"technical_source": "copy"}
     if restated and via_nrt:
         description, problem = nrt
-        if problem or description is None:
+        if problem:
             return PlanResult(
                 verdicts.UNEXPECTED, f"{PROXY_COPY} ({provider}); {problem}"
             )
+        if description is None:
+            # nrt_description returns a description or a problem, never neither.
+            raise AssertionError("NRT with neither a description nor a problem")
         label = f"{NRT_ROUTE} ({provider})"
         problem = _nrt_route_problem(description, item_values, label)
         if not problem:
@@ -934,7 +938,9 @@ def plan_file_item(
     if found["on_disk"]:
         exact["disk"] = disk.size(original.relative)
     p5 = _p5_size(found["entry"])
-    p5_alone = technical["technical_source"] == "nrt"
+    # P5's size alone stands only for a tape-only original: one on disk
+    # must give its own size.
+    p5_alone = technical["technical_source"] == "nrt" and not found["on_disk"]
     problem = size_problem(exact, p5, provider, p5_alone)
     if problem:
         return PlanResult(verdicts.UNEXPECTED, problem)

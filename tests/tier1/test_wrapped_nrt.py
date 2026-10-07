@@ -9,53 +9,11 @@ from portal.plugins.TapelessIngest.wrapped.nrt import (
     parse_nrt,
 )
 from portal.plugins.TapelessIngest.wrapped.shape import build_ffprobe_document
+from tests.wrapped_fakes import FS7_NRT, nrt_xml
 
 MP4 = "mov,mp4,m4a,3gp,3g2,mj2"
 
 
-def nrt_xml(
-    model="PXW-FS7",
-    video=(
-        '<VideoFrame videoCodec="AVC100CBG_1920_1080_H422IP@L41" '
-        'captureFps="25.00p" formatFps="25p"/>'
-    ),
-    audio_codec="LPCM24",
-    ports=8,
-    duration='<Duration value="218"/>',
-    tc_fps="25",
-):
-    audio = "".join(
-        f'<AudioRecPort port="OTHERS" audioCodec="{audio_codec}" '
-        f'trackDst="CH{n + 1}"/>'
-        for n in range(ports)
-    )
-    formats = (
-        f"<VideoFormat>{video}</VideoFormat>"
-        f'<AudioFormat numOfChannel="{ports}">{audio}</AudioFormat>'
-        if video
-        else ""
-    )
-    timecode = (
-        f'<LtcChangeTable tcFps="{tc_fps}" halfStep="false">'
-        '<LtcChange frameCount="0" value="00000000" status="increment"/>'
-        "</LtcChangeTable>"
-        if tc_fps
-        else ""
-    )
-    return (
-        '<?xml version="1.0" encoding="UTF-8"?>\n'
-        '<NonRealTimeMeta xmlns="urn:schemas-professionalDisc:nonRealTimeMeta:'
-        'ver.2.00" lastUpdate="2019-04-02T10:00:00+02:00">'
-        '<TargetMaterial umidRef="060A2B34"/>'
-        f"{duration}{timecode}"
-        '<CreationDate value="2019-04-02T10:00:00+02:00"/>'
-        f"{formats}"
-        f'<Device manufacturer="Sony" modelName="{model}" serialNo="1"/>'
-        "</NonRealTimeMeta>"
-    )
-
-
-FS7_NRT = nrt_xml()
 # The A7S writes no VideoFormat/AudioFormat: only its Duration, timecode
 # and Device.
 A7S_NRT = nrt_xml(model="ILCE-7S", video=None)

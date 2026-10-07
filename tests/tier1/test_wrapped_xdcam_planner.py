@@ -14,6 +14,7 @@ from tests.tier1.test_wrapped_file_planner import (
     file_mov_document,
     plan_file_item,
 )
+from tests.wrapped_fakes import FS7_NRT
 
 
 def _plan(world, **kwargs):
@@ -117,7 +118,6 @@ def test_a_shared_entity_is_labelled_with_its_provider(provider):
 
 def _nrt(xml=None, extension="MXF"):
     from portal.plugins.TapelessIngest.wrapped.nrt import nrt_description, parse_nrt
-    from tests.tier1.test_wrapped_nrt import FS7_NRT
 
     return nrt_description(parse_nrt(xml or FS7_NRT), extension)
 
@@ -252,3 +252,18 @@ def test_a_file_item_never_takes_the_nrt_route():
     assert result.reason == (
         "proxy-copied technical description (file); ffprobe route pending"
     )
+
+
+def test_an_original_on_disk_of_unknown_size_never_takes_the_p5_alone_proof():
+    # P5 alone stands only for a tape-only original: one on disk must give
+    # its own size.
+    world = _nrt_world(disk_bytes=b"x" * SIZE)
+    world[2].size = lambda relative: None
+    result = _plan(world, nrt=_nrt())
+    assert result.verdict == verdicts.UNEXPECTED
+    assert result.reason == "no size proof (xdcam): no exact size known"
+
+
+def test_an_nrt_with_neither_description_nor_problem_is_a_bug():
+    with pytest.raises(AssertionError):
+        _plan(_nrt_world(), nrt=(None, None))

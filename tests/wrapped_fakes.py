@@ -809,3 +809,50 @@ def ffprobe_route_xml(
         f'format_name="{format_name}" duration="{duration}" size="{size}"/>\n'
         f"{end}\n"
     )
+
+
+# A Sony NonRealTimeMeta document, as the xdcam provider stored it in
+# Clip.clip_xml; the PXW-FS7 MXF format by default (wrapped.nrt).
+def nrt_xml(
+    model="PXW-FS7",
+    video=(
+        '<VideoFrame videoCodec="AVC100CBG_1920_1080_H422IP@L41" '
+        'captureFps="25.00p" formatFps="25p"/>'
+    ),
+    audio_codec="LPCM24",
+    ports=8,
+    duration='<Duration value="218"/>',
+    tc_fps="25",
+):
+    audio = "".join(
+        f'<AudioRecPort port="OTHERS" audioCodec="{audio_codec}" '
+        f'trackDst="CH{n + 1}"/>'
+        for n in range(ports)
+    )
+    formats = (
+        f"<VideoFormat>{video}</VideoFormat>"
+        f'<AudioFormat numOfChannel="{ports}">{audio}</AudioFormat>'
+        if video
+        else ""
+    )
+    timecode = (
+        f'<LtcChangeTable tcFps="{tc_fps}" halfStep="false">'
+        '<LtcChange frameCount="0" value="00000000" status="increment"/>'
+        "</LtcChangeTable>"
+        if tc_fps
+        else ""
+    )
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<NonRealTimeMeta xmlns="urn:schemas-professionalDisc:nonRealTimeMeta:'
+        'ver.2.00" lastUpdate="2019-04-02T10:00:00+02:00">'
+        '<TargetMaterial umidRef="060A2B34"/>'
+        f"{duration}{timecode}"
+        '<CreationDate value="2019-04-02T10:00:00+02:00"/>'
+        f"{formats}"
+        f'<Device manufacturer="Sony" modelName="{model}" serialNo="1"/>'
+        "</NonRealTimeMeta>"
+    )
+
+
+FS7_NRT = nrt_xml()

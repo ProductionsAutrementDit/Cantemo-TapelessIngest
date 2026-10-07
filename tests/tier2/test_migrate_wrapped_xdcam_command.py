@@ -11,6 +11,7 @@ from portal.plugins.TapelessIngest.models.wrapped_migration import WrappedMigrat
 from portal.plugins.TapelessIngest.wrapped.paths import to_absolute
 from tests.tier1.test_wrapped_ffprobe import NON_REAL_TIME_META
 from tests.wrapped_fakes import (
+    FS7_NRT,
     FakeArchive,
     FakeDisk,
     InMemoryGateway,
@@ -128,8 +129,6 @@ def test_an_xdcam_row_is_applied_and_verified_like_a_file_row(migrated_db):
 
 
 def _nrt_clip(gateway, archive, clip_xml=None, clipfile=True):
-    from tests.tier1.test_wrapped_nrt import FS7_NRT
-
     seed_item(
         gateway,
         "VX-31",
@@ -168,7 +167,6 @@ def _nrt_world(**kwargs):
 
 def test_plan_provider_xdcam_states_a_proxy_copy_from_its_nrt(migrated_db):
     from portal.plugins.TapelessIngest.wrapped.nrt import nrt_description, parse_nrt
-    from tests.tier1.test_wrapped_nrt import FS7_NRT
 
     world = _nrt_world()
     _run(world, "plan", "--provider", "xdcam")
@@ -187,7 +185,6 @@ def test_plan_provider_xdcam_states_a_proxy_copy_from_its_nrt(migrated_db):
 
 def test_the_planner_is_given_the_nrt_description(migrated_db, planner_calls):
     from portal.plugins.TapelessIngest.wrapped.nrt import nrt_description, parse_nrt
-    from tests.tier1.test_wrapped_nrt import FS7_NRT
 
     _run(_nrt_world(), "plan", "--provider", "xdcam")
     (call,) = planner_calls
